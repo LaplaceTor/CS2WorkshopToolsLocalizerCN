@@ -1,0 +1,30 @@
+name: Check Translations Duplicate
+
+on:
+  push:
+    paths:
+      - '**.json'
+      - 'scripts/check_duplicates.py'
+  pull_request:
+    paths:
+      - '**.json'
+      - 'scripts/check_duplicates.py'
+  workflow_dispatch:
+
+jobs:
+  check-duplicates:
+    name: Check Duplicate Translation Keys
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.x'
+
+      - name: Run Duplicate Key Check
+        run: python scripts/check_duplicates.py
+

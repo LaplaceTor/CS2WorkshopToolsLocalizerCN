@@ -9,21 +9,26 @@ on:
     branches: [ main, master ]
   workflow_dispatch:
     inputs:
-      tag_name:
-        description: 'Release Tag (例如 v1.0.0，留空则自动按日期生成)'
+      version_bump:
+        description: '版本递增类型 (默认自动递增 patch 小版本)'
+        required: true
+        default: 'patch'
+        type: choice
+        options:
+          - patch
+          - minor
+          - major
+          - custom
+      custom_tag:
+        description: '自定义 Tag (仅在选择 custom 时生效，例如 v1.2.0)'
         required: false
         default: ''
         type: string
       release_name:
-        description: 'Release 标题 (留空则自动根据版本号生成)'
+        description: 'Release 标题 (留空则默认为 Release <Tag>)'
         required: false
         default: ''
         type: string
-      is_prerelease:
-        description: '是否标记为 Pre-release (预发布)'
-        required: false
-        default: false
-        type: boolean
 
 permissions:
   contents: write
@@ -37,50 +42,81 @@ jobs:
       - name: Checkout Repository
         uses: actions/checkout@v4
         with:
-          fetch-depth: 0  # 完整历史，用于生成 Changelog
+          fetch-depth: 0  # 完整历史与 tags，用于版本计算和 Changelog
 
       - name: Generate Version Info
         id: version
         shell: pwsh
         run: |
-          $inputTag = "${{ inputs.tag_name }}".Trim()
+          git fetch --tags --force 2>$null
+          $bumpType = "${{ inputs.version_bump }}".ToLower()
+          if (-not $bumpType) { $bumpType = "patch" }
+          $customTag = "${{ inputs.custom_tag }}".Trim()
           $inputReleaseName = "${{ inputs.release_name }}".Trim()
-          $inputPrerelease = "${{ inputs.is_prerelease }}"
           
-          if ($inputTag) {
-            $version = $inputTag
-            $isPrerelease = if ($inputPrerelease -eq "true") { "true" } else { "false" }
-            $releaseName = if ($inputReleaseName) { $inputReleaseName } else { "Release $version" }
-          } elseif ("${{ github.ref }}".StartsWith("refs/tags/v")) {
-            $version = "${{ github.ref_name }}"
-            $isPrerelease = "false"
-            $releaseName = if ($inputReleaseName) { $inputReleaseName } else { "Release $version" }
-          } else {
-            $date = Get-Date -Format "yyyy.MM.dd"
-            $version = "v${date}-build.${{ github.run_number }}"
-            $isPrerelease = if ($inputPrerelease -eq "true" -or $inputPrerelease -eq "True") { "true" } elseif ($inputPrerelease -eq "false" -or $inputPrerelease -eq "False") { "false" } else { "true" }
-            $releaseName = if ($inputReleaseName) { $inputReleaseName } else { "Dev Build $version" }
+          # 获取所有历史 tag，提取语义化版本
+          $tags = git tag -l
+          $semverList = @()
+          foreach ($t in $tags) {
+              if ($t -match '^v?(\d+)\.(\d+)\.(\d+)$') {
+                  $semverList += [PSCustomObject]@{
+                      Tag   = $t
+                      Major = [int]$Matches[1]
+                      Minor = [int]$Matches[2]
+                      Patch = [int]$Matches[3]
+                  }
+              }
           }
           
+          if ($semverList.Count -gt 0) {
+              $latest = $semverList | Sort-Object Major, Minor, Patch -Descending | Select-Object -First 1
+              $lastTag = $latest.Tag
+              $major = $latest.Major
+              $minor = $latest.Minor
+              $patch = $latest.Patch
+          } else {
+              $lastTag = ""
+              $major = 1
+              $minor = 0
+              $patch = 0
+          }
+          
+          # 仅在手动触发时进行版本计算与递增
+          if ($bumpType -eq "custom" -and $customTag) {
+              $version = if ($customTag.StartsWith("v")) { $customTag } else { "v$customTag" }
+          } elseif ($bumpType -eq "major") {
+              $version = "v$($major + 1).0.0"
+          } elseif ($bumpType -eq "minor") {
+              $version = "v$($major).$($minor + 1).0"
+          } else { # patch 或默认自动自增
+              if ($semverList.Count -gt 0) {
+                  $version = "v$($major).$($minor).$($patch + 1)"
+              } else {
+                  $version = "v1.0.0"
+              }
+          }
+          
+          $releaseName = if ($inputReleaseName) { $inputReleaseName } else { "Release $version" }
+          
           echo "version=$version" >> $env:GITHUB_OUTPUT
-          echo "is_prerelease=$isPrerelease" >> $env:GITHUB_OUTPUT
+          echo "last_tag=$lastTag" >> $env:GITHUB_OUTPUT
           echo "release_name=$releaseName" >> $env:GITHUB_OUTPUT
-          Write-Host "Version: $version | Prerelease: $isPrerelease | ReleaseName: $releaseName"
+          Write-Host "Calculated Version: $version (Previous: $lastTag) | Release: $releaseName"
 
       - name: Generate Changelog
         if: github.event_name == 'workflow_dispatch'
         shell: pwsh
         run: |
-          $latestTag = git describe --tags --abbrev=0 2>$null
-          if ($LASTEXITCODE -ne 0 -or -not $latestTag) {
-            $commits = git log --pretty=format:"- %s (%h)" -20
+          $prevTag = "${{ steps.version.outputs.last_tag }}"
+          if ($prevTag) {
+            $commits = git log "$prevTag..HEAD" --pretty=format:"- %s (%h)"
           } else {
-            $commits = git log "$latestTag..HEAD" --pretty=format:"- %s (%h)"
+            $commits = git log --pretty=format:"- %s (%h)" -20
           }
           if (-not $commits) {
-            $commits = "- Auto release build"
+            $commits = "- Release ${{ steps.version.outputs.version }} update"
           }
-          $body = "## What's Changed`n`n$($commits -join "`n")`n`n---`n*Manual triggered release via GitHub Actions*"
+          $body = "## What's Changed in ${{ steps.version.outputs.version }}`n`n$($commits -join "`n")`n`n---`n*Released via GitHub Actions*"
           $body | Out-File -FilePath CHANGELOG.md -Encoding utf8
           Write-Host "=== Changelog ===" 
           Get-Content CHANGELOG.md
@@ -142,8 +178,7 @@ jobs:
           path: CS2HammerTranslateCN-windows-x64.zip
           retention-days: 14
 
-      # 仅在 workflow_dispatch 手动触发时发布 Release
-      # push 和 pull_request 仅构建测试，不发布
+      # 仅在 workflow_dispatch 手动触发时发布正式 Release
       - name: Create GitHub Release
         if: github.event_name == 'workflow_dispatch'
         uses: softprops/action-gh-release@v2
@@ -153,5 +188,5 @@ jobs:
           body_path: CHANGELOG.md
           files: CS2HammerTranslateCN-windows-x64.zip
           draft: false
-          prerelease: ${{ steps.version.outputs.is_prerelease == 'true' }}
-          make_latest: ${{ steps.version.outputs.is_prerelease != 'true' }}
+          prerelease: false
+          make_latest: true
