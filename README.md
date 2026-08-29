@@ -107,28 +107,37 @@ Hammer 相关的界面与功能字符串通常分布在 CS2 安装目录下的�
 
 在终端 / PowerShell / CMD 中运行如下命令：
 
-- **基础搜索（包含关键字）：**
+- **文件夹批量扫描 / 通配符匹配（支持 `*.dll` 或目录路径）：**
   ```bash
-  python find_dll_strings.py -f "D:\SteamLibrary\steamapps\common\Counter-Strike Global Offensive\game\bin\win64\tools\xxx.dll" -p "Transform"
+  # 扫描 tools 目录下所有 DLL 文件
+  python find_dll_strings.py -f "D:\SteamLibrary\steamapps\common\Counter-Strike Global Offensive\game\bin\win64\tools\*.dll" -p "Transform"
+
+  # 或者直接传入文件夹路径
+  python find_dll_strings.py -f "D:\...\game\bin\win64\tools" -p "Transform"
+  ```
+
+- **单文件精确搜索（包含关键字）：**
+  ```bash
+  python find_dll_strings.py -f "D:\...\tools\hammer.dll" -p "Transform"
   ```
 
 - **忽略大小写 + 正则表达式匹配：**
   ```bash
   # 搜索以 Open 或 Create 开头的界面与操作字符串
-  python find_dll_strings.py -f "D:\...\xxx.dll" -p "^(Open|Create).*" -i
+  python find_dll_strings.py -f "D:\...\tools\*.dll" -p "^(Open|Create).*" -i
   ```
 
 - **搜索后自动打开文本文件浏览：**
   ```bash
-  python find_dll_strings.py -f "D:\...\xxx.dll" -p "Grid" --open
+  python find_dll_strings.py -f "D:\...\tools\*.dll" -p "Grid" --open
   ```
 
 #### 4. 参数说明
 | 参数 | 说明 |
 | :--- | :--- |
-| `-f, --file` | 目标 DLL 或二进制文件路径 (**必填**) |
+| `-f, --file` | 目标 DLL/二进制文件路径，支持通配符（如 `*.dll`、`tools/*.dll`）或文件夹路径 (**必填**) |
 | `-p, --pattern` | 要搜索的关键字或正则表达式 (**必填**) |
-| `-out, --output` | 输出的文本文件路径 (默认: `<DLL名>_matched_strings.txt`) |
+| `-out, --output` | 输出文本文件路径 (单文件默认: `<DLL名>_matched_strings.txt`，批量默认: `batch_matched_strings.txt`) |
 | `-i, --ignore-case`| 忽略大小写进行搜索匹配 |
 | `-o, --show-offset`| 输出字符串在 DLL 文件中的 16 进制偏移量与字符编码 (ASCII / UTF-16LE) |
 | `-u, --unique` | 去重输出，避免完全相同的重复字符串刷屏 |
