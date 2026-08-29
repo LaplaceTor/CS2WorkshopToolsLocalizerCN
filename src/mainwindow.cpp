@@ -22,6 +22,7 @@
 #include <QThread>
 #include <QFileInfo>
 #include <QDir>
+#include <QSettings>
 #include <QNetworkAccessManager>
 #include <QNetworkRequest>
 #include <QNetworkReply>
@@ -57,12 +58,15 @@ MainWindow::MainWindow(const std::wstring& cs2Root, QWidget *parent)
 
     setupUi();
     populateAddons();
+    loadSettings();
     updateRestoreButtonState();
 
     connect(m_launchBtn, &QPushButton::clicked, this, &MainWindow::onLaunchClicked);
     connect(m_updateBtn, &QPushButton::clicked, this, &MainWindow::onUpdateTranslationsClicked);
     connect(m_restoreBtn, &QPushButton::clicked, this, &MainWindow::onRestoreClicked);
     connect(m_helpBtn, &QPushButton::clicked, this, &MainWindow::onHelpClicked);
+    connect(m_addonCombo, &QComboBox::currentIndexChanged, this, &MainWindow::saveSettings);
+    connect(m_argsEdit, &QLineEdit::textChanged, this, &MainWindow::saveSettings);
     connect(m_hammerProcess, &QProcess::started, this, &MainWindow::onHammerStarted);
     connect(m_hammerProcess, QOverload<int, QProcess::ExitStatus>::of(&QProcess::finished), this, &MainWindow::onHammerFinished);
     connect(m_hammerProcess, &QProcess::errorOccurred, this, &MainWindow::onHammerError);
@@ -230,6 +234,60 @@ void MainWindow::populateAddons() {
     }
 }
 
+void MainWindow::loadSettings() {
+    fs::path configPath = fs::path(m_workingDir) / L"config.ini";
+    QSettings settings(QString::fromStdWString(configPath.wstring()), QSettings::IniFormat);
+
+    QString savedAddon = settings.value("Launcher/SelectedAddon", "").toString().trimmed();
+    QString savedArgs = settings.value("Launcher/LaunchArgs", "").toString();
+
+    // 1. 恢复附加启动参数
+    m_argsEdit->setText(savedArgs);
+
+    // 2. 恢复选择的目标 Addon
+    if (!savedAddon.isEmpty()) {
+        int index = m_addonCombo->findText(savedAddon);
+        if (index == -1) {
+            // 前缀匹配（例如 savedAddon 为 "addon_template"，而列表中为 "addon_template (默认模组)"）
+            for (int i = 0; i < m_addonCombo->count(); ++i) {
+                QString itemText = m_addonCombo->itemText(i);
+                if (itemText == savedAddon || itemText.startsWith(savedAddon + " ")) {
+                    index = i;
+                    break;
+                }
+            }
+        }
+
+        if (index != -1) {
+            m_addonCombo->setCurrentIndex(index);
+        } else {
+            // 已保存的 ADDON 在当前列表中未找到，自动切换到列表第一个
+            if (m_addonCombo->count() > 0) {
+                m_addonCombo->setCurrentIndex(0);
+            }
+        }
+    } else {
+        // 已保存的 ADDON 为空则自动切换到列表第一个
+        if (m_addonCombo->count() > 0) {
+            m_addonCombo->setCurrentIndex(0);
+        }
+    }
+}
+
+void MainWindow::saveSettings() {
+    fs::path configPath = fs::path(m_workingDir) / L"config.ini";
+    QSettings settings(QString::fromStdWString(configPath.wstring()), QSettings::IniFormat);
+
+    QString selectedAddon = m_addonCombo->currentText().trimmed();
+    if (selectedAddon.contains(" ")) {
+        selectedAddon = selectedAddon.split(" ").first();
+    }
+
+    settings.setValue("Launcher/SelectedAddon", selectedAddon);
+    settings.setValue("Launcher/LaunchArgs", m_argsEdit->text());
+    settings.sync();
+}
+
 void MainWindow::appendLog(const QString& msg, const QString& color) {
     QString timeStr = QDateTime::currentDateTime().toString("HH:mm:ss");
     QString formattedMsg = QString("<span style='color: #6a9955;'>[%1]</span> <span style='color: %2;'>%3</span>")
@@ -270,6 +328,8 @@ void MainWindow::onLaunchClicked() {
         QMessageBox::information(this, "提示", "Hammer 已经在运行中，请勿重复启动！");
         return;
     }
+
+    saveSettings();
 
     setUiBusy(true);
     m_statusLabel->setText("状态: 正在部署补丁并准备启动...");
@@ -802,6 +862,9 @@ void MainWindow::closeEvent(QCloseEvent *event) {
         event->ignore();
         return;
     }
+
+    // 保存当前用户配置
+    saveSettings();
 
     // 确保退出时尝试清理与恢复
     if (doRestore(false)) {

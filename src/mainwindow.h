@@ -33,6 +33,8 @@ private slots:
 private:
     void setupUi();
     void populateAddons();
+    void loadSettings();
+    void saveSettings();
     void appendLog(const QString& msg, const QString& color = "#cccccc");
     void setUiBusy(bool busy);
     void updateRestoreButtonState();
