@@ -100,9 +100,8 @@ CS2HammerTranslateCN/
 
 #### 2. 定位需要扫描的 DLL 文件
 Hammer 相关的界面与功能字符串通常分布在 CS2 安装目录下的以下二进制文件中：
-- `game/bin/win64/tools/worldedit.dll`（Hammer 视口、主视图与多数编辑工具界面）
-- `game/bin/win64/tools/hammer.dll`（Hammer 核心界面与面板）
-- `game/bin/win64/vstdlib.dll` / `game/bin/win64/tier0.dll` 等
+- `game/bin/win64/tools/*.dll`
+- `game/bin/win64/subtools/*.dll`
 
 #### 3. 运行命令示例
 
@@ -110,18 +109,18 @@ Hammer 相关的界面与功能字符串通常分布在 CS2 安装目录下的�
 
 - **基础搜索（包含关键字）：**
   ```bash
-  python find_dll_strings.py -f "D:\SteamLibrary\steamapps\common\Counter-Strike Global Offensive\game\bin\win64\tools\worldedit.dll" -p "Transform"
+  python find_dll_strings.py -f "D:\SteamLibrary\steamapps\common\Counter-Strike Global Offensive\game\bin\win64\tools\xxx.dll" -p "Transform"
   ```
 
 - **忽略大小写 + 正则表达式匹配：**
   ```bash
   # 搜索以 Open 或 Create 开头的界面与操作字符串
-  python find_dll_strings.py -f "D:\...\worldedit.dll" -p "^(Open|Create).*" -i
+  python find_dll_strings.py -f "D:\...\xxx.dll" -p "^(Open|Create).*" -i
   ```
 
 - **搜索后自动打开文本文件浏览：**
   ```bash
-  python find_dll_strings.py -f "D:\...\worldedit.dll" -p "Grid" --open
+  python find_dll_strings.py -f "D:\...\xxx.dll" -p "Grid" --open
   ```
 
 #### 4. 参数说明
