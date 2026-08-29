@@ -26,8 +26,8 @@ jobs:
         with:
           arch: x64
 
-      - name: Install Ninja
-        uses: ashley-taylor/configure-ninja@v1.0.3
+      - name: Set up Ninja
+        run: pip install ninja
 
       - name: Install Qt 6
         uses: jurplel/install-qt-action@v4
