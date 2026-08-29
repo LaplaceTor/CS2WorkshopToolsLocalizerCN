@@ -20,6 +20,9 @@ public:
     // 扫描 content/csgo_addons 下的所有可用 Addon 列表
     static std::vector<std::wstring> GetAvailableAddons(const std::wstring& cs2Root);
 
+    // 检测系统当前是否有 CS2 进程 (cs2.exe) 在运行
+    static bool IsCs2ProcessRunning();
+
 private:
     static bool CheckRegistryUninstall(std::wstring& outPath);
     static bool CheckRegistrySteam(std::wstring& outPath);

@@ -1,11 +1,35 @@
 #include "cs2_detector.h"
 #include <windows.h>
+#include <tlhelp32.h>
 #include <filesystem>
 #include <fstream>
 #include <regex>
 #include <algorithm>
 
 namespace fs = std::filesystem;
+
+bool Cs2Detector::IsCs2ProcessRunning() {
+    HANDLE hSnapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+    if (hSnapshot == INVALID_HANDLE_VALUE) {
+        return false;
+    }
+
+    PROCESSENTRY32W pe32;
+    pe32.dwSize = sizeof(PROCESSENTRY32W);
+
+    bool isRunning = false;
+    if (Process32FirstW(hSnapshot, &pe32)) {
+        do {
+            if (_wcsicmp(pe32.szExeFile, L"cs2.exe") == 0) {
+                isRunning = true;
+                break;
+            }
+        } while (Process32NextW(hSnapshot, &pe32));
+    }
+
+    CloseHandle(hSnapshot);
+    return isRunning;
+}
 
 bool Cs2Detector::IsValidCs2Root(const std::wstring& rootPath) {
     if (rootPath.empty()) return false;

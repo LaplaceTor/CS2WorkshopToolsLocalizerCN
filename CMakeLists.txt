@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.20)
-project(CS2HammerTranslateCN LANGUAGES CXX)
+project(CS2WorkshopToolsLocalizerCN LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -37,7 +37,7 @@ set_target_properties(qtcore_qm PROPERTIES
 )
 
 # 2. 编译主启动器图形界面程序
-add_executable(CS2HammerTranslateCN WIN32
+add_executable(CS2WorkshopToolsLocalizerCN WIN32
     src/main.cpp
     src/mainwindow.h
     src/mainwindow.cpp
@@ -51,7 +51,7 @@ add_executable(CS2HammerTranslateCN WIN32
     src/backup_manager.cpp
 )
 
-target_link_libraries(CS2HammerTranslateCN PRIVATE
+target_link_libraries(CS2WorkshopToolsLocalizerCN PRIVATE
     Qt6::Core
     Qt6::Gui
     Qt6::Widgets
@@ -62,16 +62,16 @@ target_link_libraries(CS2HammerTranslateCN PRIVATE
 )
 
 # 复制字典文件和 DLL 到输出目录方便调试运行
-add_custom_command(TARGET CS2HammerTranslateCN POST_BUILD
+add_custom_command(TARGET CS2WorkshopToolsLocalizerCN POST_BUILD
     COMMAND ${CMAKE_COMMAND} -E copy_if_different
         "${CMAKE_CURRENT_SOURCE_DIR}/fgd_translations.json"
-        "$<TARGET_FILE_DIR:CS2HammerTranslateCN>/fgd_translations.json"
+        "$<TARGET_FILE_DIR:CS2WorkshopToolsLocalizerCN>/fgd_translations.json"
     COMMAND ${CMAKE_COMMAND} -E copy_if_different
         "${CMAKE_CURRENT_SOURCE_DIR}/qt_translations.json"
-        "$<TARGET_FILE_DIR:CS2HammerTranslateCN>/qt_translations.json"
+        "$<TARGET_FILE_DIR:CS2WorkshopToolsLocalizerCN>/qt_translations.json"
     COMMAND ${CMAKE_COMMAND} -E copy_if_different
         "$<TARGET_FILE:qtcore_qm>"
-        "$<TARGET_FILE_DIR:CS2HammerTranslateCN>/qtcore_qm.dll"
+        "$<TARGET_FILE_DIR:CS2WorkshopToolsLocalizerCN>/qtcore_qm.dll"
 )
 
 # 3. 单元与集成测试程序

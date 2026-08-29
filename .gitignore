@@ -3,11 +3,13 @@
 # ====================================================================
 build/
 build-*/
+tmp/
 bin/
 out/
 dist/
 release/
 debug/
+*.zip
 
 # ====================================================================
 # Runtime Generated & Backup Folders
@@ -52,6 +54,7 @@ dxcompiler.dll
 dxil.dll
 vc_redist*.exe
 build.bat
+package.bat
 
 # ====================================================================
 # Visual Studio & Qt Creator IDE Files

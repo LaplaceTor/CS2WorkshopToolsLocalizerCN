@@ -7,7 +7,7 @@
 int main(int argc, char *argv[]) {
     // 启用高 DPI 缩放支持
     QApplication app(argc, argv);
-    app.setApplicationName("CS2HammerTranslateCN");
+    app.setApplicationName("CS2WorkshopToolsLocalizerCN");
     app.setOrganizationName("CS2TranslationTools");
 
     // 设置全局现代暗色调样式
@@ -21,7 +21,7 @@ int main(int argc, char *argv[]) {
         // 没检测到就终止程序并弹窗提示用户
         QMessageBox::critical(
             nullptr,
-            "CS2HammerTranslateCN",
+            "CS2 Workshop Tools Localizer CN",
             "未检测到 Counter-Strike 2 安装路径！\n\n"
             "请确认 CS2 已通过 Steam 正确安装，或 Steam 注册表处于正常状态后重试。"
         );

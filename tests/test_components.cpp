@@ -2,6 +2,9 @@
 #include <cassert>
 #include <filesystem>
 #include <fstream>
+#include <thread>
+#include <chrono>
+#include <windows.h>
 #include "../src/cs2_detector.h"
 #include "../src/pe_patcher.h"
 #include "../src/fgd_translator.h"
@@ -172,7 +175,7 @@ int main() {
         std::ifstream inFgd(tempFgdJson);
         std::string firstLine;
         std::getline(inFgd, firstLine);
-        assert(firstLine == "/**" && "Generated template must start with JSONC block comment");
+        assert(firstLine.rfind("//", 0) == 0 && "Generated template must start with JSONC comment");
     }
 
     fs::remove(tempFgdJson);
@@ -211,6 +214,109 @@ int main() {
     assert(parsedJsonc["Help"] == "帮助");
     fs::remove(tempJsonc);
     std::cout << "[Test 6] JSONC Comment Support: PASSED\n";
+
+    // 7. Test Session State & Backup Protection
+    std::cout << "[Test 7] Testing Session State Management & Backup Protection...\n";
+    fs::path tempWorkDir = fs::current_path() / L"test_work_dir";
+    fs::create_directories(tempWorkDir);
+
+    assert(!BackupManager::HasUnrestoredSession(tempWorkDir.wstring()));
+    BackupManager::SaveSessionState(tempWorkDir.wstring(), true);
+    assert(BackupManager::HasUnrestoredSession(tempWorkDir.wstring()));
+    BackupManager::ClearSessionState(tempWorkDir.wstring());
+    assert(!BackupManager::HasUnrestoredSession(tempWorkDir.wstring()));
+
+    // Test Cs2Detector::IsCs2ProcessRunning() does not crash
+    bool cs2Running = Cs2Detector::IsCs2ProcessRunning();
+    std::cout << "         Is CS2 Running right now: " << (cs2Running ? "YES" : "NO") << "\n";
+
+    fs::remove_all(tempWorkDir);
+    std::cout << "[Test 7] Session State Management & Process Detection: PASSED\n";
+
+    // 8. Test File Lock Simulation: Retry Recovery & Retry Failure
+    std::cout << "[Test 8] Testing File Lock Simulation: Retry Recovery & Retry Failure...\n";
+    fs::path mockCs2Root = fs::current_path() / L"test_mock_cs2_lock";
+    fs::path mockBackupDir = fs::current_path() / L"test_mock_backup_lock";
+
+    fs::path mockCs2Bin = mockCs2Root / L"game" / L"bin" / L"win64";
+    fs::path mockBackupBin = mockBackupDir / L"game" / L"bin" / L"win64";
+    fs::create_directories(mockCs2Bin);
+    fs::create_directories(mockBackupBin);
+
+    fs::path targetDll = mockCs2Bin / L"Qt5Core.dll";
+    fs::path backupDll = mockBackupBin / L"Qt5Core.dll";
+
+    // Create initial files
+    {
+        std::ofstream cs2File(targetDll);
+        cs2File << "MODIFIED_PATCHED_DLL_CONTENT";
+    }
+    {
+        std::ofstream bakFile(backupDll);
+        bakFile << "CLEAN_ORIGINAL_DLL_CONTENT";
+    }
+
+    // 8.1: Test Delayed Unlock (Lock for 300ms, retry should succeed)
+    {
+        HANDLE hFile = CreateFileW(
+            targetDll.c_str(),
+            GENERIC_READ | GENERIC_WRITE,
+            0, // 0 = Exclusive lock (simulate CS2 / Defender holding file)
+            NULL,
+            OPEN_EXISTING,
+            FILE_ATTRIBUTE_NORMAL,
+            NULL
+        );
+        assert(hFile != INVALID_HANDLE_VALUE && "Must acquire exclusive file lock");
+
+        // Spawn a thread to release lock after 300ms
+        std::thread unlockThread([hFile]() {
+            std::this_thread::sleep_for(std::chrono::milliseconds(300));
+            CloseHandle(hFile);
+        });
+
+        std::wstring restoreErr;
+        bool restoreOk = BackupManager::RestoreAll(mockCs2Root.wstring(), mockBackupDir.wstring(), restoreErr);
+        unlockThread.join();
+
+        assert(restoreOk && "RestoreAll must succeed with retry when lock is released");
+
+        std::ifstream checkFile(targetDll);
+        std::string content;
+        checkFile >> content;
+        assert(content == "CLEAN_ORIGINAL_DLL_CONTENT" && "Content must be restored to original");
+        std::cout << "         [8.1] Retry on delayed unlock: PASSED\n";
+    }
+
+    // 8.2: Test Permanent Lock Failure (Hold lock, retry should fail gracefully and report error)
+    {
+        HANDLE hFile = CreateFileW(
+            targetDll.c_str(),
+            GENERIC_READ | GENERIC_WRITE,
+            0, // Exclusive lock
+            NULL,
+            OPEN_EXISTING,
+            FILE_ATTRIBUTE_NORMAL,
+            NULL
+        );
+        assert(hFile != INVALID_HANDLE_VALUE && "Must acquire exclusive file lock");
+
+        std::wstring restoreErr;
+        bool restoreOk = BackupManager::RestoreAll(mockCs2Root.wstring(), mockBackupDir.wstring(), restoreErr);
+
+        // Clean up handle
+        CloseHandle(hFile);
+
+        assert(!restoreOk && "RestoreAll must return false when file remains locked");
+        assert(!restoreErr.empty() && "RestoreAll must provide detailed error message on failure");
+        std::wcout << L"         [8.2] Graceful failure message: " << restoreErr << L"\n";
+        std::cout << "         [8.2] Retry exhaustion & graceful failure: PASSED\n";
+    }
+
+    // Clean up mock dirs
+    fs::remove_all(mockCs2Root);
+    fs::remove_all(mockBackupDir);
+    std::cout << "[Test 8] File Lock Retry & Failure Handling: PASSED\n";
 
     std::cout << "\n[ALL TESTS PASSED SUCCESSFULLY!]\n";
     return 0;

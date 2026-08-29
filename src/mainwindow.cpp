@@ -19,6 +19,7 @@
 #include <QDateTime>
 #include <QCloseEvent>
 #include <QApplication>
+#include <QThread>
 #include <QFileInfo>
 #include <QDir>
 #include <QNetworkAccessManager>
@@ -40,13 +41,18 @@ MainWindow::MainWindow(const std::wstring& cs2Root, QWidget *parent)
     , m_hammerProcess(new QProcess(this))
     , m_isHammerRunning(false)
 {
-    // 获取当前工作目录
-    try {
-        m_workingDir = fs::current_path().wstring();
-    } catch (...) {
-        wchar_t curDir[MAX_PATH] = {0};
-        GetCurrentDirectoryW(MAX_PATH, curDir);
-        m_workingDir = curDir;
+    // 获取程序所在目录作为工作目录
+    QString appDir = QApplication::applicationDirPath();
+    if (!appDir.isEmpty()) {
+        m_workingDir = appDir.toStdWString();
+    } else {
+        try {
+            m_workingDir = fs::current_path().wstring();
+        } catch (...) {
+            wchar_t curDir[MAX_PATH] = {0};
+            GetCurrentDirectoryW(MAX_PATH, curDir);
+            m_workingDir = curDir;
+        }
     }
 
     setupUi();
@@ -62,7 +68,7 @@ MainWindow::MainWindow(const std::wstring& cs2Root, QWidget *parent)
     connect(m_hammerProcess, &QProcess::errorOccurred, this, &MainWindow::onHammerError);
 
     appendLog("==================================================", "#66d9ef");
-    appendLog(" CS2HammerTranslateCN 深度汉化启动器已就绪", "#a6e22e");
+    appendLog(" CS2 Workshop Tools Localizer CN 汉化启动器已就绪", "#a6e22e");
     appendLog("==================================================", "#66d9ef");
     appendLog(QString("已锁定 CS2 安装目录: %1").arg(QString::fromStdWString(m_cs2Root)), "#f8f8f2");
 
@@ -77,13 +83,16 @@ MainWindow::MainWindow(const std::wstring& cs2Root, QWidget *parent)
     if (FgdTranslator::EnsureQtDictionaryExists(qtPath.wstring(), L"", notice)) {
         appendLog("[i] " + QString::fromStdWString(notice), "#66d9ef");
     }
+
+    // 检查上一次是否异常退出并执行安全恢复
+    checkAndRecoverAbnormalExit();
 }
 
 MainWindow::~MainWindow() {
 }
 
 void MainWindow::setupUi() {
-    setWindowTitle("CS2 Hammer 深度汉化启动器 - CS2HammerTranslateCN");
+    setWindowTitle("CS2 Workshop Tools 汉化启动器 - CS2 Workshop Tools Localizer CN");
     resize(440, 420);
     setMinimumSize(440, 420);
 
@@ -131,7 +140,7 @@ void MainWindow::setupUi() {
     btnLayout->setSpacing(6);
 
     // 第一行: 主要启动按钮
-    m_launchBtn = new QPushButton("🚀 启动 CS2 Hammer (汉化版)", centralWidget);
+    m_launchBtn = new QPushButton("🚀 启动 CS2 Workshop Tools (汉化版)", centralWidget);
     m_launchBtn->setMinimumHeight(36);
     m_launchBtn->setStyleSheet(
         "QPushButton {"
@@ -394,6 +403,9 @@ void MainWindow::onLaunchClicked() {
     m_hammerProcess->setWorkingDirectory(QString::fromStdWString(cs2Bin.wstring()));
 
     appendLog(QString("[*] 执行命令: %1 %2").arg(cs2ExePath, processArgs.join(" ")), "#75715e");
+
+    // 保存运行会话状态，防止运行期间程序被强杀导致下次启动丢失备份
+    BackupManager::SaveSessionState(m_workingDir, true);
     m_hammerProcess->start();
 }
 
@@ -410,14 +422,36 @@ void MainWindow::onHammerStarted() {
 void MainWindow::onHammerFinished(int exitCode, QProcess::ExitStatus exitStatus) {
     Q_UNUSED(exitStatus);
     m_isHammerRunning = false;
-    appendLog(QString("[*] 检测到 CS2 Hammer 进程已退出 (代码: %1)，正在执行自动还原...").arg(exitCode), "#66d9ef");
-    m_statusLabel->setText("状态: 正在恢复原版文件...");
+    appendLog(QString("[*] 检测到 CS2 Hammer 进程已退出 (代码: %1)，正在等待文件释放并执行自动还原...").arg(exitCode), "#66d9ef");
+    m_statusLabel->setText("状态: 正在等待文件句柄释放并恢复原版文件...");
 
-    doRestore(true);
+    // 1. 等待系统内所有 cs2.exe 进程完全释放退出（最多等待 3 秒）
+    int waitCount = 0;
+    while (Cs2Detector::IsCs2ProcessRunning() && waitCount < 30) {
+        QThread::msleep(100);
+        waitCount++;
+    }
 
-    m_launchBtn->setText("🚀 启动 CS2 Hammer (汉化版)");
+    // 2. 执行安全还原（内部自带多重重试机制）
+    bool restoreOk = doRestore(true);
+
+    if (restoreOk) {
+        BackupManager::ClearSessionState(m_workingDir);
+        m_statusLabel->setText("状态: 就绪 (原版环境已安全恢复)");
+    } else {
+        m_statusLabel->setText("状态: 恢复备份遇到占用，请手动点击【还原原版备份】");
+        appendLog("[-] 部分原版文件还原失败（可能仍被其他程序占用），未清除会话状态以保护原版备份。", "#f92672");
+        QMessageBox::warning(
+            this,
+            "恢复提示",
+            "自动恢复原版文件时遇到部分文件被占用或写入受阻！\n\n"
+            "请确认 CS2 与 Hammer 是否已完全退出，然后可手动点击【还原原版备份】。\n"
+            "（启动器已安全保留会话状态与原版备份，下次启动也会自动再次尝试恢复）。"
+        );
+    }
+
+    m_launchBtn->setText("🚀 启动 CS2 Workshop Tools (汉化版)");
     setUiBusy(false);
-    m_statusLabel->setText("状态: 就绪 (原版环境已安全恢复)");
 }
 
 void MainWindow::onHammerError(QProcess::ProcessError error) {
@@ -433,15 +467,12 @@ void MainWindow::onHammerError(QProcess::ProcessError error) {
 bool MainWindow::doRestore(bool showLog) {
     fs::path workPath(m_workingDir);
     fs::path backupDir = workPath / L"backup";
-    std::wstring err;
-
     if (!BackupManager::HasBackup(backupDir.wstring())) {
-        if (showLog) appendLog("[*] 未发现有效 backup 备份文件，无需还原。", "#75715e");
         return true;
     }
 
-    if (showLog) appendLog("[*] 正在从 backup 目录恢复所有原始 FGD 与 Qt5Core.dll...", "#e6db74");
-
+    if (showLog) appendLog("[*] 正在还原原版 FGD 实体定义及核心二进制...", "#66d9ef");
+    std::wstring err;
     if (!BackupManager::RestoreAll(m_cs2Root, backupDir.wstring(), err)) {
         if (showLog) appendLog(QString("[-] 还原备份失败: %1").arg(QString::fromStdWString(err)), "#f92672");
         return false;
@@ -467,7 +498,7 @@ void MainWindow::fetchUrlCandidates(const QStringList& urls, std::function<void(
         QUrl url(urls[index]);
         QNetworkRequest request(url);
         request.setAttribute(QNetworkRequest::RedirectPolicyAttribute, QNetworkRequest::NoLessSafeRedirectPolicy);
-        request.setHeader(QNetworkRequest::UserAgentHeader, "CS2HammerTranslateCN");
+        request.setHeader(QNetworkRequest::UserAgentHeader, "CS2WorkshopToolsLocalizerCN");
         request.setTransferTimeout(10000);
 
         QNetworkReply* reply = m_networkManager->get(request);
@@ -513,17 +544,21 @@ void MainWindow::onUpdateTranslationsClicked() {
     appendLog("[*] 正在从 GitHub 官方仓库下载最新词典文件...", "#66d9ef");
 
     QStringList qtUrls = {
+        "https://raw.githubusercontent.com/LaplaceTor/CS2WorkshopToolsLocalizerCN/main/qt_translations.json",
+        "https://cdn.jsdelivr.net/gh/LaplaceTor/CS2WorkshopToolsLocalizerCN@main/qt_translations.json",
+        "https://raw.githubusercontent.com/LaplaceTor/CS2WorkshopToolsLocalizerCN/master/qt_translations.json",
+        "https://cdn.jsdelivr.net/gh/LaplaceTor/CS2WorkshopToolsLocalizerCN@master/qt_translations.json",
         "https://raw.githubusercontent.com/LaplaceTor/CS2HammerTranslateCN/main/qt_translations.json",
-        "https://cdn.jsdelivr.net/gh/LaplaceTor/CS2HammerTranslateCN@main/qt_translations.json",
-        "https://raw.githubusercontent.com/LaplaceTor/CS2HammerTranslateCN/master/qt_translations.json",
-        "https://cdn.jsdelivr.net/gh/LaplaceTor/CS2HammerTranslateCN@master/qt_translations.json"
+        "https://cdn.jsdelivr.net/gh/LaplaceTor/CS2HammerTranslateCN@main/qt_translations.json"
     };
 
     QStringList fgdUrls = {
+        "https://raw.githubusercontent.com/LaplaceTor/CS2WorkshopToolsLocalizerCN/main/fgd_translations.json",
+        "https://cdn.jsdelivr.net/gh/LaplaceTor/CS2WorkshopToolsLocalizerCN@main/fgd_translations.json",
+        "https://raw.githubusercontent.com/LaplaceTor/CS2WorkshopToolsLocalizerCN/master/fgd_translations.json",
+        "https://cdn.jsdelivr.net/gh/LaplaceTor/CS2WorkshopToolsLocalizerCN@master/fgd_translations.json",
         "https://raw.githubusercontent.com/LaplaceTor/CS2HammerTranslateCN/main/fgd_translations.json",
-        "https://cdn.jsdelivr.net/gh/LaplaceTor/CS2HammerTranslateCN@main/fgd_translations.json",
-        "https://raw.githubusercontent.com/LaplaceTor/CS2HammerTranslateCN/master/fgd_translations.json",
-        "https://cdn.jsdelivr.net/gh/LaplaceTor/CS2HammerTranslateCN@master/fgd_translations.json"
+        "https://cdn.jsdelivr.net/gh/LaplaceTor/CS2HammerTranslateCN@main/fgd_translations.json"
     };
 
     // 1. Fetch qt_translations.json
@@ -644,15 +679,15 @@ void MainWindow::onUpdateTranslationsClicked() {
                 QString("已成功从 GitHub 获取并更新最新汉化词典！\n\n"
                         "- 界面词典 (qt_translations.json): %1 条\n"
                         "- 实体词典 (fgd_translations.json): %2 条\n\n"
-                        "点击“启动 CS2 Hammer (汉化版)”即可应用最新汉化。").arg(qtCount).arg(fgdCount)
+                        "点击“启动 CS2 Workshop Tools (汉化版)”即可应用最新汉化。").arg(qtCount).arg(fgdCount)
             );
         });
     });
 }
 
 void MainWindow::onRestoreClicked() {
-    if (m_isHammerRunning) {
-        QMessageBox::warning(this, "警告", "Hammer 正在运行中，无法在运行时执行手动还原！");
+    if (m_isHammerRunning || Cs2Detector::IsCs2ProcessRunning()) {
+        QMessageBox::warning(this, "警告", "CS2 / Hammer 正在运行中，无法在运行时执行手动还原！\n请先退出 CS2 或 Hammer。");
         return;
     }
 
@@ -666,6 +701,7 @@ void MainWindow::onRestoreClicked() {
     int ret = QMessageBox::question(this, "确认还原", "是否确认将 backup 中的所有原始文件覆盖恢复到 CS2 目录？", QMessageBox::Yes | QMessageBox::No);
     if (ret == QMessageBox::Yes) {
         if (doRestore(true)) {
+            BackupManager::ClearSessionState(m_workingDir);
             QMessageBox::information(this, "成功", "所有原始文件已成功恢复！");
         } else {
             QMessageBox::critical(this, "失败", "还原过程中遇到错误，请查看日志。");
@@ -674,12 +710,60 @@ void MainWindow::onRestoreClicked() {
     }
 }
 
+void MainWindow::checkAndRecoverAbnormalExit() {
+    fs::path workPath(m_workingDir);
+    fs::path backupDir = workPath / L"backup";
+
+    bool hasUnrestored = BackupManager::HasUnrestoredSession(m_workingDir) ||
+                         (BackupManager::HasBackup(backupDir.wstring()) && BackupManager::IsPatchDeployed(m_cs2Root));
+
+    if (!hasUnrestored) {
+        return;
+    }
+
+    appendLog("[!] 检测到上一次程序未正常结束或存在未还原的补丁文件，正在进行安全恢复检查...", "#fd971f");
+
+    // 检查 CS2 是否仍在运行
+    while (Cs2Detector::IsCs2ProcessRunning()) {
+        int ret = QMessageBox::warning(
+            this,
+            "检测到 CS2 正在运行",
+            "检测到上一次程序未正常结束，且 CS2 (cs2.exe) 目前仍在运行中！\n\n"
+            "为确保原版文件能够被安全恢复，请先退出 CS2 游戏或 Hammer 编辑器，然后点击【重试】。\n"
+            "若点击【取消】，将推迟恢复（注意：未还原状态下直接启动可能导致原版备份异常）。",
+            QMessageBox::Retry | QMessageBox::Cancel,
+            QMessageBox::Retry
+        );
+
+        if (ret == QMessageBox::Cancel) {
+            appendLog("[-] 用户推迟了异常退出的自动还原流程", "#f92672");
+            return;
+        }
+    }
+
+    // CS2 进程已退出，自动执行还原
+    appendLog("[*] 正在自动从 backup 目录恢复纯净原版文件...", "#66d9ef");
+    if (doRestore(true)) {
+        BackupManager::ClearSessionState(m_workingDir);
+        appendLog("[SUCCESS] 上次异常退出遗留的文件已成功还原为纯净原版备份！", "#a6e22e");
+        updateRestoreButtonState();
+        QMessageBox::information(
+            this,
+            "自动恢复成功",
+            "检测到上一次程序未正常结束（如意外关闭、断电或崩溃）。\n\n"
+            "启动器已自动将 CS2 原始文件完整恢复，以确保您的游戏文件纯净无损。"
+        );
+    } else {
+        appendLog("[-] 自动恢复备份失败，请检查文件占用或稍后点击【还原原版备份】", "#f92672");
+    }
+}
+
 void MainWindow::onHelpClicked() {
     QMessageBox msgBox(this);
     msgBox.setWindowTitle("翻译字典格式与填写指南");
     msgBox.setTextFormat(Qt::RichText);
     msgBox.setText(
-        "<h3>📚 CS2 Hammer 汉化字典格式与编写指南</h3>"
+        "<h3>📚 CS2 Workshop Tools 汉化字典格式与编写指南</h3>"
         "<p>所有翻译字典均采用标准 <b>UTF-8 JSON</b> 键值对格式：<code>\"英文原词\": \"中文翻译\"</code></p>"
         "<hr/>"
         "<h4>1. 实体定义字典 (<code>fgd_translations.json</code>)</h4>"
@@ -706,20 +790,22 @@ void MainWindow::onHelpClicked() {
 }
 
 void MainWindow::closeEvent(QCloseEvent *event) {
-    if (m_isHammerRunning) {
-        int ret = QMessageBox::question(
+    bool isRunning = m_isHammerRunning || Cs2Detector::IsCs2ProcessRunning();
+    if (isRunning) {
+        QMessageBox::warning(
             this,
-            "退出确认",
-            "CS2 Hammer 仍在运行中！\n\n关闭启动器将不会立即中断游戏，但可能会影响退出时的自动还原。\n是否强行关闭？",
-            QMessageBox::Yes | QMessageBox::No
+            "禁止关闭",
+            "CS2 / Hammer 编辑器正在运行中！\n\n"
+            "为防止 CS2 原版文件损坏或丢失，在 CS2 运行期间严禁关闭本启动器。\n"
+            "请先在 CS2 / Hammer 中正常退出，启动器将在退出后自动恢复原版文件并允许安全关闭。"
         );
-        if (ret == QMessageBox::No) {
-            event->ignore();
-            return;
-        }
+        event->ignore();
+        return;
     }
 
     // 确保退出时尝试清理与恢复
-    doRestore(false);
+    if (doRestore(false)) {
+        BackupManager::ClearSessionState(m_workingDir);
+    }
     event->accept();
 }

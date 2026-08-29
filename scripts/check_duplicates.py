@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-CS2HammerTranslateCN - 翻译字典查重检测脚本
+CS2WorkshopToolsLocalizerCN - 翻译字典查重检测脚本
 用于检测 JSON / JSONC 翻译文件中是否存在重复的原文 (Key)，并精确定位行号。
 """
 
@@ -177,7 +177,7 @@ def main():
     checked_files = 0
 
     print("==================================================")
-    print("        CS2Hammer 翻译文本查重检测器")
+    print("    CS2 Workshop Tools 翻译文本查重检测器")
     print("==================================================")
 
     for fpath in target_files:

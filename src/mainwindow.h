@@ -37,6 +37,7 @@ private:
     void setUiBusy(bool busy);
     void updateRestoreButtonState();
     bool doRestore(bool showLog = true);
+    void checkAndRecoverAbnormalExit();
     void fetchUrlCandidates(const QStringList& urls, std::function<void(bool success, const QByteArray& data)> callback);
 
     std::wstring m_cs2Root;
