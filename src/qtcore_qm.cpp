@@ -62,7 +62,7 @@ static bool g_bLoaded = false;
 static std::mutex g_Mutex;
 static std::mutex g_CacheMutex;
 
-// 快速、零依赖的高性能 JSON 解析器（支持 UTF-8、转义符 \", \\, \n, \t, \r, \uXXXX）
+// 快速、零依赖的高性能 JSON/JSONC 解析器（支持 UTF-8、注释 // 与 /* */、转义符 \", \\, \n, \t, \r, \uXXXX）
 static bool ParseJsonTranslations(const char* jsonContent, size_t length, std::unordered_map<std::string, std::string>& outMap) {
     outMap.clear();
     outMap.reserve(15000);
@@ -75,16 +75,40 @@ static bool ParseJsonTranslations(const char* jsonContent, size_t length, std::u
         p += 3;
     }
 
-    // 寻找起始大括号 '{'
-    while (p < end && *p != '{') p++;
-    if (p >= end) return false;
-    p++;
-
-    auto skipWhitespace = [&]() {
-        while (p < end && (*p == ' ' || *p == '\t' || *p == '\r' || *p == '\n' || *p == ',')) {
-            p++;
+    auto skipWhitespaceAndComments = [&]() {
+        while (p < end) {
+            if (*p == ' ' || *p == '\t' || *p == '\r' || *p == '\n' || *p == ',') {
+                p++;
+            } else if (*p == '/' && (p + 1 < end)) {
+                if (*(p + 1) == '/') {
+                    // 单行注释 //
+                    p += 2;
+                    while (p < end && *p != '\n' && *p != '\r') {
+                        p++;
+                    }
+                } else if (*(p + 1) == '*') {
+                    // 块注释 /* ... */
+                    p += 2;
+                    while (p + 1 < end && !(*p == '*' && *(p + 1) == '/')) {
+                        p++;
+                    }
+                    if (p + 1 < end) {
+                        p += 2; // 跳过 '*/'
+                    } else {
+                        p = end;
+                    }
+                } else {
+                    break;
+                }
+            } else {
+                break;
+            }
         }
     };
+
+    skipWhitespaceAndComments();
+    if (p >= end || *p != '{') return false;
+    p++;
 
     auto parseString = [&](std::string& str) -> bool {
         if (p >= end || *p != '"') return false;
@@ -143,16 +167,16 @@ static bool ParseJsonTranslations(const char* jsonContent, size_t length, std::u
 
     std::string key, val;
     while (p < end) {
-        skipWhitespace();
+        skipWhitespaceAndComments();
         if (p >= end || *p == '}') break;
 
         if (!parseString(key)) break;
 
-        while (p < end && (*p == ' ' || *p == '\t' || *p == '\r' || *p == '\n')) p++;
+        skipWhitespaceAndComments();
         if (p >= end || *p != ':') break;
         p++;
 
-        while (p < end && (*p == ' ' || *p == '\t' || *p == '\r' || *p == '\n')) p++;
+        skipWhitespaceAndComments();
         if (!parseString(val)) break;
 
         if (!key.empty() && !val.empty()) {

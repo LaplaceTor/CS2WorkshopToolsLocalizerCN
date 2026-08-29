@@ -154,22 +154,63 @@ int main() {
     assert(g1 && g2 && "Template generator must return true when creating new files");
     assert(fs::exists(tempFgdJson) && fs::exists(tempQtJson));
 
-    // 验证生成的字典内容包含说明
+    // 验证生成的字典内容有效且没有将注释污染为字典词条
     std::unordered_map<std::string, std::string> parsedFgd;
     bool p1 = FgdTranslator::LoadDictionary(tempFgdJson.wstring(), parsedFgd);
-    assert(p1 && "Generated FGD template JSON must be valid");
-    assert(parsedFgd.find("_说明_1_使用指南") != parsedFgd.end());
+    assert(p1 && "Generated FGD template JSONC must be valid");
+    assert(parsedFgd.find("_说明_1_使用指南") == parsedFgd.end() && "JSONC comments should not be parsed as keys");
     assert(parsedFgd.find("Omnidirectional point light") != parsedFgd.end());
 
     std::unordered_map<std::string, std::string> parsedQt;
     bool p2 = FgdTranslator::LoadDictionary(tempQtJson.wstring(), parsedQt);
-    assert(p2 && "Generated Qt template JSON must be valid");
-    assert(parsedQt.find("_说明_1_使用指南") != parsedQt.end());
+    assert(p2 && "Generated Qt template JSONC must be valid");
+    assert(parsedQt.find("_说明_1_使用指南") == parsedQt.end() && "JSONC comments should not be parsed as keys");
     assert(parsedQt.find("Clipping Tool") != parsedQt.end());
+
+    // 验证文件开头确实生成了 JSONC 注释块
+    {
+        std::ifstream inFgd(tempFgdJson);
+        std::string firstLine;
+        std::getline(inFgd, firstLine);
+        assert(firstLine == "/**" && "Generated template must start with JSONC block comment");
+    }
 
     fs::remove(tempFgdJson);
     fs::remove(tempQtJson);
     std::cout << "[Test 5] Template Dictionary Generation: PASSED\n";
+
+    // 6. Test JSONC Comments Parsing
+    std::cout << "[Test 6] Testing JSONC Comment Support (// and /* */)...\n";
+    fs::path tempJsonc = fs::current_path() / L"test_jsonc.json";
+    {
+        std::ofstream jsoncFile(tempJsonc);
+        jsoncFile << "// 顶部单行注释\n"
+                  << "/* 顶部多行注释\n"
+                  << "   第二行说明 */\n"
+                  << "{\n"
+                  << "    // 字段前单行注释\n"
+                  << "    \"File\": \"文件\", // 行尾单行注释\n"
+                  << "    /* 字段间块注释 */\n"
+                  << "    \"Edit\": /* 键值中间注释 */ \"编辑\",\n"
+                  << "    \"URL_Test\": \"https://github.com/test//not_comment/*still_string*/\",\n"
+                  << "    \"Escape_Test\": \"Quote: \\\" and Slash: \\/\",\n"
+                  << "    // 末尾字段注释\n"
+                  << "    \"Help\": \"帮助\",\n"
+                  << "    // 尾随逗号与结尾注释\n"
+                  << "}\n"
+                  << "// 底部注释\n";
+    }
+    std::unordered_map<std::string, std::string> parsedJsonc;
+    bool pJsonc = FgdTranslator::LoadDictionary(tempJsonc.wstring(), parsedJsonc);
+    assert(pJsonc && "JSONC parsing must succeed");
+    assert(parsedJsonc.size() == 5);
+    assert(parsedJsonc["File"] == "文件");
+    assert(parsedJsonc["Edit"] == "编辑");
+    assert(parsedJsonc["URL_Test"] == "https://github.com/test//not_comment/*still_string*/");
+    assert(parsedJsonc["Escape_Test"] == "Quote: \" and Slash: /");
+    assert(parsedJsonc["Help"] == "帮助");
+    fs::remove(tempJsonc);
+    std::cout << "[Test 6] JSONC Comment Support: PASSED\n";
 
     std::cout << "\n[ALL TESTS PASSED SUCCESSFULLY!]\n";
     return 0;

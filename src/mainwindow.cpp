@@ -537,8 +537,42 @@ void MainWindow::onUpdateTranslationsClicked() {
             return;
         }
 
+        auto stripJsonc = [](const QByteArray& input) -> QByteArray {
+            QByteArray output;
+            output.reserve(input.size());
+            const char* p = input.constData();
+            const char* end = p + input.size();
+
+            while (p < end) {
+                if (*p == '"') {
+                    output.append(*p++);
+                    while (p < end) {
+                        char c = *p++;
+                        output.append(c);
+                        if (c == '"') break;
+                        if (c == '\\' && p < end) output.append(*p++);
+                    }
+                } else if (*p == '/' && (p + 1 < end)) {
+                    if (*(p + 1) == '/') {
+                        p += 2;
+                        while (p < end && *p != '\n' && *p != '\r') p++;
+                    } else if (*(p + 1) == '*') {
+                        p += 2;
+                        while (p + 1 < end && !(*p == '*' && *(p + 1) == '/')) p++;
+                        if (p + 1 < end) p += 2;
+                        else p = end;
+                    } else {
+                        output.append(*p++);
+                    }
+                } else {
+                    output.append(*p++);
+                }
+            }
+            return output;
+        };
+
         QJsonParseError qtParseErr;
-        QJsonDocument qtDoc = QJsonDocument::fromJson(qtData, &qtParseErr);
+        QJsonDocument qtDoc = QJsonDocument::fromJson(stripJsonc(qtData), &qtParseErr);
         if (qtParseErr.error != QJsonParseError::NoError || !qtDoc.isObject() || qtDoc.object().isEmpty()) {
             appendLog(QString("[-] 解析 qt_translations.json 失败: %1").arg(qtParseErr.errorString()), "#f92672");
             QMessageBox::critical(this, "更新失败", "下载的 qt_translations.json 格式异常或内容为空，已放弃更新。");
@@ -552,7 +586,7 @@ void MainWindow::onUpdateTranslationsClicked() {
 
         // 2. Fetch fgd_translations.json
         appendLog("[2/2] 正在获取 fgd_translations.json (实体定义词典)...", "#e6db74");
-        fetchUrlCandidates(fgdUrls, [this, qtDoc, qtCount](bool fgdOk, const QByteArray& fgdData) {
+        fetchUrlCandidates(fgdUrls, [this, qtData, qtCount, stripJsonc](bool fgdOk, const QByteArray& fgdData) {
             if (!fgdOk) {
                 appendLog("[-] 获取 fgd_translations.json 失败：所有节点连接超时或不可达，请检查网络设置。", "#f92672");
                 QMessageBox::critical(this, "更新失败", "获取 fgd_translations.json 失败！\n无法连接到 GitHub 仓库，请检查网络连接。");
@@ -562,7 +596,7 @@ void MainWindow::onUpdateTranslationsClicked() {
             }
 
             QJsonParseError fgdParseErr;
-            QJsonDocument fgdDoc = QJsonDocument::fromJson(fgdData, &fgdParseErr);
+            QJsonDocument fgdDoc = QJsonDocument::fromJson(stripJsonc(fgdData), &fgdParseErr);
             if (fgdParseErr.error != QJsonParseError::NoError || !fgdDoc.isObject() || fgdDoc.object().isEmpty()) {
                 appendLog(QString("[-] 解析 fgd_translations.json 失败: %1").arg(fgdParseErr.errorString()), "#f92672");
                 QMessageBox::critical(this, "更新失败", "下载的 fgd_translations.json 格式异常或内容为空，已放弃更新。");
@@ -586,7 +620,7 @@ void MainWindow::onUpdateTranslationsClicked() {
                 m_statusLabel->setText("状态: 写入失败");
                 return;
             }
-            qtFile.write(qtDoc.toJson(QJsonDocument::Indented));
+            qtFile.write(qtData);
             qtFile.close();
 
             QFile fgdFile(fgdLocalPath);
@@ -597,7 +631,7 @@ void MainWindow::onUpdateTranslationsClicked() {
                 m_statusLabel->setText("状态: 写入失败");
                 return;
             }
-            fgdFile.write(fgdDoc.toJson(QJsonDocument::Indented));
+            fgdFile.write(fgdData);
             fgdFile.close();
 
             appendLog(QString("[SUCCESS] 翻译词典更新成功！(界面词条: %1, 实体词条: %2)").arg(qtCount).arg(fgdCount), "#a6e22e");

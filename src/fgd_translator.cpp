@@ -20,15 +20,40 @@ static bool ParseJsonTranslations(const char* jsonContent, size_t length, std::u
         p += 3;
     }
 
-    while (p < end && *p != '{') p++;
-    if (p >= end) return false;
-    p++;
-
-    auto skipWhitespace = [&]() {
-        while (p < end && (*p == ' ' || *p == '\t' || *p == '\r' || *p == '\n' || *p == ',')) {
-            p++;
+    auto skipWhitespaceAndComments = [&]() {
+        while (p < end) {
+            if (*p == ' ' || *p == '\t' || *p == '\r' || *p == '\n' || *p == ',') {
+                p++;
+            } else if (*p == '/' && (p + 1 < end)) {
+                if (*(p + 1) == '/') {
+                    // 单行注释 //
+                    p += 2;
+                    while (p < end && *p != '\n' && *p != '\r') {
+                        p++;
+                    }
+                } else if (*(p + 1) == '*') {
+                    // 块注释 /* ... */
+                    p += 2;
+                    while (p + 1 < end && !(*p == '*' && *(p + 1) == '/')) {
+                        p++;
+                    }
+                    if (p + 1 < end) {
+                        p += 2; // 跳过 '*/'
+                    } else {
+                        p = end;
+                    }
+                } else {
+                    break;
+                }
+            } else {
+                break;
+            }
         }
     };
+
+    skipWhitespaceAndComments();
+    if (p >= end || *p != '{') return false;
+    p++;
 
     auto parseString = [&](std::string& str) -> bool {
         if (p >= end || *p != '"') return false;
@@ -87,16 +112,16 @@ static bool ParseJsonTranslations(const char* jsonContent, size_t length, std::u
 
     std::string key, val;
     while (p < end) {
-        skipWhitespace();
+        skipWhitespaceAndComments();
         if (p >= end || *p == '}') break;
 
         if (!parseString(key)) break;
 
-        while (p < end && (*p == ' ' || *p == '\t' || *p == '\r' || *p == '\n')) p++;
+        skipWhitespaceAndComments();
         if (p >= end || *p != ':') break;
         p++;
 
-        while (p < end && (*p == ' ' || *p == '\t' || *p == '\r' || *p == '\n')) p++;
+        skipWhitespaceAndComments();
         if (!parseString(val)) break;
 
         if (!key.empty() && !val.empty()) {
@@ -411,10 +436,29 @@ bool FgdTranslator::EnsureFgdDictionaryExists(const std::wstring& jsonPath, cons
         return false;
     }
 
+    out << "/**\n";
+    out << " * ==============================================================================\n";
+    out << " * CS2 Hammer FGD 实体定义翻译字典 (JSONC 格式)\n";
+    out << " * ==============================================================================\n";
+    out << " * \n";
+    out << " * 【使用指南】\n";
+    out << " * - 格式为标准的键值对：\"英文原词\": \"中文翻译\"\n";
+    out << " * - 支持 // 单行注释 与 /* 块注释 */\n";
+    out << " * \n";
+    out << " * 【可翻译内容】\n";
+    out << " * 1. 实体类说明 (@PointClass ... = name : \"Description\")\n";
+    out << " * 2. 属性显示名称 (targetname : \"Name\" : : \"...\")\n";
+    out << " * 3. 属性悬停描述 (... : \"Name\" : default : \"Description\")\n";
+    out << " * 4. 选项与标记 (\"0\" : \"Enabled\" : \"Option Desc\")\n";
+    out << " * 5. 输入输出 (input Kill : \"Description\")\n";
+    out << " * 6. 绑定按钮说明 (desc = \"Description\")\n";
+    out << " * \n";
+    out << " * 【格式与安全】\n";
+    out << " * - 所有底层 RAW 标识符（如 targetname、angles、thinkalways、io 类型与默认值）引擎会自动保护，请仅翻译双引号内的文本。\n";
+    out << " * - 修改保存后重新在启动器点击启动即可自动重新编译部署。\n";
+    out << " * ==============================================================================\n";
+    out << " */\n";
     out << "{\n";
-    out << "  \"_说明_1_使用指南\": \"本文件为 CS2 Hammer FGD 实体定义翻译字典。格式为标准 JSON 键值对：\\\"英文原词\\\": \\\"中文翻译\\\"。\",\n";
-    out << "  \"_说明_2_可翻译内容\": \"可翻译内容包括：1. 实体类说明 (@PointClass ... = name : \\\"Description\\\")；2. 属性显示名称 (targetname : \\\"Name\\\" : : \\\"...\\\")；3. 属性悬停描述 (... : \\\"Name\\\" : default : \\\"Description\\\")；4. 选项与标记 (\\\"0\\\" : \\\"Enabled\\\" : \\\"Option Desc\\\")；5. 输入输出 (input Kill : \\\"Description\\\")；6. 绑定按钮说明 (desc = \\\"Description\\\")。\",\n";
-    out << "  \"_说明_3_格式与安全\": \"所有底层 RAW 标识符（如 targetname、angles、thinkalways、io 类型与默认值）引擎会自动保护，请仅翻译双引号内的文本。修改保存后重新在启动器点击启动即可自动重新编译部署。\",\n";
 
     if (loaded.empty()) {
         out << "  \"Omnidirectional point light\": \"全向点光源\",\n";
@@ -425,11 +469,14 @@ bool FgdTranslator::EnsureFgdDictionaryExists(const std::wstring& jsonPath, cons
         out << "  \"Enabled\": \"已启用\",\n";
         out << "  \"Disabled\": \"已禁用\"\n";
     } else {
-        size_t count = 0;
+        std::vector<std::pair<std::string, std::string>> validEntries;
         for (const auto& kv : loaded) {
             if (kv.first.rfind("_说明", 0) == 0) continue;
-            out << "  \"" << EscapeJsonString(kv.first) << "\": \"" << EscapeJsonString(kv.second) << "\"";
-            if (++count < loaded.size()) {
+            validEntries.push_back(kv);
+        }
+        for (size_t i = 0; i < validEntries.size(); ++i) {
+            out << "  \"" << EscapeJsonString(validEntries[i].first) << "\": \"" << EscapeJsonString(validEntries[i].second) << "\"";
+            if (i + 1 < validEntries.size()) {
                 out << ",\n";
             } else {
                 out << "\n";
@@ -460,10 +507,29 @@ bool FgdTranslator::EnsureQtDictionaryExists(const std::wstring& jsonPath, const
         return false;
     }
 
+    out << "/**\n";
+    out << " * ==============================================================================\n";
+    out << " * CS2 Hammer 界面与菜单核心翻译字典 (JSONC 格式)\n";
+    out << " * ==============================================================================\n";
+    out << " * \n";
+    out << " * 【使用指南】\n";
+    out << " * - 格式为标准的键值对：\"英文原词\": \"中文翻译\"\n";
+    out << " * - 支持 // 单行注释 与 /* 块注释 */\n";
+    out << " * \n";
+    out << " * 【可翻译内容】\n";
+    out << " * 1. 主菜单与二级菜单项\n";
+    out << " * 2. 工具栏按钮与悬停提示\n";
+    out << " * 3. 属性面板属性名\n";
+    out << " * 4. 树形视图、列表与下拉框文本\n";
+    out << " * 5. 弹窗对话框与按钮文本\n";
+    out << " * \n";
+    out << " * 【快捷键自动适配】\n";
+    out << " * - 核心注入模块已内置动态快捷键识别与拆分引擎。\n";
+    out << " * - 遇到如 'Clipping Tool [Shift+X]'、'Undo (Ctrl+Z)'、'Save\\tCtrl+S'、'Save As...'、'Name:' 等文本，\n";
+    out << " *   只需翻译基础英文（如 \"Clipping Tool\": \"剪切工具\"），快捷键后缀会被自动保留与拼接，无需手动输入快捷键！\n";
+    out << " * ==============================================================================\n";
+    out << " */\n";
     out << "{\n";
-    out << "  \"_说明_1_使用指南\": \"本文件为 CS2 Hammer 界面与菜单核心翻译字典。格式为标准 JSON 键值对：\\\"英文原词\\\": \\\"中文翻译\\\"。\",\n";
-    out << "  \"_说明_2_可翻译内容\": \"可翻译内容包括：1. 主菜单与二级菜单项；2. 工具栏按钮与悬停提示；3. 属性面板属性名；4. 树形视图、列表与下拉框文本；5. 弹窗对话框与按钮文本。\",\n";
-    out << "  \"_说明_3_快捷键自动适配\": \"核心注入模块已内置动态快捷键识别与拆分引擎。遇到如 'Clipping Tool [Shift+X]'、'Undo (Ctrl+Z)'、'Save\\\\tCtrl+S'、'Save As...'、'Name:' 等文本，只需翻译基础英文（如 \\\"Clipping Tool\\\": \\\"剪切工具\\\"），快捷键后缀会被自动保留与拼接，无需手动输入快捷键！\",\n";
 
     if (loaded.empty()) {
         out << "  \"File\": \"文件\",\n";
@@ -483,11 +549,14 @@ bool FgdTranslator::EnsureQtDictionaryExists(const std::wstring& jsonPath, const
         out << "  \"Pinned To\": \"固定至\",\n";
         out << "  \"Force Hidden\": \"强制隐藏\"\n";
     } else {
-        size_t count = 0;
+        std::vector<std::pair<std::string, std::string>> validEntries;
         for (const auto& kv : loaded) {
             if (kv.first.rfind("_说明", 0) == 0) continue;
-            out << "  \"" << EscapeJsonString(kv.first) << "\": \"" << EscapeJsonString(kv.second) << "\"";
-            if (++count < loaded.size()) {
+            validEntries.push_back(kv);
+        }
+        for (size_t i = 0; i < validEntries.size(); ++i) {
+            out << "  \"" << EscapeJsonString(validEntries[i].first) << "\": \"" << EscapeJsonString(validEntries[i].second) << "\"";
+            if (i + 1 < validEntries.size()) {
                 out << ",\n";
             } else {
                 out << "\n";
