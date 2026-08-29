@@ -85,7 +85,7 @@ CS2WorkshopToolsLocalizerCN/
 
 - **⚠️ 注意事项**：  
   实体的底层代码英文标识符（例如 `targetname`、`angles` 等）工具会自动保护，无需翻译。**请只翻译双引号内部的展示文本与描述说明即可**。
-
+  > 主译者(DramaCa)目前正在处理：Hammer 与 Asset Browser。可自行避免重复工作。
 ---
 
 ## 🔍 遇到修改汉化词条无效？如何获取完整原文字符串
