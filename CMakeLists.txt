@@ -23,7 +23,7 @@ if(NOT DEFINED CMAKE_PREFIX_PATH)
     endif()
 endif()
 
-find_package(Qt6 REQUIRED COMPONENTS Core Gui Widgets)
+find_package(Qt6 REQUIRED COMPONENTS Core Gui Widgets Network)
 
 # 1. 编译注入 DLL qtcore_qm.dll
 add_library(qtcore_qm SHARED
@@ -55,6 +55,7 @@ target_link_libraries(CS2HammerTranslateCN PRIVATE
     Qt6::Core
     Qt6::Gui
     Qt6::Widgets
+    Qt6::Network
     advapi32
     user32
     shell32

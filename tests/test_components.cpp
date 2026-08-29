@@ -77,6 +77,8 @@ int main() {
     if (fs::exists(mockBackup)) fs::remove_all(mockBackup);
     if (fs::exists(mockTrans)) fs::remove_all(mockTrans);
 
+    assert(!BackupManager::HasBackup(mockBackup.wstring()) && "HasBackup should be false before backup");
+
     fs::create_directories(mockRoot / L"game" / L"core");
     fs::create_directories(mockRoot / L"game" / L"bin" / L"win64");
 
@@ -97,6 +99,7 @@ int main() {
     bool b1 = BackupManager::BackupFgdFiles(mockRoot.wstring(), mockBackup.wstring(), backedFgd, err);
     bool b2 = BackupManager::BackupQtCore(mockRoot.wstring(), mockBackup.wstring(), err);
     assert(b1 && b2 && "Mock backup must succeed");
+    assert(BackupManager::HasBackup(mockBackup.wstring()) && "HasBackup should be true after backup");
     assert(fs::exists(mockBackup / L"game" / L"core" / L"test.fgd"));
     assert(fs::exists(mockBackup / L"game" / L"bin" / L"win64" / L"Qt5Core.dll"));
 

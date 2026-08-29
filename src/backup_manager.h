@@ -5,6 +5,9 @@
 
 class BackupManager {
 public:
+    // 检查 backupDir 目录是否存在且包含有效的备份文件
+    static bool HasBackup(const std::wstring& backupDir);
+
     // 递归备份 CS2 目录下的所有 FGD 文件到 backupDir（按相对路径）
     static bool BackupFgdFiles(const std::wstring& cs2Root, const std::wstring& backupDir, std::vector<std::wstring>& outBackedUpFiles, std::wstring& outError);
 

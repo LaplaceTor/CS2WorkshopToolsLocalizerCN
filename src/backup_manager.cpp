@@ -4,6 +4,23 @@
 
 namespace fs = std::filesystem;
 
+bool BackupManager::HasBackup(const std::wstring& backupDir) {
+    try {
+        fs::path backupRoot(backupDir);
+        if (!fs::exists(backupRoot) || !fs::is_directory(backupRoot)) {
+            return false;
+        }
+        for (const auto& entry : fs::recursive_directory_iterator(backupRoot)) {
+            if (entry.is_regular_file()) {
+                return true;
+            }
+        }
+        return false;
+    } catch (...) {
+        return false;
+    }
+}
+
 bool BackupManager::BackupFgdFiles(const std::wstring& cs2Root, const std::wstring& backupDir, std::vector<std::wstring>& outBackedUpFiles, std::wstring& outError) {
     try {
         fs::path cs2Path(cs2Root);
