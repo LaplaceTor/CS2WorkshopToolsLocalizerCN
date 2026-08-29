@@ -84,6 +84,66 @@ CS2HammerTranslateCN/
 
 ---
 
+## 🔍 遇到修改汉化词条无效？如何获取完整原文字符串
+
+有时候在 `qt_translations.json` 中添加了某个单词的翻译，但进入 Hammer 后发现界面依然显示英文。  
+这通常是因为该界面的英文文本**并不是一个孤立的单词**，而是包含在一段更长的完整字符串、格式化占位符、特殊前缀（如 `&` 快捷键前缀、`...` 省略号、`%s` 占位符等）中。如果字典中的英文原文与 DLL 内部存储的原文字符串不完全匹配，翻译就不会生效。
+
+为此，本项目提供了辅助脚本 [`find_dll_strings.py`](./find_dll_strings.py)，用于直接从 CS2 的 DLL 库中扫描并提取匹配指定关键字或正则表达式的**完整原始字符串**。
+
+### 🛠️ 辅助脚本使用指南 (`find_dll_strings.py`)
+
+#### 1. 前提条件
+- 确保系统已安装 **Python 3.6+**。
+
+#### 2. 定位需要扫描的 DLL 文件
+Hammer 相关的界面与功能字符串通常分布在 CS2 安装目录下的以下二进制文件中：
+- `game/bin/win64/tools/worldedit.dll`（Hammer 视口、主视图与多数编辑工具界面）
+- `game/bin/win64/tools/hammer.dll`（Hammer 核心界面与面板）
+- `game/bin/win64/vstdlib.dll` / `game/bin/win64/tier0.dll` 等
+
+#### 3. 运行命令示例
+
+在终端 / PowerShell / CMD 中运行如下命令：
+
+- **基础搜索（包含关键字）：**
+  ```bash
+  python find_dll_strings.py -f "D:\SteamLibrary\steamapps\common\Counter-Strike Global Offensive\game\bin\win64\tools\worldedit.dll" -p "Transform"
+  ```
+
+- **忽略大小写 + 正则表达式匹配：**
+  ```bash
+  # 搜索以 Open 或 Create 开头的界面与操作字符串
+  python find_dll_strings.py -f "D:\...\worldedit.dll" -p "^(Open|Create).*" -i
+  ```
+
+- **搜索后自动打开文本文件浏览：**
+  ```bash
+  python find_dll_strings.py -f "D:\...\worldedit.dll" -p "Grid" --open
+  ```
+
+#### 4. 参数说明
+| 参数 | 说明 |
+| :--- | :--- |
+| `-f, --file` | 目标 DLL 或二进制文件路径 (**必填**) |
+| `-p, --pattern` | 要搜索的关键字或正则表达式 (**必填**) |
+| `-out, --output` | 输出的文本文件路径 (默认: `<DLL名>_matched_strings.txt`) |
+| `-i, --ignore-case`| 忽略大小写进行搜索匹配 |
+| `-o, --show-offset`| 输出字符串在 DLL 文件中的 16 进制偏移量与字符编码 (ASCII / UTF-16LE) |
+| `-u, --unique` | 去重输出，避免完全相同的重复字符串刷屏 |
+| `--open` | 搜索完成后自动使用记事本/默认文本编辑器打开结果文件 |
+
+#### 5. 填入词典生效
+在输出的 `.txt` 文本文件中找到对应的完整英文原文后，将完整的原文本复制并填入 `qt_translations.json` 即可成功汉化：
+```json
+{
+  "完整的英文原文字符串": "对应的中文翻译"
+}
+```
+
+---
+
 ### 💡 提交你的翻译
 
 如果你翻译或修正了新的词条，欢迎将修改后的 `qt_translations.json` 或 `fgd_translations.json` 提交 Pull Request，或者在 Issues 中分享，共同完善 CS2 中文地图制作生态！
+
