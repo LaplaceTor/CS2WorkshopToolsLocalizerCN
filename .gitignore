@@ -1,32 +1,87 @@
-# Prerequisites
-*.d
+# ====================================================================
+# Build & Output Directories
+# ====================================================================
+build/
+build-*/
+bin/
+out/
+dist/
+release/
+debug/
 
-# Compiled Object files
-*.slo
-*.lo
-*.o
-*.obj
+# ====================================================================
+# Runtime Generated & Backup Folders
+# ====================================================================
+backup/
+translations/
+mock_*/
+tools/
+fgd/
 
-# Precompiled Headers
-*.gch
-*.pch
-
-# Compiled Dynamic libraries
+# ====================================================================
+# Compiled Binaries & Libraries
+# ====================================================================
+*.exe
+*.dll
 *.so
 *.dylib
-*.dll
-
-# Fortran module files
-*.mod
-*.smod
-
-# Compiled Static libraries
-*.lai
-*.la
-*.a
 *.lib
+*.exp
+*.obj
+*.o
+*.a
+*.pdb
+*.ilk
+*.idb
 
-# Executables
-*.exe
-*.out
-*.app
+# ====================================================================
+# Qt windeployqt Deployed Folders & DLLs
+# ====================================================================
+generic/
+iconengines/
+imageformats/
+networkinformation/
+platforminputcontexts/
+platforms/
+styles/
+tls/
+qml/
+opengl32sw.dll
+d3dcompiler_*.dll
+dxcompiler.dll
+dxil.dll
+vc_redist*.exe
+build.bat
+
+# ====================================================================
+# Visual Studio & Qt Creator IDE Files
+# ====================================================================
+.vs/
+*.user
+*.user.*
+*.VC.db
+*.opendb
+*.suo
+CMakeSettings.json
+CMakeUserPresets.json
+
+# ====================================================================
+# Python Cache
+# ====================================================================
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache/
+.venv/
+venv/
+env/
+
+# ====================================================================
+# Operating System Files
+# ====================================================================
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+$RECYCLE.BIN/
+.DS_Store
