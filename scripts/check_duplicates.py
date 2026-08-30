@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 """
 CS2WorkshopToolsLocalizerCN - 翻译字典查重检测脚本
-用于检测 JSON / JSONC 翻译文件中是否存在重复的原文 (Key)，并精确定位行号。
+用于检测 JSON / JSONC 翻译文件中是否存在重复的原文 (Key)，支持作用域感知并精确定位行号。
 """
 
 import sys
@@ -21,7 +21,7 @@ if sys.stdout.encoding and sys.stdout.encoding.lower() != 'utf-8':
 def extract_keys_with_lines(filepath):
     """
     解析 JSON / JSONC 文件并提取所有 Key 及其所在起始行号。
-    支持 // 单行注释 和 /* ... */ 多行注释，仅在 JSON 对象 {...} 内部提取 Key。
+    支持 // 单行注释 和 /* ... */ 多行注释，按对象作用域 (Scope Path) 提取 Key。
     """
     with open(filepath, "r", encoding="utf-8") as f:
         text = f.read()
@@ -29,7 +29,12 @@ def extract_keys_with_lines(filepath):
     i = 0
     n = len(text)
     line = 1
-    depth = 0  # 跟踪对象深度 {...}
+    
+    # 作用域栈：存储当前所处的对象键路径
+    scope_stack = []
+    # 记录当前已确定但尚未进入值的 key
+    pending_key = None
+    
     keys = []
     
     while i < n:
@@ -58,18 +63,31 @@ def extract_keys_with_lines(filepath):
             i += 2  # 跳过 */
             continue
             
-        # 跟踪大括号深度
+        # 进入新对象
         if c == "{":
-            depth += 1
-            i += 1
-            continue
-        elif c == "}":
-            if depth > 0:
-                depth -= 1
+            if pending_key is not None:
+                scope_stack.append(pending_key)
+                pending_key = None
+            else:
+                scope_stack.append("$root" if not scope_stack else "$obj")
             i += 1
             continue
             
-        # 字符串（仅在 depth > 0 时可能为字典 Key）
+        # 离开当前对象
+        elif c == "}":
+            if scope_stack:
+                scope_stack.pop()
+            pending_key = None
+            i += 1
+            continue
+            
+        # 逗号分隔同级元素
+        elif c == ",":
+            pending_key = None
+            i += 1
+            continue
+            
+        # 字符串
         if c == '"':
             str_start_line = line
             i += 1
@@ -92,7 +110,7 @@ def extract_keys_with_lines(filepath):
             except Exception:
                 decoded_str = raw_str
                 
-            if depth > 0:
+            if scope_stack:
                 # 向前探测下一个有效非空/非注释字符是否为 ':'
                 j = i
                 temp_line = line
@@ -121,7 +139,9 @@ def extract_keys_with_lines(filepath):
                         break
                 
                 if is_key:
-                    keys.append((decoded_str, str_start_line))
+                    current_scope = tuple(scope_stack)
+                    keys.append((current_scope, decoded_str, str_start_line))
+                    pending_key = decoded_str
             continue
             
         i += 1
@@ -143,20 +163,23 @@ def check_file(filepath):
         return True, 1
 
     key_map = defaultdict(list)
-    for key, line_no in keys_with_lines:
-        key_map[key].append(line_no)
+    for scope, key, line_no in keys_with_lines:
+        scoped_id = (scope, key)
+        key_map[scoped_id].append(line_no)
 
     duplicates = {k: lines for k, lines in key_map.items() if len(lines) > 1}
 
     if not duplicates:
-        print(f"[OK] {rel_path}: 查重通过，共 {len(keys_with_lines)} 条翻译，无重复原文。\n")
+        print(f"[OK] {rel_path}: 查重通过，共 {len(keys_with_lines)} 条词条，无重复原文。\n")
         return False, 0
 
     print(f"[ERROR] {rel_path}: 发现 {len(duplicates)} 处完全重复的原文翻译项！")
-    for key, lines in duplicates.items():
+    for (scope, key), lines in duplicates.items():
         line_str = ", ".join([f"line {l}" for l in lines])
+        scope_str = " -> ".join(scope)
         # 输出 GitHub Actions Annotation 格式报错，直接在 PR/Commit 中精确定位
-        print(f"::error file={rel_path},line={lines[-1]}::[原文查重失败] \"{key}\" 重复定义于 ({line_str})")
+        print(f"::error file={rel_path},line={lines[-1]}::[原文查重失败] [{scope_str}] \"{key}\" 重复定义于 ({line_str})")
+        print(f"   - 作用域: {scope_str}")
         print(f"   - 原文: \"{key}\"")
         print(f"     重复位置: ({line_str})\n")
 
@@ -171,7 +194,7 @@ def main():
             if os.path.isfile(f)
         ]
         if not target_files:
-            target_files = ["fgd_translations.json", "qt_translations.json"]
+            target_files = ["fgd_translations.json", "fgd_override.json", "qt_translations.json"]
 
     total_errors = 0
     checked_files = 0
@@ -198,4 +221,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-

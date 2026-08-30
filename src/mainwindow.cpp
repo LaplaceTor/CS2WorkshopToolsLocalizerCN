@@ -84,10 +84,14 @@ MainWindow::MainWindow(const std::wstring& cs2Root, QWidget *parent)
 
     // 检查并生成翻译字典文件
     fs::path fgdPath = fs::path(m_workingDir) / L"fgd_translations.json";
+    fs::path fgdOverridePath = fs::path(m_workingDir) / L"fgd_override.json";
     fs::path qtPath = fs::path(m_workingDir) / L"qt_translations.json";
 
     std::wstring notice;
     if (FgdTranslator::EnsureFgdDictionaryExists(fgdPath.wstring(), L"", notice)) {
+        appendLog("[i] " + QString::fromStdWString(notice), "#66d9ef");
+    }
+    if (FgdTranslator::EnsureFgdOverrideDictionaryExists(fgdOverridePath.wstring(), L"", notice)) {
         appendLog("[i] " + QString::fromStdWString(notice), "#66d9ef");
     }
     if (FgdTranslator::EnsureQtDictionaryExists(qtPath.wstring(), L"", notice)) {
@@ -360,10 +364,14 @@ void MainWindow::onLaunchClicked() {
     fs::path cs2Bin = fs::path(m_cs2Root) / L"game" / L"bin" / L"win64";
 
     fs::path fgdDictPath = workPath / L"fgd_translations.json";
+    fs::path fgdOverridePath = workPath / L"fgd_override.json";
     fs::path qtDictPath = workPath / L"qt_translations.json";
 
     std::wstring notice;
     if (FgdTranslator::EnsureFgdDictionaryExists(fgdDictPath.wstring(), L"", notice)) {
+        appendLog("[i] " + QString::fromStdWString(notice), "#66d9ef");
+    }
+    if (FgdTranslator::EnsureFgdOverrideDictionaryExists(fgdOverridePath.wstring(), L"", notice)) {
         appendLog("[i] " + QString::fromStdWString(notice), "#66d9ef");
     }
     if (FgdTranslator::EnsureQtDictionaryExists(qtDictPath.wstring(), L"", notice)) {
@@ -385,10 +393,10 @@ void MainWindow::onLaunchClicked() {
     }
     appendLog(QString("[+] 成功备份 %1 个 FGD 文件至 backup 相对路径").arg(backedFgd.size()), "#a6e22e");
 
-    // 步骤 2: 使用 fgd_translations.json 汉化输出到 translations 文件夹相对路径，并覆盖到 CS2
-    appendLog("[2/6] 正在解析字典并汉化 FGD 实体定义...", "#e6db74");
+    // 步骤 2: 使用 fgd_translations.json 与 fgd_override.json 汉化输出到 translations 文件夹相对路径，并覆盖到 CS2
+    appendLog("[2/6] 正在解析字典与覆盖规则并汉化 FGD 实体定义...", "#e6db74");
     std::vector<std::wstring> transFgd;
-    if (!FgdTranslator::TranslateAndDeployAll(m_cs2Root, backupDir.wstring(), transDir.wstring(), fgdDictPath.wstring(), transFgd, err)) {
+    if (!FgdTranslator::TranslateAndDeployAll(m_cs2Root, backupDir.wstring(), transDir.wstring(), fgdDictPath.wstring(), fgdOverridePath.wstring(), transFgd, err)) {
         appendLog(QString("[-] 汉化 FGD 失败: %1").arg(QString::fromStdWString(err)), "#f92672");
         QMessageBox::critical(this, "错误", "汉化 FGD 文件失败，已中止启动！\n" + QString::fromStdWString(err));
         doRestore(false);
@@ -898,19 +906,27 @@ void MainWindow::onHelpClicked() {
     msgBox.setTextFormat(Qt::RichText);
     msgBox.setText(
         "<h3>📚 CS2 Workshop Tools 汉化字典格式与编写指南</h3>"
-        "<p>所有翻译字典均采用标准 <b>UTF-8 JSON</b> 键值对格式：<code>\"英文原词\": \"中文翻译\"</code></p>"
+        "<p>所有翻译字典均采用标准 <b>UTF-8 JSON / JSONC</b> 键值对格式：<code>\"英文原词\": \"中文翻译\"</code></p>"
         "<hr/>"
-        "<h4>1. 实体定义字典 (<code>fgd_translations.json</code>)</h4>"
+        "<h4>1. 实体定义翻译字典 (<code>fgd_translations.json</code>)</h4>"
         "<ul>"
+        "<li><b>作用</b>：精准匹配替换 FGD 实体定义中已有的英文字符串。</li>"
         "<li><b>实体类说明</b>：例如 <code>\"Omnidirectional point light\": \"全向点光源\"</code></li>"
         "<li><b>属性显示名</b>：例如 <code>\"Light Source\": \"光源\"</code>、<code>\"Name\": \"名称\"</code></li>"
         "<li><b>属性悬停描述</b>：例如 <code>\"The name that other entities use...\": \"其他实体用于引用的名称。\"</code></li>"
         "<li><b>选项与标记</b>：例如 <code>\"Enabled\": \"已启用\"</code>、<code>\"Disabled\": \"已禁用\"</code></li>"
         "<li><b>输入/输出 (I/O) 说明</b>：例如 <code>\"Removes this entity from the world.\": \"从世界中移除此实体。\"</code></li>"
-        "<li><i>注：所有 RAW 代码标识符（如 <code>targetname</code>、<code>angles</code> 等）引擎会自动保护，请仅翻译双引号内的文本。</i></li>"
         "</ul>"
         "<hr/>"
-        "<h4>2. 界面核心字典 (<code>qt_translations.json</code>)</h4>"
+        "<h4>2. 实体键值描述补充与覆盖字典 (<code>fgd_override.json</code>)</h4>"
+        "<ul>"
+        "<li><b>作用</b>：针对特定属性名 (Key)、实体类或 I/O <b>补充缺失描述</b>或<b>强制覆盖说明</b>。</li>"
+        "<li><b>属性描述补充</b>：在 <code>properties</code> 分组中配置，如 <code>\"bodygroups\": \"设置模型的子部件与可选网格组合。\"</code></li>"
+        "<li><b>I/O 说明补充</b>：在 <code>io</code> 分组中配置，如 <code>\"SetParent\": \"设置该实体的父级层级对象。\"</code></li>"
+        "<li><b>实体类说明</b>：在 <code>classes</code> 分组中配置，如 <code>\"info_node\": \"AI 地面导航节点。\"</code></li>"
+        "</ul>"
+        "<hr/>"
+        "<h4>3. 界面核心字典 (<code>qt_translations.json</code>)</h4>"
         "<ul>"
         "<li><b>主菜单与工具栏</b>：例如 <code>\"File\": \"文件\"</code>、<code>\"Clipping Tool\": \"剪切工具\"</code></li>"
         "<li><b>通用属性面板</b>：例如 <code>\"Transform Locked\": \"变换锁定\"</code>、<code>\"Pinned To\": \"固定至\"</code></li>"

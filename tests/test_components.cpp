@@ -31,7 +31,7 @@ int main() {
     }
     assert(found && "CS2 must be detected on this machine");
 
-    // 2. Test FGD Translation Logic
+    // 2. Test FGD Translation & Override Logic
     std::unordered_map<std::string, std::string> dict;
     dict["Omnidirectional point light"] = "全向点光源";
     dict["Light Source"] = "光源";
@@ -39,22 +39,77 @@ int main() {
     dict["The name that other entities use to refer to this entity."] = "其他实体用于引用此实体的名称。";
     dict["Removes this entity from the world."] = "从世界中移除此实体。";
     dict["Enabled"] = "已启用";
+    dict["Body Groups"] = "身体部件组";
+    dict["Maximum Lightmap Resolution"] = "最大光照贴图分辨率";
+    dict["World Model"] = "世界模型";
 
+    FgdOverrideData overrideData;
+    overrideData.globalProperties["bodygroups"].description = "设置模型的子部件与可选身体部件网格组合。";
+    overrideData.globalProperties["max_lightmap_resolution"].description = "限制此对象在烘焙时的最大光照贴图分辨率。";
+    overrideData.globalProperties["model"].description = "实体引用的 3D 模型资源文件路径。";
+    overrideData.ioOverrides["SetParent"] = "设置该实体的父级层级对象，使其跟随父级移动。";
+    overrideData.classDescriptions["csm_fov_override"] = "级联阴影贴图 (CSM) 视场角覆盖控制器。";
+    overrideData.classDescriptions["env_cubemap"] = "用于采样环境间接镜面反射的高动态范围立方体贴图实体。";
+    overrideData.classProperties["env_cubemap"]["influenceradius"].description = "当前立方体贴图的生效影响半径（单位：英寸）。";
+
+    std::string currentCls = "";
+
+    // 2.1 实体类测试 (已有描述与无描述)
     std::string testClass = "@PointClass = light_omni : \"Omnidirectional point light\" []";
-    std::string transClass = FgdTranslator::TranslateLine(testClass, dict);
+    std::string transClass = FgdTranslator::TranslateLine(testClass, dict, overrideData, currentCls);
     std::cout << "[Test 2.1] Class trans: " << transClass << "\n";
     assert(transClass.find("全向点光源") != std::string::npos);
+    assert(currentCls == "light_omni");
 
+    std::string testBareClass = "@PointClass editormodel(\"models/editor/camera.vmdl\", fixedbounds) = csm_fov_override :";
+    std::string transBareClass = FgdTranslator::TranslateLine(testBareClass, dict, overrideData, currentCls);
+    std::cout << "[Test 2.2] Bare Class override: " << transBareClass << "\n";
+    assert(transBareClass.find("级联阴影贴图 (CSM) 视场角覆盖控制器。") != std::string::npos);
+    assert(currentCls == "csm_fov_override");
+
+    // 2.2 属性测试 (完整三段、无描述属性、无描述带Choices、仅显示名)
     std::string testProp = "    targetname(target_source) : \"Name\" : : \"The name that other entities use to refer to this entity.\"";
-    std::string transProp = FgdTranslator::TranslateLine(testProp, dict);
-    std::cout << "[Test 2.2] Prop trans: " << transProp << "\n";
+    std::string transProp = FgdTranslator::TranslateLine(testProp, dict, overrideData, currentCls);
+    std::cout << "[Test 2.3] Prop trans: " << transProp << "\n";
     assert(transProp.find("名称") != std::string::npos);
     assert(transProp.find("其他实体用于引用此实体的名称。") != std::string::npos);
 
+    std::string testNoDescProp = "\tbodygroups(bodygroupchoices) [ group=\"Render Properties\" ] : \"Body Groups\" : \"\"";
+    std::string transNoDescProp = FgdTranslator::TranslateLine(testNoDescProp, dict, overrideData, currentCls);
+    std::cout << "[Test 2.4] No-desc prop override: " << transNoDescProp << "\n";
+    assert(transNoDescProp.find("身体部件组") != std::string::npos);
+    assert(transNoDescProp.find("设置模型的子部件与可选身体部件网格组合。") != std::string::npos);
+
+    std::string testChoiceNoDesc = "\tmax_lightmap_resolution(choices) : \"Maximum Lightmap Resolution\" : \"0\" =";
+    std::string transChoiceNoDesc = FgdTranslator::TranslateLine(testChoiceNoDesc, dict, overrideData, currentCls);
+    std::cout << "[Test 2.5] Choices no-desc override: " << transChoiceNoDesc << "\n";
+    assert(transChoiceNoDesc.find("最大光照贴图分辨率") != std::string::npos);
+    assert(transChoiceNoDesc.find("限制此对象在烘焙时的最大光照贴图分辨率。") != std::string::npos);
+    assert(transChoiceNoDesc.back() == '=' || transChoiceNoDesc.find(" =") != std::string::npos);
+
+    std::string testDispOnly = "\tmodel(studio) { report = true sort_priority = 80 } : \"World Model\"";
+    std::string transDispOnly = FgdTranslator::TranslateLine(testDispOnly, dict, overrideData, currentCls);
+    std::cout << "[Test 2.6] Display-only prop override: " << transDispOnly << "\n";
+    assert(transDispOnly.find("世界模型") != std::string::npos);
+    assert(transDispOnly.find("实体引用的 3D 模型资源文件路径。") != std::string::npos);
+
+    // 2.3 I/O 测试 (已有描述与无描述 I/O 补充)
     std::string testIO = "    input Kill(void) : \"Removes this entity from the world.\"";
-    std::string transIO = FgdTranslator::TranslateLine(testIO, dict);
-    std::cout << "[Test 2.3] I/O trans: " << transIO << "\n";
+    std::string transIO = FgdTranslator::TranslateLine(testIO, dict, overrideData, currentCls);
+    std::cout << "[Test 2.7] I/O trans: " << transIO << "\n";
     assert(transIO.find("从世界中移除此实体。") != std::string::npos);
+
+    std::string testBareIO = "\tinput SetParent(api)";
+    std::string transBareIO = FgdTranslator::TranslateLine(testBareIO, dict, overrideData, currentCls);
+    std::cout << "[Test 2.8] Bare I/O override: " << transBareIO << "\n";
+    assert(transBareIO.find("设置该实体的父级层级对象，使其跟随父级移动。") != std::string::npos);
+
+    // 2.4 类作用域特定属性测试
+    currentCls = "env_cubemap";
+    std::string testScopedProp = "\tinfluenceradius(float) { min=12 } : \"Influence Radius\" : \"256.0\" : \"The radius of influence for this cubemap\"";
+    std::string transScopedProp = FgdTranslator::TranslateLine(testScopedProp, dict, overrideData, currentCls);
+    std::cout << "[Test 2.9] Scoped prop override: " << transScopedProp << "\n";
+    assert(transScopedProp.find("当前立方体贴图的生效影响半径（单位：英寸）。") != std::string::npos);
 
     // 3. Test PE Patcher against CS2 Qt5Core.dll
     fs::path qt5CoreSrc = fs::path(cs2Root) / L"game" / L"bin" / L"win64" / L"Qt5Core.dll";
@@ -147,15 +202,18 @@ int main() {
     // 5. Test Dictionary Generation when Missing
     std::cout << "[Test 5] Testing Template Dictionary Generation...\n";
     fs::path tempFgdJson = fs::current_path() / L"test_missing_fgd.json";
+    fs::path tempOverrideJson = fs::current_path() / L"test_missing_override.json";
     fs::path tempQtJson = fs::current_path() / L"test_missing_qt.json";
     if (fs::exists(tempFgdJson)) fs::remove(tempFgdJson);
+    if (fs::exists(tempOverrideJson)) fs::remove(tempOverrideJson);
     if (fs::exists(tempQtJson)) fs::remove(tempQtJson);
 
     std::wstring genNotice;
     bool g1 = FgdTranslator::EnsureFgdDictionaryExists(tempFgdJson.wstring(), L"", genNotice);
-    bool g2 = FgdTranslator::EnsureQtDictionaryExists(tempQtJson.wstring(), L"", genNotice);
-    assert(g1 && g2 && "Template generator must return true when creating new files");
-    assert(fs::exists(tempFgdJson) && fs::exists(tempQtJson));
+    bool g2 = FgdTranslator::EnsureFgdOverrideDictionaryExists(tempOverrideJson.wstring(), L"", genNotice);
+    bool g3 = FgdTranslator::EnsureQtDictionaryExists(tempQtJson.wstring(), L"", genNotice);
+    assert(g1 && g2 && g3 && "Template generator must return true when creating new files");
+    assert(fs::exists(tempFgdJson) && fs::exists(tempOverrideJson) && fs::exists(tempQtJson));
 
     // 验证生成的字典内容有效且没有将注释污染为字典词条
     std::unordered_map<std::string, std::string> parsedFgd;
@@ -163,6 +221,13 @@ int main() {
     assert(p1 && "Generated FGD template JSONC must be valid");
     assert(parsedFgd.find("_说明_1_使用指南") == parsedFgd.end() && "JSONC comments should not be parsed as keys");
     assert(parsedFgd.find("Omnidirectional point light") != parsedFgd.end());
+
+    FgdOverrideData parsedOverride;
+    bool pOv = FgdTranslator::LoadOverrideDictionary(tempOverrideJson.wstring(), parsedOverride);
+    assert(pOv && "Generated FGD override template JSONC must be valid");
+    assert(parsedOverride.globalProperties.find("bodygroups") != parsedOverride.globalProperties.end());
+    assert(parsedOverride.ioOverrides.find("SetParent") != parsedOverride.ioOverrides.end());
+    assert(parsedOverride.classDescriptions.find("info_node") != parsedOverride.classDescriptions.end());
 
     std::unordered_map<std::string, std::string> parsedQt;
     bool p2 = FgdTranslator::LoadDictionary(tempQtJson.wstring(), parsedQt);
@@ -179,6 +244,7 @@ int main() {
     }
 
     fs::remove(tempFgdJson);
+    fs::remove(tempOverrideJson);
     fs::remove(tempQtJson);
     std::cout << "[Test 5] Template Dictionary Generation: PASSED\n";
 

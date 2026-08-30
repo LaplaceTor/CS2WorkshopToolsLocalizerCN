@@ -67,6 +67,9 @@ add_custom_command(TARGET CS2WorkshopToolsLocalizerCN POST_BUILD
         "${CMAKE_CURRENT_SOURCE_DIR}/fgd_translations.json"
         "$<TARGET_FILE_DIR:CS2WorkshopToolsLocalizerCN>/fgd_translations.json"
     COMMAND ${CMAKE_COMMAND} -E copy_if_different
+        "${CMAKE_CURRENT_SOURCE_DIR}/fgd_override.json"
+        "$<TARGET_FILE_DIR:CS2WorkshopToolsLocalizerCN>/fgd_override.json"
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different
         "${CMAKE_CURRENT_SOURCE_DIR}/qt_translations.json"
         "$<TARGET_FILE_DIR:CS2WorkshopToolsLocalizerCN>/qt_translations.json"
     COMMAND ${CMAKE_COMMAND} -E copy_if_different

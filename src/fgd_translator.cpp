@@ -5,40 +5,75 @@
 #include <regex>
 #include <filesystem>
 #include <iostream>
+#include <memory>
 
 namespace fs = std::filesystem;
 
-static bool ParseJsonTranslations(const char* jsonContent, size_t length, std::unordered_map<std::string, std::string>& outMap) {
-    outMap.clear();
-    outMap.reserve(15000);
+// ==============================================================================
+// 轻量级 JSON / JSONC 解析器
+// 支持 // 单行注释、/* ... */ 块注释、转义字符以及嵌套 Object / Array
+// ==============================================================================
+namespace {
 
-    const char* p = jsonContent;
-    const char* end = jsonContent + length;
+enum class JsonType {
+    Null,
+    Bool,
+    Number,
+    String,
+    Array,
+    Object
+};
 
-    // 跳过 UTF-8 BOM
-    if (length >= 3 && (unsigned char)p[0] == 0xEF && (unsigned char)p[1] == 0xBB && (unsigned char)p[2] == 0xBF) {
-        p += 3;
+struct JsonValue {
+    JsonType type = JsonType::Null;
+    std::string str;
+    std::vector<JsonValue> arr;
+    std::unordered_map<std::string, JsonValue> obj;
+
+    bool isString() const { return type == JsonType::String; }
+    bool isObject() const { return type == JsonType::Object; }
+    bool isArray() const { return type == JsonType::Array; }
+    bool isNull() const { return type == JsonType::Null; }
+};
+
+class JsoncParser {
+public:
+    JsoncParser(const char* data, size_t length)
+        : p(data), end(data + length)
+    {
+        // 跳过 UTF-8 BOM
+        if (length >= 3 && (unsigned char)p[0] == 0xEF && (unsigned char)p[1] == 0xBB && (unsigned char)p[2] == 0xBF) {
+            p += 3;
+        }
     }
 
-    auto skipWhitespaceAndComments = [&]() {
+    bool parse(JsonValue& root) {
+        skipWhitespaceAndComments();
+        if (p >= end) return false;
+        return parseValue(root);
+    }
+
+private:
+    const char* p;
+    const char* end;
+
+    void skipWhitespaceAndComments() {
         while (p < end) {
             if (*p == ' ' || *p == '\t' || *p == '\r' || *p == '\n' || *p == ',') {
                 p++;
             } else if (*p == '/' && (p + 1 < end)) {
                 if (*(p + 1) == '/') {
-                    // 单行注释 //
                     p += 2;
                     while (p < end && *p != '\n' && *p != '\r') {
                         p++;
                     }
                 } else if (*(p + 1) == '*') {
-                    // 块注释 /* ... */
                     p += 2;
                     while (p + 1 < end && !(*p == '*' && *(p + 1) == '/')) {
                         p++;
                     }
                     if (p + 1 < end) {
-                        p += 2; // 跳过 '*/'
+                        p += 2;
                     } else {
                         p = end;
                     }
@@ -49,17 +84,13 @@ static bool ParseJsonTranslations(const char* jsonContent, size_t length, std::u
                 break;
             }
         }
-    };
+    }
 
-    skipWhitespaceAndComments();
-    if (p >= end || *p != '{') return false;
-    p++;
-
-    auto parseString = [&](std::string& str) -> bool {
+    bool parseString(std::string& outStr) {
         if (p >= end || *p != '"') return false;
         p++;
-        str.clear();
-        str.reserve(64);
+        outStr.clear();
+        outStr.reserve(64);
 
         while (p < end) {
             char c = *p++;
@@ -68,14 +99,14 @@ static bool ParseJsonTranslations(const char* jsonContent, size_t length, std::u
                 if (p >= end) return false;
                 char esc = *p++;
                 switch (esc) {
-                    case '"':  str.push_back('"'); break;
-                    case '\\': str.push_back('\\'); break;
-                    case '/':  str.push_back('/'); break;
-                    case 'b':  str.push_back('\b'); break;
-                    case 'f':  str.push_back('\f'); break;
-                    case 'n':  str.push_back('\n'); break;
-                    case 'r':  str.push_back('\r'); break;
-                    case 't':  str.push_back('\t'); break;
+                    case '"':  outStr.push_back('"'); break;
+                    case '\\': outStr.push_back('\\'); break;
+                    case '/':  outStr.push_back('/'); break;
+                    case 'b':  outStr.push_back('\b'); break;
+                    case 'f':  outStr.push_back('\f'); break;
+                    case 'n':  outStr.push_back('\n'); break;
+                    case 'r':  outStr.push_back('\r'); break;
+                    case 't':  outStr.push_back('\t'); break;
                     case 'u': {
                         if (p + 4 > end) return false;
                         unsigned int codepoint = 0;
@@ -88,51 +119,129 @@ static bool ParseJsonTranslations(const char* jsonContent, size_t length, std::u
                             else return false;
                         }
                         if (codepoint <= 0x7F) {
-                            str.push_back((char)codepoint);
+                            outStr.push_back((char)codepoint);
                         } else if (codepoint <= 0x7FF) {
-                            str.push_back((char)(0xC0 | ((codepoint >> 6) & 0x1F)));
-                            str.push_back((char)(0x80 | (codepoint & 0x3F)));
+                            outStr.push_back((char)(0xC0 | ((codepoint >> 6) & 0x1F)));
+                            outStr.push_back((char)(0x80 | (codepoint & 0x3F)));
                         } else if (codepoint <= 0xFFFF) {
-                            str.push_back((char)(0xE0 | ((codepoint >> 12) & 0x0F)));
-                            str.push_back((char)(0x80 | ((codepoint >> 6) & 0x3F)));
-                            str.push_back((char)(0x80 | (codepoint & 0x3F)));
+                            outStr.push_back((char)(0xE0 | ((codepoint >> 12) & 0x0F)));
+                            outStr.push_back((char)(0x80 | ((codepoint >> 6) & 0x3F)));
+                            outStr.push_back((char)(0x80 | (codepoint & 0x3F)));
                         }
                         break;
                     }
                     default:
-                        str.push_back(esc);
+                        outStr.push_back(esc);
                         break;
                 }
             } else {
-                str.push_back(c);
+                outStr.push_back(c);
             }
         }
         return false;
-    };
-
-    std::string key, val;
-    while (p < end) {
-        skipWhitespaceAndComments();
-        if (p >= end || *p == '}') break;
-
-        if (!parseString(key)) break;
-
-        skipWhitespaceAndComments();
-        if (p >= end || *p != ':') break;
-        p++;
-
-        skipWhitespaceAndComments();
-        if (!parseString(val)) break;
-
-        if (!key.empty() && !val.empty()) {
-            outMap[key] = val;
-        }
     }
 
-    return !outMap.empty();
-}
+    bool parseObject(JsonValue& val) {
+        if (p >= end || *p != '{') return false;
+        p++;
+        val.type = JsonType::Object;
+        val.obj.clear();
+
+        while (p < end) {
+            skipWhitespaceAndComments();
+            if (p >= end) return false;
+            if (*p == '}') {
+                p++;
+                return true;
+            }
+
+            std::string key;
+            if (!parseString(key)) return false;
+
+            skipWhitespaceAndComments();
+            if (p >= end || *p != ':') return false;
+            p++;
+
+            skipWhitespaceAndComments();
+            JsonValue child;
+            if (!parseValue(child)) return false;
+
+            val.obj[key] = std::move(child);
+        }
+        return false;
+    }
+
+    bool parseArray(JsonValue& val) {
+        if (p >= end || *p != '[') return false;
+        p++;
+        val.type = JsonType::Array;
+        val.arr.clear();
+
+        while (p < end) {
+            skipWhitespaceAndComments();
+            if (p >= end) return false;
+            if (*p == ']') {
+                p++;
+                return true;
+            }
+
+            JsonValue item;
+            if (!parseValue(item)) return false;
+            val.arr.push_back(std::move(item));
+        }
+        return false;
+    }
+
+    bool parseValue(JsonValue& val) {
+        skipWhitespaceAndComments();
+        if (p >= end) return false;
+
+        if (*p == '{') {
+            return parseObject(val);
+        } else if (*p == '[') {
+            return parseArray(val);
+        } else if (*p == '"') {
+            val.type = JsonType::String;
+            return parseString(val.str);
+        } else if (*p == 't' || *p == 'f') {
+            // boolean
+            if (p + 4 <= end && memcmp(p, "true", 4) == 0) {
+                p += 4;
+                val.type = JsonType::Bool;
+                val.str = "true";
+                return true;
+            } else if (p + 5 <= end && memcmp(p, "false", 5) == 0) {
+                p += 5;
+                val.type = JsonType::Bool;
+                val.str = "false";
+                return true;
+            }
+            return false;
+        } else if (*p == 'n' && p + 4 <= end && memcmp(p, "null", 4) == 0) {
+            p += 4;
+            val.type = JsonType::Null;
+            return true;
+        } else if (*p == '-' || (*p >= '0' && *p <= '9')) {
+            // number
+            val.type = JsonType::Number;
+            val.str.clear();
+            while (p < end && (*p == '-' || *p == '+' || *p == '.' || *p == 'e' || *p == 'E' || (*p >= '0' && *p <= '9'))) {
+                val.str.push_back(*p++);
+            }
+            return true;
+        }
+        return false;
+    }
+};
+
+} // anonymous namespace
+
+// ==============================================================================
+// 字典加载与解析
+// ==============================================================================
 
 bool FgdTranslator::LoadDictionary(const std::wstring& jsonPath, std::unordered_map<std::string, std::string>& outDict) {
+    outDict.clear();
     FILE* fp = _wfopen(jsonPath.c_str(), L"rb");
     if (!fp) return false;
 
@@ -149,7 +258,144 @@ bool FgdTranslator::LoadDictionary(const std::wstring& jsonPath, std::unordered_
     fread(buffer.data(), 1, fsize, fp);
     fclose(fp);
 
-    return ParseJsonTranslations(buffer.data(), fsize, outDict);
+    JsonValue root;
+    JsoncParser parser(buffer.data(), fsize);
+    if (!parser.parse(root) || !root.isObject()) {
+        return false;
+    }
+
+    outDict.reserve(root.obj.size());
+    for (const auto& kv : root.obj) {
+        if (kv.second.isString() && !kv.second.str.empty()) {
+            outDict[kv.first] = kv.second.str;
+        }
+    }
+
+    return !outDict.empty();
+}
+
+bool FgdTranslator::LoadOverrideDictionary(const std::wstring& jsonPath, FgdOverrideData& outOverride) {
+    outOverride = FgdOverrideData();
+    FILE* fp = _wfopen(jsonPath.c_str(), L"rb");
+    if (!fp) return false;
+
+    fseek(fp, 0, SEEK_END);
+    long fsize = ftell(fp);
+    fseek(fp, 0, SEEK_SET);
+
+    if (fsize <= 0) {
+        fclose(fp);
+        return false;
+    }
+
+    std::vector<char> buffer(fsize + 1, 0);
+    fread(buffer.data(), 1, fsize, fp);
+    fclose(fp);
+
+    JsonValue root;
+    JsoncParser parser(buffer.data(), fsize);
+    if (!parser.parse(root) || !root.isObject()) {
+        return false;
+    }
+
+    auto parsePropOverride = [](const JsonValue& val, FgdPropertyOverride& propOut) {
+        if (val.isString()) {
+            propOut.description = val.str;
+        } else if (val.isObject()) {
+            auto itDesc = val.obj.find("description");
+            if (itDesc != val.obj.end() && itDesc->second.isString()) {
+                propOut.description = itDesc->second.str;
+            }
+            auto itDisplay = val.obj.find("displayName");
+            if (itDisplay != val.obj.end() && itDisplay->second.isString()) {
+                propOut.displayName = itDisplay->second.str;
+            }
+        }
+    };
+
+    for (const auto& kv : root.obj) {
+        const std::string& key = kv.first;
+        const JsonValue& val = kv.second;
+
+        if (key == "properties" && val.isObject()) {
+            // 1. 全局属性
+            for (const auto& pkv : val.obj) {
+                FgdPropertyOverride prop;
+                parsePropOverride(pkv.second, prop);
+                if (!prop.description.empty() || !prop.displayName.empty()) {
+                    outOverride.globalProperties[pkv.first] = std::move(prop);
+                }
+            }
+        } else if (key == "io" && val.isObject()) {
+            // 2. I/O
+            for (const auto& iokv : val.obj) {
+                if (iokv.second.isString()) {
+                    outOverride.ioOverrides[iokv.first] = iokv.second.str;
+                } else if (iokv.second.isObject()) {
+                    auto itDesc = iokv.second.obj.find("description");
+                    if (itDesc != iokv.second.obj.end() && itDesc->second.isString()) {
+                        outOverride.ioOverrides[iokv.first] = itDesc->second.str;
+                    }
+                }
+            }
+        } else if (key == "classes" && val.isObject()) {
+            // 3. 类说明与类作用域特定属性
+            for (const auto& ckv : val.obj) {
+                const std::string& clsName = ckv.first;
+                if (ckv.second.isString()) {
+                    outOverride.classDescriptions[clsName] = ckv.second.str;
+                } else if (ckv.second.isObject()) {
+                    auto itDesc = ckv.second.obj.find("description");
+                    if (itDesc != ckv.second.obj.end() && itDesc->second.isString()) {
+                        outOverride.classDescriptions[clsName] = itDesc->second.str;
+                    }
+                    auto itProps = ckv.second.obj.find("properties");
+                    if (itProps != ckv.second.obj.end() && itProps->second.isObject()) {
+                        for (const auto& pkv : itProps->second.obj) {
+                            FgdPropertyOverride prop;
+                            parsePropOverride(pkv.second, prop);
+                            if (!prop.description.empty() || !prop.displayName.empty()) {
+                                outOverride.classProperties[clsName][pkv.first] = std::move(prop);
+                            }
+                        }
+                    }
+                }
+            }
+        } else if (key.rfind("_", 0) != 0) {
+            // 4. 顶层平铺直接定义
+            if (val.isString()) {
+                FgdPropertyOverride prop;
+                prop.description = val.str;
+                outOverride.globalProperties[key] = std::move(prop);
+            } else if (val.isObject()) {
+                if (val.obj.find("properties") != val.obj.end()) {
+                    // 作为类定义解析
+                    auto itDesc = val.obj.find("description");
+                    if (itDesc != val.obj.end() && itDesc->second.isString()) {
+                        outOverride.classDescriptions[key] = itDesc->second.str;
+                    }
+                    auto itProps = val.obj.find("properties");
+                    if (itProps != val.obj.end() && itProps->second.isObject()) {
+                        for (const auto& pkv : itProps->second.obj) {
+                            FgdPropertyOverride prop;
+                            parsePropOverride(pkv.second, prop);
+                            if (!prop.description.empty() || !prop.displayName.empty()) {
+                                outOverride.classProperties[key][pkv.first] = std::move(prop);
+                            }
+                        }
+                    }
+                } else {
+                    FgdPropertyOverride prop;
+                    parsePropOverride(val, prop);
+                    if (!prop.description.empty() || !prop.displayName.empty()) {
+                        outOverride.globalProperties[key] = std::move(prop);
+                    }
+                }
+            }
+        }
+    }
+
+    return !outOverride.empty();
 }
 
 static inline std::string TrimString(const std::string& str) {
@@ -159,7 +405,22 @@ static inline std::string TrimString(const std::string& str) {
     return str.substr(first, last - first + 1);
 }
 
+// ==============================================================================
+// 单行 FGD 翻译与覆盖处理
+// ==============================================================================
+
 std::string FgdTranslator::TranslateLine(const std::string& line, const std::unordered_map<std::string, std::string>& dict) {
+    std::string dummyClass;
+    FgdOverrideData dummyOverride;
+    return TranslateLine(line, dict, dummyOverride, dummyClass);
+}
+
+std::string FgdTranslator::TranslateLine(
+    const std::string& line,
+    const std::unordered_map<std::string, std::string>& dict,
+    const FgdOverrideData& overrideData,
+    std::string& inOutCurrentClass
+) {
     std::string lineEnding = "";
     std::string raw = line;
     if (raw.length() >= 2 && raw.substr(raw.length() - 2) == "\r\n") {
@@ -194,28 +455,95 @@ std::string FgdTranslator::TranslateLine(const std::string& line, const std::uno
         return text;
     };
 
-    // 1. 实体类说明：= classname : "Description"
-    std::regex classRegex(R"re((=)\s*([a-zA-Z0-9_]+)\s*:\s*"([^"]*)")re");
-    std::smatch classMatch;
-    if (std::regex_search(code, classMatch, classRegex)) {
-        std::string prefix = code.substr(0, classMatch.position(0));
-        std::string name = classMatch[2].str();
-        std::string desc = classMatch[3].str();
-        std::string suffix = code.substr(classMatch.position(0) + classMatch.length(0));
-        std::string tr = getTrans(desc);
-        return prefix + "= " + name + " : \"" + tr + "\"" + suffix + comment + lineEnding;
+    // 1. 实体类定义与说明跟踪：
+    //    支持 = classname : "Description" 或 = classname : 或 = classname
+    std::regex classFullRegex(R"re((=\s*)([a-zA-Z0-9_]+)\s*:\s*"([^"]*)")re");
+    std::smatch classFullMatch;
+    if (std::regex_search(code, classFullMatch, classFullRegex)) {
+        std::string prefix = code.substr(0, classFullMatch.position(0));
+        std::string eq = classFullMatch[1].str();
+        std::string className = classFullMatch[2].str();
+        std::string origDesc = classFullMatch[3].str();
+        std::string suffix = code.substr(classFullMatch.position(0) + classFullMatch.length(0));
+
+        inOutCurrentClass = className;
+
+        std::string finalDesc = "";
+        auto itDesc = overrideData.classDescriptions.find(className);
+        if (itDesc != overrideData.classDescriptions.end() && !itDesc->second.empty()) {
+            finalDesc = itDesc->second;
+        } else {
+            finalDesc = getTrans(origDesc);
+        }
+
+        return prefix + eq + className + " : \"" + finalDesc + "\"" + suffix + comment + lineEnding;
     }
 
-    // 2. 输入 / 输出描述：input/output Name(type) : "Description"
-    std::regex ioRegex(R"re(^(input|output)\s+([a-zA-Z0-9_]+\s*\([^)]*\))\s*:\s*"([^"]*)")re");
+    std::regex classBareRegex(R"re((=\s*)([a-zA-Z0-9_]+)(\s*(?::\s*)?)(?:\[|$))re");
+    std::smatch classBareMatch;
+    if (std::regex_search(code, classBareMatch, classBareRegex)) {
+        std::string className = classBareMatch[2].str();
+        inOutCurrentClass = className;
+
+        auto itDesc = overrideData.classDescriptions.find(className);
+        if (itDesc != overrideData.classDescriptions.end() && !itDesc->second.empty()) {
+            std::string prefix = code.substr(0, classBareMatch.position(0));
+            std::string eq = classBareMatch[1].str();
+            std::string after = code.substr(classBareMatch.position(0) + classBareMatch.length(0));
+            // 如果原行尾部是 [，保留
+            std::string bracketTail = "";
+            if (!code.empty() && code.find('[', classBareMatch.position(0)) != std::string::npos) {
+                bracketTail = code.substr(code.find('[', classBareMatch.position(0)));
+            }
+            return prefix + eq + className + " : \"" + itDesc->second + "\" " + bracketTail + comment + lineEnding;
+        }
+    }
+
+    // 2. 输入 / 输出描述：input/output Name(type) [ : "Description" ]
+    std::regex ioRegex(R"re(^(\s*(?:input|output)\s+)([a-zA-Z0-9_]+)(\s*\([^)]*\))(.*)$)re");
     std::smatch ioMatch;
-    if (std::regex_search(code, ioMatch, ioRegex)) {
-        std::string kind = ioMatch[1].str();
-        std::string nameType = ioMatch[2].str();
-        std::string desc = ioMatch[3].str();
-        std::string suffix = code.substr(ioMatch.position(0) + ioMatch.length(0));
-        std::string tr = getTrans(desc);
-        return kind + " " + nameType + " : \"" + tr + "\"" + suffix + comment + lineEnding;
+    if (std::regex_match(code, ioMatch, ioRegex)) {
+        std::string ioPrefix = ioMatch[1].str();
+        std::string ioName = ioMatch[2].str();
+        std::string ioParam = ioMatch[3].str();
+        std::string ioRest = ioMatch[4].str();
+
+        std::string overrideIoDesc = "";
+        // 优先在当前类中查找，其次在全局 ioOverrides，最后在 globalProperties
+        if (!inOutCurrentClass.empty()) {
+            auto itCls = overrideData.classProperties.find(inOutCurrentClass);
+            if (itCls != overrideData.classProperties.end()) {
+                auto itP = itCls->second.find(ioName);
+                if (itP != itCls->second.end() && !itP->second.description.empty()) {
+                    overrideIoDesc = itP->second.description;
+                }
+            }
+        }
+        if (overrideIoDesc.empty()) {
+            auto itIo = overrideData.ioOverrides.find(ioName);
+            if (itIo != overrideData.ioOverrides.end() && !itIo->second.empty()) {
+                overrideIoDesc = itIo->second;
+            }
+        }
+        if (overrideIoDesc.empty()) {
+            auto itGlob = overrideData.globalProperties.find(ioName);
+            if (itGlob != overrideData.globalProperties.end() && !itGlob->second.description.empty()) {
+                overrideIoDesc = itGlob->second.description;
+            }
+        }
+
+        std::regex descQuoteRegex(R"re(:\s*"([^"]*)")re");
+        std::smatch descQuoteMatch;
+        if (std::regex_search(ioRest, descQuoteMatch, descQuoteRegex)) {
+            std::string origDesc = descQuoteMatch[1].str();
+            std::string finalDesc = overrideIoDesc.empty() ? getTrans(origDesc) : overrideIoDesc;
+            std::string replacedRest = ioRest.substr(0, descQuoteMatch.position(0)) + ": \"" + finalDesc + "\"" + ioRest.substr(descQuoteMatch.position(0) + descQuoteMatch.length(0));
+            return ioPrefix + ioName + ioParam + replacedRest + comment + lineEnding;
+        } else if (!overrideIoDesc.empty()) {
+            // 原行无描述，追加描述
+            return ioPrefix + ioName + ioParam + " : \"" + overrideIoDesc + "\"" + comment + lineEnding;
+        }
+        return code + comment + lineEnding;
     }
 
     // 3. 按钮/元数据说明：desc = "Description"
@@ -229,70 +557,145 @@ std::string FgdTranslator::TranslateLine(const std::string& line, const std::uno
         return prefix + "desc = \"" + tr + "\"" + suffix + comment + lineEnding;
     }
 
-    // 4. 属性定义：prop(type) [attrs] {attrs} : "Display Name" [ : default [ : "Description" ]]
-    std::regex propRegex(R"re(^(\s*[a-zA-Z0-9_\.]+\s*\([a-zA-Z0-9_:]+\)(?:\s*\[[^\]]*\]|\s*\{[^\}]*\})*\s*:)(.*)$)re");
+    // 4. 属性定义：prop(type) [attrs] {attrs} : "Display Name" [ : default [ : "Description" ]] [ = [ choices ] ]
+    std::regex propRegex(R"re(^(\s*([a-zA-Z0-9_\.]+)\s*\(([a-zA-Z0-9_:]+)\)((?:\s*\[[^\]]*\]|\s*\{[^\}]*\})*)\s*)(:?.*)$)re");
     std::smatch propMatch;
     if (std::regex_match(code, propMatch, propRegex)) {
-        std::string prefix = propMatch[1].str();
-        std::string rest = propMatch[2].str();
+        std::string propHead = propMatch[1].str();
+        std::string propKey = propMatch[2].str();
+        std::string propType = propMatch[3].str();
+        std::string propAttrs = propMatch[4].str();
+        std::string rest = propMatch[5].str();
 
-        std::vector<std::string> parts;
-        std::string curr = "";
-        bool inQ = false;
+        // 查找该属性是否有 override
+        const FgdPropertyOverride* propOverride = nullptr;
+        if (!inOutCurrentClass.empty()) {
+            auto itCls = overrideData.classProperties.find(inOutCurrentClass);
+            if (itCls != overrideData.classProperties.end()) {
+                auto itP = itCls->second.find(propKey);
+                if (itP != itCls->second.end()) {
+                    propOverride = &itP->second;
+                }
+            }
+        }
+        if (!propOverride) {
+            auto itGlob = overrideData.globalProperties.find(propKey);
+            if (itGlob != overrideData.globalProperties.end()) {
+                propOverride = &itGlob->second;
+            }
+        }
+
+        // 分离 choices 尾部 (如果有 = )
         std::string choicesTail = "";
-
+        std::string propBody = rest;
+        bool inQ = false;
         for (size_t i = 0; i < rest.length(); ++i) {
             char c = rest[i];
             if (c == '"') {
                 inQ = !inQ;
-                curr.push_back(c);
-            } else if (c == ':' && !inQ) {
-                parts.push_back(curr);
-                curr.clear();
             } else if (c == '=' && !inQ) {
+                propBody = rest.substr(0, i);
                 choicesTail = rest.substr(i);
                 break;
+            }
+        }
+
+        // 解析 propBody 中的冒号分隔项
+        std::vector<std::string> parts;
+        std::string curr = "";
+        inQ = false;
+        bool hasInitialColon = false;
+
+        for (size_t i = 0; i < propBody.length(); ++i) {
+            char c = propBody[i];
+            if (c == '"') {
+                inQ = !inQ;
+                curr.push_back(c);
+            } else if (c == ':' && !inQ) {
+                if (!hasInitialColon && parts.empty() && TrimString(curr).empty()) {
+                    hasInitialColon = true;
+                    curr.clear();
+                    continue;
+                }
+                parts.push_back(curr);
+                curr.clear();
             } else {
                 curr.push_back(c);
             }
         }
-        if (!curr.empty() || (!parts.empty() && choicesTail.empty())) {
+        if (!curr.empty() || hasInitialColon) {
             parts.push_back(curr);
         }
 
         std::string newRest = "";
-        for (size_t idx = 0; idx < parts.size(); ++idx) {
-            if (idx > 0) newRest += ":";
-            std::string part = parts[idx];
-            std::string pStrip = TrimString(part);
-
-            if (idx == 0) {
-                // 显示名称 (Display Name)
-                if (pStrip.length() >= 2 && pStrip.front() == '"' && pStrip.back() == '"') {
-                    std::string val = pStrip.substr(1, pStrip.length() - 2);
-                    std::string tr = getTrans(val);
-                    size_t pos = part.find("\"" + val + "\"");
-                    if (pos != std::string::npos) {
-                        part.replace(pos, val.length() + 2, "\"" + tr + "\"");
-                    }
-                }
-            } else if (idx == 1) {
-                // 默认值 (保持原样)
-            } else if (idx == 2) {
-                // 属性描述 (Description)
-                if (pStrip.length() >= 2 && pStrip.front() == '"' && pStrip.back() == '"') {
-                    std::string val = pStrip.substr(1, pStrip.length() - 2);
-                    std::string tr = getTrans(val);
-                    size_t pos = part.find("\"" + val + "\"");
-                    if (pos != std::string::npos) {
-                        part.replace(pos, val.length() + 2, "\"" + tr + "\"");
-                    }
+        if (parts.empty()) {
+            // 原行无冒号，若有 override 则注入
+            if (propOverride && !propOverride->description.empty()) {
+                std::string disp = propOverride->displayName.empty() ? "\"\"" : "\"" + propOverride->displayName + "\"";
+                newRest = " : " + disp + " : \"\" : \"" + propOverride->description + "\"";
+            }
+        } else {
+            // 处理显示名称 (parts[0])
+            std::string dispPart = parts[0];
+            std::string dispStrip = TrimString(dispPart);
+            if (propOverride && !propOverride->displayName.empty()) {
+                dispPart = " \"" + propOverride->displayName + "\"";
+            } else if (dispStrip.length() >= 2 && dispStrip.front() == '"' && dispStrip.back() == '"') {
+                std::string val = dispStrip.substr(1, dispStrip.length() - 2);
+                std::string tr = getTrans(val);
+                size_t pos = dispPart.find("\"" + val + "\"");
+                if (pos != std::string::npos) {
+                    dispPart.replace(pos, val.length() + 2, "\"" + tr + "\"");
                 }
             }
-            newRest += part;
+
+            // 处理描述与默认值
+            if (parts.size() == 1) {
+                // 仅有显示名
+                if (propOverride && !propOverride->description.empty()) {
+                    newRest = ":" + dispPart + " : \"\" : \"" + propOverride->description + "\"";
+                } else {
+                    newRest = ":" + dispPart;
+                }
+            } else if (parts.size() == 2) {
+                // 有显示名 + 默认值，无描述
+                std::string defPart = parts[1];
+                if (propOverride && !propOverride->description.empty()) {
+                    newRest = ":" + dispPart + ":" + defPart + " : \"" + propOverride->description + "\"";
+                } else {
+                    newRest = ":" + dispPart + ":" + defPart;
+                }
+            } else {
+                // 有显示名 + 默认值 + 描述 (parts.size() >= 3)
+                std::string defPart = parts[1];
+                std::string descPart = parts[2];
+                std::string descStrip = TrimString(descPart);
+
+                if (propOverride && !propOverride->description.empty()) {
+                    descPart = " \"" + propOverride->description + "\"";
+                } else if (descStrip.length() >= 2 && descStrip.front() == '"' && descStrip.back() == '"') {
+                    std::string val = descStrip.substr(1, descStrip.length() - 2);
+                    std::string tr = getTrans(val);
+                    size_t pos = descPart.find("\"" + val + "\"");
+                    if (pos != std::string::npos) {
+                        descPart.replace(pos, val.length() + 2, "\"" + tr + "\"");
+                    }
+                }
+
+                newRest = ":" + dispPart + ":" + defPart + ":" + descPart;
+                for (size_t idx = 3; idx < parts.size(); ++idx) {
+                    newRest += ":" + parts[idx];
+                }
+            }
         }
 
-        return prefix + newRest + choicesTail + comment + lineEnding;
+        // 整理前导空格与结构
+        std::string cleanHead = TrimString(propHead);
+        // 获取行首原样缩进
+        size_t indentLen = code.find_first_not_of(" \t");
+        std::string indent = (indentLen != std::string::npos) ? code.substr(0, indentLen) : "";
+
+        return indent + cleanHead + newRest + choicesTail + comment + lineEnding;
     }
 
     // 5. 选项列表 (Choices / Flags)："0" : "Enabled" : "Option Desc" 或 1 : "Passable" : 0
@@ -326,7 +729,16 @@ std::string FgdTranslator::TranslateLine(const std::string& line, const std::uno
     return code + comment + lineEnding;
 }
 
-bool FgdTranslator::TranslateFile(const std::wstring& srcPath, const std::wstring& dstPath, const std::unordered_map<std::string, std::string>& dict) {
+// ==============================================================================
+// FGD 文件批量与单文件翻译
+// ==============================================================================
+
+bool FgdTranslator::TranslateFile(
+    const std::wstring& srcPath,
+    const std::wstring& dstPath,
+    const std::unordered_map<std::string, std::string>& dict,
+    const FgdOverrideData& overrideData
+) {
     std::ifstream inFile(srcPath, std::ios::binary);
     if (!inFile.is_open()) return false;
 
@@ -348,8 +760,9 @@ bool FgdTranslator::TranslateFile(const std::wstring& srcPath, const std::wstrin
     std::ofstream outFile(dstPath, std::ios::binary);
     if (!outFile.is_open()) return false;
 
+    std::string currentClassName = "";
     for (const auto& l : lines) {
-        std::string transLine = TranslateLine(l, dict);
+        std::string transLine = TranslateLine(l, dict, overrideData, currentClassName);
         outFile.write(transLine.data(), transLine.length());
     }
     outFile.close();
@@ -364,10 +777,27 @@ bool FgdTranslator::TranslateAndDeployAll(
     std::vector<std::wstring>& outProcessedFiles,
     std::wstring& outError
 ) {
+    return TranslateAndDeployAll(cs2Root, backupDir, translationsDir, jsonDictPath, L"", outProcessedFiles, outError);
+}
+
+bool FgdTranslator::TranslateAndDeployAll(
+    const std::wstring& cs2Root,
+    const std::wstring& backupDir,
+    const std::wstring& translationsDir,
+    const std::wstring& jsonDictPath,
+    const std::wstring& jsonOverridePath,
+    std::vector<std::wstring>& outProcessedFiles,
+    std::wstring& outError
+) {
     std::unordered_map<std::string, std::string> dict;
     if (!LoadDictionary(jsonDictPath, dict)) {
         outError = L"无法加载 FGD 翻译字典: " + jsonDictPath;
         return false;
+    }
+
+    FgdOverrideData overrideData;
+    if (!jsonOverridePath.empty() && fs::exists(jsonOverridePath)) {
+        LoadOverrideDictionary(jsonOverridePath, overrideData);
     }
 
     fs::path backupRoot(backupDir);
@@ -384,7 +814,7 @@ bool FgdTranslator::TranslateAndDeployAll(
                 fs::path cs2Dst = fs::path(cs2Root) / relPath;
 
                 // 翻译至 translationsDir
-                if (!TranslateFile(entry.path().wstring(), transDst.wstring(), dict)) {
+                if (!TranslateFile(entry.path().wstring(), transDst.wstring(), dict, overrideData)) {
                     outError = L"翻译 FGD 失败: " + entry.path().wstring();
                     return false;
                 }
@@ -418,6 +848,10 @@ static std::string EscapeJsonString(const std::string& str) {
     }
     return out;
 }
+
+// ==============================================================================
+// 确保字典文件存在 (模板自动生成)
+// ==============================================================================
 
 bool FgdTranslator::EnsureFgdDictionaryExists(const std::wstring& jsonPath, const std::wstring& fallbackCachePath, std::wstring& outNotice) {
     fs::path p(jsonPath);
@@ -485,6 +919,82 @@ bool FgdTranslator::EnsureFgdDictionaryExists(const std::wstring& jsonPath, cons
     out.close();
 
     outNotice = L"已自动生成 fgd_translations.json 模板字典（包含详细使用说明与格式示例）。";
+    return true;
+}
+
+bool FgdTranslator::EnsureFgdOverrideDictionaryExists(const std::wstring& jsonPath, const std::wstring& fallbackCachePath, std::wstring& outNotice) {
+    fs::path p(jsonPath);
+    if (fs::exists(p)) {
+        return false;
+    }
+
+    FgdOverrideData loaded;
+    if (!fallbackCachePath.empty() && fs::exists(fallbackCachePath)) {
+        LoadOverrideDictionary(fallbackCachePath, loaded);
+    }
+
+    std::ofstream out(jsonPath, std::ios::binary);
+    if (!out.is_open()) {
+        outNotice = L"无法创建 FGD 覆盖字典文件: " + jsonPath;
+        return false;
+    }
+
+    out << "{\n";
+    out << "  // ==============================================================================\n";
+    out << "  // CS2 FGD 实体键值描述补充与覆盖字典 (jsonc 格式)\n";
+    out << "  // ==============================================================================\n";
+    out << "  //\n";
+    out << "  // 【作用说明】\n";
+    out << "  // - 本文件用于针对 FGD 中特定的【属性名 (Key)】、【实体类名 (Class)】或【输入输出 (I/O)】\n";
+    out << "  //   补充缺失的说明描述，或覆盖原版已有描述。\n";
+    out << "  // - 与 fgd_translations.json 互为补充：\n";
+    out << "  //   * fgd_translations.json: 负责已有英文字符串 -> 中文翻译。\n";
+    out << "  //   * fgd_override.json: 负责针对特定键名无描述时【自动新增描述】或【强制覆盖描述】。\n";
+    out << "  //\n";
+    out << "  // 【支持格式】\n";
+    out << "  // 1. 全局属性描述补充 (properties): \"属性键名\": \"描述文本\" 或 \"属性键名\": { \"description\": \"...\", \"displayName\": \"...\" }\n";
+    out << "  // 2. 输入输出说明补充 (io): \"IOName\": \"说明文本\"\n";
+    out << "  // 3. 实体类说明补充 (classes): \"classname\": \"说明文本\" 或 \"classname\": { \"description\": \"...\", \"properties\": { ... } }\n";
+    out << "  // 4. 顶层快速简写: \"键名\": \"描述文本\"\n";
+    out << "  // ==============================================================================\n\n";
+
+    out << "  \"properties\": {\n";
+    out << "    \"bodygroups\": \"设置模型的子部件与可选身体部件网格组合。\",\n";
+    out << "    \"vscripts\": \"实体生成后自动加载并执行的 VScript 脚本文件列表。\",\n";
+    out << "    \"clientSideEntity\": \"是否仅在客户端创建并运行此实体（不向服务器同步）。\",\n";
+    out << "    \"TeamNum\": \"所属队伍编号（0: 任意/无队伍, 2: T 阵营, 3: CT 阵营）。\",\n";
+    out << "    \"box_mins\": \"包围盒/光照探针体积的最小边界坐标 (X Y Z)。\",\n";
+    out << "    \"box_maxs\": \"包围盒/光照探针体积的最大边界坐标 (X Y Z)。\",\n";
+    out << "    \"flood_fill\": \"忽略玩家不可达的空间，加快光照烘焙速度并节省显存。\",\n";
+    out << "    \"voxelize\": \"忽略已体素化的实体空间，优化光照探针计算。\",\n";
+    out << "    \"light_probe_volume_from_cubemap\": \"是否使用立方体贴图 (Cubemap) 计算漫反射光照探针。\",\n";
+    out << "    \"moveable\": \"是否允许在游戏运行时移动、绑定父级、启用或禁用此对象。\",\n";
+    out << "    \"edge_fade_dist\": \"反射或光照边界平滑淡出过渡距离。\",\n";
+    out << "    \"max_lightmap_resolution\": \"限制此对象在烘焙时的最大光照贴图分辨率（0 为默认）。\"\n";
+    out << "  },\n\n";
+
+    out << "  \"io\": {\n";
+    out << "    \"SetParent\": \"设置该实体的父级层级对象，使其跟随父级移动。\",\n";
+    out << "    \"SetParentWithOffset\": \"保持当前局部偏移并挂载到父级实体。\",\n";
+    out << "    \"SetParentMaintainOffset\": \"挂载到父级实体的同时保持相对位置偏移不变。\",\n";
+    out << "    \"ClearParent\": \"解除与父级实体的挂载绑定关系，使其独立运动。\",\n";
+    out << "    \"FollowEntity\": \"骨骼合并 (Bone Merge) 附加到目标实体。\"\n";
+    out << "  },\n\n";
+
+    out << "  \"classes\": {\n";
+    out << "    \"info_node\": \"AI 地面导航节点，供 NPC 寻路与路径规划计算使用。\",\n";
+    out << "    \"csm_fov_override\": \"级联阴影贴图 (CSM) 视场角覆盖控制器。\",\n";
+    out << "    \"env_cubemap\": {\n";
+    out << "      \"description\": \"用于采样环境间接镜面反射的高动态范围立方体贴图实体。\",\n";
+    out << "      \"properties\": {\n";
+    out << "        \"influenceradius\": \"当前立方体贴图的生效影响半径（单位：英寸）。\"\n";
+    out << "      }\n";
+    out << "    }\n";
+    out << "  }\n";
+    out << "}\n";
+    out.close();
+
+    outNotice = L"已自动生成 fgd_override.json 模板字典（包含详细使用说明与格式示例）。";
     return true;
 }
 
@@ -565,5 +1075,3 @@ bool FgdTranslator::EnsureQtDictionaryExists(const std::wstring& jsonPath, const
     outNotice = L"已自动生成 qt_translations.json 模板字典（包含详细使用说明与格式示例）。";
     return true;
 }
-
-

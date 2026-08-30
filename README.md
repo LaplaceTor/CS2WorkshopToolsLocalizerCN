@@ -26,19 +26,20 @@
 
 ---
 
-## ✍️ 如何参与完善汉化？（只需修改两个文本文件）
+## ✍️ 如何参与完善汉化？（只需修改三个文本文件）
 
-本项目的所有汉化词条都保存在程序同目录下的两个 `.json` 文件中：
+本项目的所有汉化词条与实体覆盖均保存在程序同目录下的三个 `.json` 文件中：
 
 ```text
 CS2WorkshopToolsLocalizerCN/
 ├── qt_translations.json    # 1. 软件界面与菜单翻译字典 (支持模块子块与注释)
-└── fgd_translations.json   # 2. 地图实体与属性描述翻译字典
+├── fgd_translations.json   # 2. 地图实体与属性已有字符串翻译字典 (精确匹配替换)
+└── fgd_override.json       # 3. 地图实体键值描述补充与覆盖字典 (针对特定 Key 新增/覆盖说明)
 ```
 
 > **⚠️ 译者提醒**：
 > 1. 请尽量**不要**直接使用未经校对的 AI 翻译批量提交！地图工具中含有大量领域专有名词，需要人工结合上下文核对。
-> 2. 支持 `//` 单行注释，方便对词条做批注说明。
+> 2. 所有字典文件均采用标准 JSON / JSONC 格式，支持 `//` 单行注释与 `/* */` 块注释，方便对词条做批注说明。
 
 ---
 
@@ -134,6 +135,50 @@ CS2WorkshopToolsLocalizerCN/
 
 ---
 
+### 3️⃣ `fgd_override.json`（实体键值描述补充与覆盖字典）
+
+用于针对 Valve 原版 FGD 实体定义中**缺失悬停描述**或**需要个性化说明**的特定属性 (Key)、实体类 (Class) 或输入输出 (I/O) 进行描述补充与覆盖。
+
+- **与 `fgd_translations.json` 的区别**：
+  - `fgd_translations.json`：根据已有英文原文进行精确匹配翻译（无法给原版无描述的属性补充中文）。
+  - `fgd_override.json`：根据属性键名、类名或 I/O 名称直接**新增悬停描述**或**强制替换说明**。
+
+- **格式与配置示例**：
+  ```jsonc
+  {
+    // 1. 全局属性描述补充与覆盖 (按属性名匹配，如 disableshadows, bodygroups, vscripts)
+    "properties": {
+      "bodygroups": "设置模型的子部件与可选身体部件网格组合。",
+      "vscripts": "实体生成后自动加载并执行的 VScript 脚本文件列表。",
+      "clientSideEntity": "是否仅在客户端创建并运行此实体（不向服务器同步）。",
+      "TeamNum": "所属队伍编号（0: 任意/无队伍, 2: T 阵营, 3: CT 阵营）。",
+      "box_mins": "包围盒/光照探针体积的最小边界坐标 (X Y Z)。",
+      "flood_fill": "忽略玩家不可达的空间，加快光照烘焙速度并节省显存。"
+    },
+
+    // 2. 输入 / 输出 (I/O) 说明补充
+    "io": {
+      "SetParent": "设置该实体的父级层级对象，使其跟随父级移动。",
+      "SetParentWithOffset": "保持当前局部偏移并挂载到父级实体。",
+      "ClearParent": "解除与父级实体的挂载绑定关系，使其独立运动。"
+    },
+
+    // 3. 实体类说明补充与类作用域专属属性配置
+    "classes": {
+      "info_node": "AI 地面导航节点，供 NPC 寻路与路径规划计算使用。",
+      "csm_fov_override": "级联阴影贴图 (CSM) 视场角覆盖控制器。",
+      "env_cubemap": {
+        "description": "用于采样环境间接镜面反射的高动态范围立方体贴图实体。",
+        "properties": {
+          "influenceradius": "当前立方体贴图的生效影响半径（单位：英寸）。"
+        }
+      }
+    }
+  }
+  ```
+
+---
+
 ## 🔍 遇到修改汉化词条无效？如何获取完整原文字符串
 
 有时候在 `qt_translations.json` 中添加了某个单词的翻译，但进入 Hammer 后发现界面依然显示英文。  
@@ -191,6 +236,6 @@ CS2WorkshopToolsLocalizerCN/
 
 ---
 
-### 💡 提交你的翻译
+### 💡 提交你的翻译与覆盖说明
 
-如果你翻译或修正了新的词条，欢迎将修改后的 `qt_translations.json` 或 `fgd_translations.json` 提交 Pull Request，或者在 Issues 中分享，共同完善 CS2 中文地图与模组制作生态！
+如果你翻译或修正了新的词条，欢迎将修改后的 `qt_translations.json`、`fgd_translations.json` 或 `fgd_override.json` 提交 Pull Request，或者在 Issues 中分享，共同完善 CS2 中文地图与模组制作生态！
