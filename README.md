@@ -158,9 +158,10 @@ CS2WorkshopToolsLocalizerCN/
 
     // 2. 输入 / 输出 (I/O) 说明补充
     "io": {
-      "SetParent": "设置该实体的父级层级对象，使其跟随父级移动。",
-      "SetParentWithOffset": "保持当前局部偏移并挂载到父级实体。",
-      "ClearParent": "解除与父级实体的挂载绑定关系，使其独立运动。"
+      "ClearParent": "解除与父级实体的挂载绑定关系，使其独立运动。",
+      "FollowEntity": "骨骼合并 (Bone Merge) 附加到目标实体。",
+      "Kill": "从世界中移除此实体并释放资源。",
+      "SetHealth": "设置该实体的当前生命值。"
     },
 
     // 3. 实体类说明补充与类作用域专属属性配置

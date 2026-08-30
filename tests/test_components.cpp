@@ -13,6 +13,8 @@
 namespace fs = std::filesystem;
 
 int main() {
+    std::cout << std::unitbuf;
+    std::cerr << std::unitbuf;
     std::cout << "========================================\n";
     std::cout << " Running CS2 Launcher Component Tests\n";
     std::cout << "========================================\n";
@@ -47,7 +49,8 @@ int main() {
     overrideData.globalProperties["bodygroups"].description = "设置模型的子部件与可选身体部件网格组合。";
     overrideData.globalProperties["max_lightmap_resolution"].description = "限制此对象在烘焙时的最大光照贴图分辨率。";
     overrideData.globalProperties["model"].description = "实体引用的 3D 模型资源文件路径。";
-    overrideData.ioOverrides["SetParent"] = "设置该实体的父级层级对象，使其跟随父级移动。";
+    overrideData.ioOverrides["Kill"] = "从世界中移除此实体并释放资源。";
+    overrideData.ioOverrides["SetHealth"] = "设置该实体的当前生命值。";
     overrideData.classDescriptions["csm_fov_override"] = "级联阴影贴图 (CSM) 视场角覆盖控制器。";
     overrideData.classDescriptions["env_cubemap"] = "用于采样环境间接镜面反射的高动态范围立方体贴图实体。";
     overrideData.classProperties["env_cubemap"]["influenceradius"].description = "当前立方体贴图的生效影响半径（单位：英寸）。";
@@ -61,10 +64,19 @@ int main() {
     assert(transClass.find("全向点光源") != std::string::npos);
     assert(currentCls == "light_omni");
 
-    std::string testBareClass = "@PointClass editormodel(\"models/editor/camera.vmdl\", fixedbounds) = csm_fov_override :";
-    std::string transBareClass = FgdTranslator::TranslateLine(testBareClass, dict, overrideData, currentCls);
-    std::cout << "[Test 2.2] Bare Class override: " << transBareClass << "\n";
-    assert(transBareClass.find("级联阴影贴图 (CSM) 视场角覆盖控制器。") != std::string::npos);
+    std::string pendingDesc = "";
+    std::string testMultiLineClass1 = "@PointClass editormodel(\"models/editor/camera.vmdl\", fixedbounds) = csm_fov_override :";
+    std::string testMultiLineClass2 = "\t\"This entity indicates the FOV override for cascading shadow maps.   .\"";
+    std::string testMultiLineClass3 = "[";
+
+    std::string out1 = FgdTranslator::TranslateLine(testMultiLineClass1, dict, overrideData, currentCls, pendingDesc);
+    std::string out2 = FgdTranslator::TranslateLine(testMultiLineClass2, dict, overrideData, currentCls, pendingDesc);
+    std::string out3 = FgdTranslator::TranslateLine(testMultiLineClass3, dict, overrideData, currentCls, pendingDesc);
+
+    std::cout << "[Test 2.2] Multi-line Class override:\n" << out1 << out2 << out3 << "\n";
+    assert(out1.find("\"") == std::string::npos && "Line 1 must not inject double description");
+    assert(out2.find("级联阴影贴图 (CSM) 视场角覆盖控制器。") != std::string::npos);
+    assert(out3.find("[") != std::string::npos);
     assert(currentCls == "csm_fov_override");
 
     // 2.2 属性测试 (完整三段、无描述属性、无描述带Choices、仅显示名)
@@ -97,12 +109,17 @@ int main() {
     std::string testIO = "    input Kill(void) : \"Removes this entity from the world.\"";
     std::string transIO = FgdTranslator::TranslateLine(testIO, dict, overrideData, currentCls);
     std::cout << "[Test 2.7] I/O trans: " << transIO << "\n";
-    assert(transIO.find("从世界中移除此实体。") != std::string::npos);
+    assert(transIO.find("从世界中移除此实体并释放资源。") != std::string::npos);
 
-    std::string testBareIO = "\tinput SetParent(api)";
-    std::string transBareIO = FgdTranslator::TranslateLine(testBareIO, dict, overrideData, currentCls);
-    std::cout << "[Test 2.8] Bare I/O override: " << transBareIO << "\n";
-    assert(transBareIO.find("设置该实体的父级层级对象，使其跟随父级移动。") != std::string::npos);
+    std::string testBareApiIO = "\tinput SetParent(api)";
+    std::string transBareApiIO = FgdTranslator::TranslateLine(testBareApiIO, dict, overrideData, currentCls);
+    std::cout << "[Test 2.8.1] API I/O protected: " << transBareApiIO << "\n";
+    assert(transBareApiIO.find(":") == std::string::npos && "API I/O lines must not have colon injected");
+
+    std::string testBareDataIO = "\tinput SetHealth(integer)";
+    std::string transBareDataIO = FgdTranslator::TranslateLine(testBareDataIO, dict, overrideData, currentCls);
+    std::cout << "[Test 2.8.2] Bare I/O override: " << transBareDataIO << "\n";
+    assert(transBareDataIO.find("设置该实体的当前生命值。") != std::string::npos);
 
     // 2.4 类作用域特定属性测试
     currentCls = "env_cubemap";
@@ -111,8 +128,77 @@ int main() {
     std::cout << "[Test 2.9] Scoped prop override: " << transScopedProp << "\n";
     assert(transScopedProp.find("当前立方体贴图的生效影响半径（单位：英寸）。") != std::string::npos);
 
+    // 2.5 复杂嵌套 KV3 属性结构测试 (base.fgd:171)
+    std::string testNestedKv3 = "\tlocal.origin(vector) { group=\"Hierarchy\" enabled={ variable=\"useLocalOffset\" value=\"1\" } } : \"Local Origin\" : : \"Offset in the local space of the parent model's attachment/bone to use in hierarchy. Not used if you are not using parent attachment.\"";
+    std::string transNestedKv3 = FgdTranslator::TranslateLine(testNestedKv3, dict, overrideData, currentCls);
+    std::cout << "[Test 2.10] Nested KV3 prop: " << transNestedKv3 << "\n";
+    assert(transNestedKv3.find("enabled={ variable=\"useLocalOffset\" value=\"1\" }") != std::string::npos);
+    assert(transNestedKv3.find("group=\"Hierarchy\"") != std::string::npos);
+
+    // 2.6 真实 backup 目录下所有 FGD 完整批量翻译验证
+    std::cout << "[Test 2.11] Translating all real backup FGD files...\n";
+    fs::path realBackupDir = fs::current_path() / L"backup";
+    if (fs::exists(realBackupDir)) {
+        fs::path tempRealTrans = fs::current_path() / L"test_real_trans";
+        fs::path tempRealCs2 = fs::current_path() / L"test_real_cs2";
+        fs::path realFgdJson = fs::current_path() / L"fgd_translations.json";
+        fs::path realOverrideJson = fs::current_path() / L"fgd_override.json";
+        std::vector<std::wstring> realProcessed;
+        std::wstring realErr;
+        bool realOk = FgdTranslator::TranslateAndDeployAll(tempRealCs2.wstring(), realBackupDir.wstring(), tempRealTrans.wstring(), realFgdJson.wstring(), realOverrideJson.wstring(), realProcessed, realErr);
+        if (!realOk) {
+            std::wcout << L"           [ERROR in 2.11]: " << realErr << L"\n";
+        }
+        assert(realOk && "All real FGD files in backup must translate without error");
+        std::cout << "           Processed " << realProcessed.size() << " real FGD files successfully!\n";
+
+        // 检查生成的 base.fgd 中 local.origin 行是否完好
+        fs::path genBaseFgd = tempRealTrans / L"game" / L"core" / L"base.fgd";
+        assert(fs::exists(genBaseFgd));
+        std::ifstream genFgdIn(genBaseFgd);
+        std::string line;
+        bool foundOrigin = false;
+        while (std::getline(genFgdIn, line)) {
+            if (line.find("local.origin") != std::string::npos) {
+                foundOrigin = true;
+                std::cout << "           [Found local.origin line]: " << line << "\n";
+                assert(line.find("enabled={ variable=\"useLocalOffset\" value=\"1\" }") != std::string::npos);
+                assert(line.find("group=\"Hierarchy\"") != std::string::npos);
+            }
+        }
+        std::cout << "           foundOrigin: " << (foundOrigin ? "TRUE" : "FALSE") << "\n";
+        assert(foundOrigin && "Generated base.fgd must contain local.origin");
+        genFgdIn.close();
+
+        // 检查生成的 csgo.fgd 中 csm_fov_override 与 worldspawn 是否完好
+        fs::path genCsgoFgd = tempRealTrans / L"game" / L"csgo" / L"csgo.fgd";
+        assert(fs::exists(genCsgoFgd));
+        std::ifstream genCsgoIn(genCsgoFgd);
+        bool foundCsm = false;
+        while (std::getline(genCsgoIn, line)) {
+            if (line.find("= csm_fov_override") != std::string::npos) {
+                foundCsm = true;
+                std::string descLine, bracketLine;
+                std::getline(genCsgoIn, descLine);
+                std::getline(genCsgoIn, bracketLine);
+                std::cout << "           [Found csm_fov_override lines]:\n             " << line << "\n             " << descLine << "\n             " << bracketLine << "\n";
+                assert(descLine.find("级联阴影贴图 (CSM) 视场角覆盖控制器。") != std::string::npos);
+                assert(bracketLine.find("[") != std::string::npos);
+            }
+        }
+        assert(foundCsm && "Generated csgo.fgd must contain csm_fov_override");
+        genCsgoIn.close();
+
+        fs::remove_all(tempRealTrans);
+        fs::remove_all(tempRealCs2);
+    }
+
     // 3. Test PE Patcher against CS2 Qt5Core.dll
     fs::path qt5CoreSrc = fs::path(cs2Root) / L"game" / L"bin" / L"win64" / L"Qt5Core.dll";
+    fs::path backupQtCore = fs::current_path() / L"backup" / L"game" / L"bin" / L"win64" / L"Qt5Core.dll";
+    if (fs::exists(backupQtCore)) {
+        qt5CoreSrc = backupQtCore;
+    }
     fs::path tempPatched = fs::current_path() / L"test_patched_Qt5Core.dll";
     std::wstring patchErr;
     bool patchOk = PePatcher::PatchQtCore(qt5CoreSrc.wstring(), tempPatched.wstring(), patchErr);

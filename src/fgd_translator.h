@@ -35,7 +35,15 @@ public:
     // 加载 FGD 覆盖字典文件 (fgd_override.json)
     static bool LoadOverrideDictionary(const std::wstring& jsonPath, FgdOverrideData& outOverride);
 
-    // 翻译单行 FGD 内容（带类状态机跟踪与覆盖支持）
+    // 翻译单行 FGD 内容（带类状态机跟踪与跨行说明覆盖支持）
+    static std::string TranslateLine(
+        const std::string& line,
+        const std::unordered_map<std::string, std::string>& dict,
+        const FgdOverrideData& overrideData,
+        std::string& inOutCurrentClass,
+        std::string& inOutPendingClassDesc
+    );
+
     static std::string TranslateLine(
         const std::string& line,
         const std::unordered_map<std::string, std::string>& dict,

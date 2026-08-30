@@ -406,13 +406,113 @@ static inline std::string TrimString(const std::string& str) {
 }
 
 // ==============================================================================
+// 准确提取 FGD 属性头部（支持任意深度的 KV3 嵌套 {} 与 [] 属性）
+// ==============================================================================
+static bool ExtractPropertyHeader(
+    const std::string& code,
+    std::string& outPropHead,
+    std::string& outPropKey,
+    std::string& outPropType,
+    std::string& outRest
+) {
+    size_t i = 0;
+    size_t n = code.length();
+    while (i < n && (code[i] == ' ' || code[i] == '\t')) i++;
+    if (i >= n) return false;
+
+    // 排除 @Class 或注释
+    if (code[i] == '@' || code[i] == '/' || code[i] == ':') return false;
+
+    size_t keyStart = i;
+    while (i < n && (isalnum((unsigned char)code[i]) || code[i] == '_' || code[i] == '.' || code[i] == '-')) {
+        i++;
+    }
+    if (i == keyStart) return false;
+    std::string propKey = code.substr(keyStart, i - keyStart);
+
+    // 跳过空格
+    while (i < n && (code[i] == ' ' || code[i] == '\t')) i++;
+    if (i >= n || code[i] != '(') return false;
+    i++; // 跳过 '('
+
+    size_t typeStart = i;
+    while (i < n && code[i] != ')') {
+        i++;
+    }
+    if (i >= n || code[i] != ')') return false;
+    std::string propType = code.substr(typeStart, i - typeStart);
+    i++; // 跳过 ')'
+
+    // 解析后续属性 [ ... ] 与 { ... }，支持嵌套与内部双引号
+    while (i < n) {
+        while (i < n && (code[i] == ' ' || code[i] == '\t')) i++;
+        if (i >= n) break;
+
+        if (code[i] == '[') {
+            size_t depth = 1;
+            i++;
+            while (i < n && depth > 0) {
+                if (code[i] == '"') {
+                    i++;
+                    while (i < n && code[i] != '"') {
+                        if (code[i] == '\\' && i + 1 < n) i += 2;
+                        else i++;
+                    }
+                    if (i < n) i++;
+                } else if (code[i] == '[') {
+                    depth++;
+                    i++;
+                } else if (code[i] == ']') {
+                    depth--;
+                    i++;
+                } else {
+                    i++;
+                }
+            }
+            if (depth != 0) return false;
+        } else if (code[i] == '{') {
+            size_t depth = 1;
+            i++;
+            while (i < n && depth > 0) {
+                if (code[i] == '"') {
+                    i++;
+                    while (i < n && code[i] != '"') {
+                        if (code[i] == '\\' && i + 1 < n) i += 2;
+                        else i++;
+                    }
+                    if (i < n) i++;
+                } else if (code[i] == '{') {
+                    depth++;
+                    i++;
+                } else if (code[i] == '}') {
+                    depth--;
+                    i++;
+                } else {
+                    i++;
+                }
+            }
+            if (depth != 0) return false;
+        } else {
+            break;
+        }
+    }
+
+    outPropHead = code.substr(0, i);
+    outPropKey = propKey;
+    outPropType = propType;
+    outRest = code.substr(i);
+    return true;
+}
+
+// ==============================================================================
 // 单行 FGD 翻译与覆盖处理
 // ==============================================================================
 
 std::string FgdTranslator::TranslateLine(const std::string& line, const std::unordered_map<std::string, std::string>& dict) {
     std::string dummyClass;
+    std::string dummyPending;
     FgdOverrideData dummyOverride;
-    return TranslateLine(line, dict, dummyOverride, dummyClass);
+    return TranslateLine(line, dict, dummyOverride, dummyClass, dummyPending);
 }
 
 std::string FgdTranslator::TranslateLine(
@@ -420,6 +520,17 @@ std::string FgdTranslator::TranslateLine(
     const std::unordered_map<std::string, std::string>& dict,
     const FgdOverrideData& overrideData,
     std::string& inOutCurrentClass
+) {
+    std::string dummyPending;
+    return TranslateLine(line, dict, overrideData, inOutCurrentClass, dummyPending);
+}
+
+std::string FgdTranslator::TranslateLine(
+    const std::string& line,
+    const std::unordered_map<std::string, std::string>& dict,
+    const FgdOverrideData& overrideData,
+    std::string& inOutCurrentClass,
+    std::string& inOutPendingClassDesc
 ) {
     std::string lineEnding = "";
     std::string raw = line;
@@ -455,8 +566,47 @@ std::string FgdTranslator::TranslateLine(
         return text;
     };
 
+    // 0. 检查是否正在等待上一行的跨行类说明 (如 @PointClass ... = classname :\n  "Desc")
+    if (!inOutPendingClassDesc.empty()) {
+        std::string trimmed = TrimString(code);
+        if (trimmed.empty()) {
+            // 空行保持状态
+            return code + comment + lineEnding;
+        }
+
+        std::regex standaloneStrRegex(R"re(^\s*"([^"]*)"\s*$)re");
+        std::smatch strMatch;
+        if (std::regex_match(code, strMatch, standaloneStrRegex)) {
+            std::string origDesc = strMatch[1].str();
+            std::string finalDesc = "";
+            auto itDesc = overrideData.classDescriptions.find(inOutPendingClassDesc);
+            if (itDesc != overrideData.classDescriptions.end() && !itDesc->second.empty()) {
+                finalDesc = itDesc->second;
+            } else {
+                finalDesc = getTrans(origDesc);
+            }
+            inOutPendingClassDesc = ""; // 已完成匹配替换
+
+            size_t lead = code.find_first_not_of(" \t");
+            std::string indent = (lead != std::string::npos) ? code.substr(0, lead) : "\t";
+            return indent + "\"" + finalDesc + "\"" + comment + lineEnding;
+        } else if (trimmed.front() == '[') {
+            // 原类定义没有独立描述行，直接遇到了 [
+            auto itDesc = overrideData.classDescriptions.find(inOutPendingClassDesc);
+            std::string cls = inOutPendingClassDesc;
+            inOutPendingClassDesc = "";
+            if (itDesc != overrideData.classDescriptions.end() && !itDesc->second.empty()) {
+                size_t lead = code.find_first_not_of(" \t");
+                std::string indent = (lead != std::string::npos) ? code.substr(0, lead) : "";
+                return indent + "\t\"" + itDesc->second + "\"\n" + code + comment + lineEnding;
+            }
+        } else {
+            inOutPendingClassDesc = "";
+        }
+    }
+
     // 1. 实体类定义与说明跟踪：
-    //    支持 = classname : "Description" 或 = classname : 或 = classname
+    // 1.1 同行完整定义：= classname : "Description"
     std::regex classFullRegex(R"re((=\s*)([a-zA-Z0-9_]+)\s*:\s*"([^"]*)")re");
     std::smatch classFullMatch;
     if (std::regex_search(code, classFullMatch, classFullRegex)) {
@@ -467,6 +617,7 @@ std::string FgdTranslator::TranslateLine(
         std::string suffix = code.substr(classFullMatch.position(0) + classFullMatch.length(0));
 
         inOutCurrentClass = className;
+        inOutPendingClassDesc = "";
 
         std::string finalDesc = "";
         auto itDesc = overrideData.classDescriptions.find(className);
@@ -479,24 +630,33 @@ std::string FgdTranslator::TranslateLine(
         return prefix + eq + className + " : \"" + finalDesc + "\"" + suffix + comment + lineEnding;
     }
 
-    std::regex classBareRegex(R"re((=\s*)([a-zA-Z0-9_]+)(\s*(?::\s*)?)(?:\[|$))re");
-    std::smatch classBareMatch;
-    if (std::regex_search(code, classBareMatch, classBareRegex)) {
-        std::string className = classBareMatch[2].str();
+    // 1.2 跨行或末尾冒号/无描述类定义：= classname : 或 = classname (行尾)
+    std::regex classHeaderRegex(R"re((=\s*)([a-zA-Z0-9_]+)(\s*:\s*|\s*)$)re");
+    std::smatch classHeaderMatch;
+    if (std::regex_search(code, classHeaderMatch, classHeaderRegex)) {
+        std::string className = classHeaderMatch[2].str();
         inOutCurrentClass = className;
+        inOutPendingClassDesc = className;
+        return code + comment + lineEnding;
+    }
+
+    // 1.3 同行紧接中括号的无描述类定义：= classname [
+    std::regex classBracketRegex(R"re((=\s*)([a-zA-Z0-9_]+)\s*(\[.*)$)re");
+    std::smatch classBracketMatch;
+    if (std::regex_search(code, classBracketMatch, classBracketRegex)) {
+        std::string prefix = code.substr(0, classBracketMatch.position(0));
+        std::string eq = classBracketMatch[1].str();
+        std::string className = classBracketMatch[2].str();
+        std::string bracketTail = classBracketMatch[3].str();
+
+        inOutCurrentClass = className;
+        inOutPendingClassDesc = "";
 
         auto itDesc = overrideData.classDescriptions.find(className);
         if (itDesc != overrideData.classDescriptions.end() && !itDesc->second.empty()) {
-            std::string prefix = code.substr(0, classBareMatch.position(0));
-            std::string eq = classBareMatch[1].str();
-            std::string after = code.substr(classBareMatch.position(0) + classBareMatch.length(0));
-            // 如果原行尾部是 [，保留
-            std::string bracketTail = "";
-            if (!code.empty() && code.find('[', classBareMatch.position(0)) != std::string::npos) {
-                bracketTail = code.substr(code.find('[', classBareMatch.position(0)));
-            }
             return prefix + eq + className + " : \"" + itDesc->second + "\" " + bracketTail + comment + lineEnding;
         }
+        return code + comment + lineEnding;
     }
 
     // 2. 输入 / 输出描述：input/output Name(type) [ : "Description" ]
@@ -507,6 +667,11 @@ std::string FgdTranslator::TranslateLine(
         std::string ioName = ioMatch[2].str();
         std::string ioParam = ioMatch[3].str();
         std::string ioRest = ioMatch[4].str();
+
+        // 如果参数类型包含 api (如 (api))，Valve FGD 语法不支持冒号和描述，直接原样保留
+        if (ioParam.find("api") != std::string::npos) {
+            return code + comment + lineEnding;
+        }
 
         std::string overrideIoDesc = "";
         // 优先在当前类中查找，其次在全局 ioOverrides，最后在 globalProperties
@@ -558,15 +723,8 @@ std::string FgdTranslator::TranslateLine(
     }
 
     // 4. 属性定义：prop(type) [attrs] {attrs} : "Display Name" [ : default [ : "Description" ]] [ = [ choices ] ]
-    std::regex propRegex(R"re(^(\s*([a-zA-Z0-9_\.]+)\s*\(([a-zA-Z0-9_:]+)\)((?:\s*\[[^\]]*\]|\s*\{[^\}]*\})*)\s*)(:?.*)$)re");
-    std::smatch propMatch;
-    if (std::regex_match(code, propMatch, propRegex)) {
-        std::string propHead = propMatch[1].str();
-        std::string propKey = propMatch[2].str();
-        std::string propType = propMatch[3].str();
-        std::string propAttrs = propMatch[4].str();
-        std::string rest = propMatch[5].str();
-
+    std::string propHead, propKey, propType, rest;
+    if (ExtractPropertyHeader(code, propHead, propKey, propType, rest)) {
         // 查找该属性是否有 override
         const FgdPropertyOverride* propOverride = nullptr;
         if (!inOutCurrentClass.empty()) {
@@ -600,11 +758,16 @@ std::string FgdTranslator::TranslateLine(
             }
         }
 
+        // 如果属性没有冒号定义（例如跨行定义的属性头部 useLocalOffset(boolean)）
+        if (TrimString(propBody).empty()) {
+            return code + comment + lineEnding;
+        }
+
         // 解析 propBody 中的冒号分隔项
         std::vector<std::string> parts;
         std::string curr = "";
         inQ = false;
-        bool hasInitialColon = false;
+        bool hasFirstColon = false;
 
         for (size_t i = 0; i < propBody.length(); ++i) {
             char c = propBody[i];
@@ -612,34 +775,31 @@ std::string FgdTranslator::TranslateLine(
                 inQ = !inQ;
                 curr.push_back(c);
             } else if (c == ':' && !inQ) {
-                if (!hasInitialColon && parts.empty() && TrimString(curr).empty()) {
-                    hasInitialColon = true;
+                if (!hasFirstColon) {
+                    hasFirstColon = true;
                     curr.clear();
-                    continue;
+                } else {
+                    parts.push_back(curr);
+                    curr.clear();
                 }
-                parts.push_back(curr);
-                curr.clear();
             } else {
                 curr.push_back(c);
             }
         }
-        if (!curr.empty() || hasInitialColon) {
+        if (hasFirstColon) {
             parts.push_back(curr);
         }
 
-        std::string newRest = "";
-        if (parts.empty()) {
-            // 原行无冒号，若有 override 则注入
-            if (propOverride && !propOverride->description.empty()) {
-                std::string disp = propOverride->displayName.empty() ? "\"\"" : "\"" + propOverride->displayName + "\"";
-                newRest = " : " + disp + " : \"\" : \"" + propOverride->description + "\"";
-            }
-        } else {
-            // 处理显示名称 (parts[0])
+        if (!hasFirstColon) {
+            return code + comment + lineEnding;
+        }
+
+        // 处理显示名称 (parts[0])
+        if (!parts.empty()) {
             std::string dispPart = parts[0];
             std::string dispStrip = TrimString(dispPart);
             if (propOverride && !propOverride->displayName.empty()) {
-                dispPart = " \"" + propOverride->displayName + "\"";
+                parts[0] = " \"" + propOverride->displayName + "\"";
             } else if (dispStrip.length() >= 2 && dispStrip.front() == '"' && dispStrip.back() == '"') {
                 std::string val = dispStrip.substr(1, dispStrip.length() - 2);
                 std::string tr = getTrans(val);
@@ -647,32 +807,28 @@ std::string FgdTranslator::TranslateLine(
                 if (pos != std::string::npos) {
                     dispPart.replace(pos, val.length() + 2, "\"" + tr + "\"");
                 }
+                parts[0] = dispPart;
             }
 
             // 处理描述与默认值
             if (parts.size() == 1) {
                 // 仅有显示名
                 if (propOverride && !propOverride->description.empty()) {
-                    newRest = ":" + dispPart + " : \"\" : \"" + propOverride->description + "\"";
-                } else {
-                    newRest = ":" + dispPart;
+                    parts.push_back(" \"\"");
+                    parts.push_back(" \"" + propOverride->description + "\"");
                 }
             } else if (parts.size() == 2) {
                 // 有显示名 + 默认值，无描述
-                std::string defPart = parts[1];
                 if (propOverride && !propOverride->description.empty()) {
-                    newRest = ":" + dispPart + ":" + defPart + " : \"" + propOverride->description + "\"";
-                } else {
-                    newRest = ":" + dispPart + ":" + defPart;
+                    parts.push_back(" \"" + propOverride->description + "\"");
                 }
             } else {
                 // 有显示名 + 默认值 + 描述 (parts.size() >= 3)
-                std::string defPart = parts[1];
                 std::string descPart = parts[2];
                 std::string descStrip = TrimString(descPart);
 
                 if (propOverride && !propOverride->description.empty()) {
-                    descPart = " \"" + propOverride->description + "\"";
+                    parts[2] = " \"" + propOverride->description + "\"";
                 } else if (descStrip.length() >= 2 && descStrip.front() == '"' && descStrip.back() == '"') {
                     std::string val = descStrip.substr(1, descStrip.length() - 2);
                     std::string tr = getTrans(val);
@@ -680,28 +836,86 @@ std::string FgdTranslator::TranslateLine(
                     if (pos != std::string::npos) {
                         descPart.replace(pos, val.length() + 2, "\"" + tr + "\"");
                     }
-                }
-
-                newRest = ":" + dispPart + ":" + defPart + ":" + descPart;
-                for (size_t idx = 3; idx < parts.size(); ++idx) {
-                    newRest += ":" + parts[idx];
+                    parts[2] = descPart;
                 }
             }
         }
 
-        // 整理前导空格与结构
-        std::string cleanHead = TrimString(propHead);
-        // 获取行首原样缩进
-        size_t indentLen = code.find_first_not_of(" \t");
-        std::string indent = (indentLen != std::string::npos) ? code.substr(0, indentLen) : "";
+        std::string newPropBody = " :";
+        for (size_t idx = 0; idx < parts.size(); ++idx) {
+            if (idx > 0) newPropBody += ":";
+            newPropBody += parts[idx];
+        }
 
-        return indent + cleanHead + newRest + choicesTail + comment + lineEnding;
+        return propHead + newPropBody + choicesTail + comment + lineEnding;
+    }
+
+    // 4.1 属性跨行定义的续行（以冒号开头，例如 : "Use Local Transform" : 0 : "..."）
+    std::string trimmedCode = TrimString(code);
+    if (!trimmedCode.empty() && trimmedCode.front() == ':') {
+        std::vector<std::string> parts;
+        std::string curr = "";
+        bool inQ = false;
+        bool hasFirstColon = false;
+        for (size_t k = 0; k < code.length(); ++k) {
+            char c = code[k];
+            if (c == '"') {
+                inQ = !inQ;
+                curr.push_back(c);
+            } else if (c == ':' && !inQ) {
+                if (!hasFirstColon) {
+                    hasFirstColon = true;
+                    curr.clear();
+                } else {
+                    parts.push_back(curr);
+                    curr.clear();
+                }
+            } else {
+                curr.push_back(c);
+            }
+        }
+        if (hasFirstColon) {
+            parts.push_back(curr);
+        }
+
+        if (!parts.empty()) {
+            // parts[0] display name
+            std::string dStrip = TrimString(parts[0]);
+            if (dStrip.length() >= 2 && dStrip.front() == '"' && dStrip.back() == '"') {
+                std::string val = dStrip.substr(1, dStrip.length() - 2);
+                std::string tr = getTrans(val);
+                size_t pos = parts[0].find("\"" + val + "\"");
+                if (pos != std::string::npos) {
+                    parts[0].replace(pos, val.length() + 2, "\"" + tr + "\"");
+                }
+            }
+            // parts[2] description
+            if (parts.size() >= 3) {
+                std::string descStrip = TrimString(parts[2]);
+                if (descStrip.length() >= 2 && descStrip.front() == '"' && descStrip.back() == '"') {
+                    std::string val = descStrip.substr(1, descStrip.length() - 2);
+                    std::string tr = getTrans(val);
+                    size_t pos = parts[2].find("\"" + val + "\"");
+                    if (pos != std::string::npos) {
+                        parts[2].replace(pos, val.length() + 2, "\"" + tr + "\"");
+                    }
+                }
+            }
+
+            size_t leadPos = code.find_first_not_of(" \t");
+            std::string leadingSpaces = (leadPos != std::string::npos) ? code.substr(0, leadPos) : "";
+            std::string reassembled = leadingSpaces + ":";
+            for (size_t k = 0; k < parts.size(); ++k) {
+                if (k > 0) reassembled += ":";
+                reassembled += parts[k];
+            }
+            return reassembled + comment + lineEnding;
+        }
     }
 
     // 5. 选项列表 (Choices / Flags)："0" : "Enabled" : "Option Desc" 或 1 : "Passable" : 0
-    std::string trimmedCode = TrimString(code);
     if (!trimmedCode.empty() && trimmedCode.front() != '@' && code.find(':') != std::string::npos) {
-        std::regex choiceRegex(R"re(^(\s*(?:"[^"]*"|[0-9a-zA-Z_\-]+)\s*:\s*)"([^"]*)"(.*)$)re");
+        std::regex choiceRegex(R"re(^(\s*(?:"[^"]*"|[-0-9a-zA-Z_]+)\s*:\s*)"([^"]*)"(.*)$)re");
         std::smatch choiceMatch;
         if (std::regex_match(code, choiceMatch, choiceRegex)) {
             std::string cPrefix = choiceMatch[1].str();
@@ -761,8 +975,9 @@ bool FgdTranslator::TranslateFile(
     if (!outFile.is_open()) return false;
 
     std::string currentClassName = "";
+    std::string pendingClassDesc = "";
     for (const auto& l : lines) {
-        std::string transLine = TranslateLine(l, dict, overrideData, currentClassName);
+        std::string transLine = TranslateLine(l, dict, overrideData, currentClassName, pendingClassDesc);
         outFile.write(transLine.data(), transLine.length());
     }
     outFile.close();
@@ -974,11 +1189,10 @@ bool FgdTranslator::EnsureFgdOverrideDictionaryExists(const std::wstring& jsonPa
     out << "  },\n\n";
 
     out << "  \"io\": {\n";
-    out << "    \"SetParent\": \"设置该实体的父级层级对象，使其跟随父级移动。\",\n";
-    out << "    \"SetParentWithOffset\": \"保持当前局部偏移并挂载到父级实体。\",\n";
-    out << "    \"SetParentMaintainOffset\": \"挂载到父级实体的同时保持相对位置偏移不变。\",\n";
     out << "    \"ClearParent\": \"解除与父级实体的挂载绑定关系，使其独立运动。\",\n";
-    out << "    \"FollowEntity\": \"骨骼合并 (Bone Merge) 附加到目标实体。\"\n";
+    out << "    \"FollowEntity\": \"骨骼合并 (Bone Merge) 附加到目标实体。\",\n";
+    out << "    \"Kill\": \"从世界中移除此实体并释放资源。\",\n";
+    out << "    \"SetHealth\": \"设置该实体的当前生命值。\"\n";
     out << "  },\n\n";
 
     out << "  \"classes\": {\n";
