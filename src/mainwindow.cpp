@@ -666,12 +666,11 @@ void MainWindow::onUpdateTranslationsClicked() {
         QMessageBox::warning(this, "警告", "Hammer 正在运行中，无法在运行时更新词典！");
         return;
     }
-
     int ret = QMessageBox::question(
         this,
         "确认更新在线翻译",
         "是否从 GitHub 仓库获取并更新最新的汉化词典文件？\n\n"
-        "提示：此操作将使用在线最新词典覆盖本地的 qt_translations.json 和 fgd_translations.json。\n"
+        "提示：此操作将使用在线最新词典覆盖本地的 qt_translations.json、fgd_translations.json 与 fgd_override.json。\n"
         "若您之前手动自定义过本地词典，请注意备份。",
         QMessageBox::Yes | QMessageBox::No,
         QMessageBox::No
@@ -703,9 +702,52 @@ void MainWindow::onUpdateTranslationsClicked() {
         "https://cdn.jsdelivr.net/gh/LaplaceTor/CS2HammerTranslateCN@main/fgd_translations.json"
     };
 
+    QStringList overrideUrls = {
+        "https://raw.githubusercontent.com/LaplaceTor/CS2WorkshopToolsLocalizerCN/main/fgd_override.json",
+        "https://cdn.jsdelivr.net/gh/LaplaceTor/CS2WorkshopToolsLocalizerCN@main/fgd_override.json",
+        "https://raw.githubusercontent.com/LaplaceTor/CS2WorkshopToolsLocalizerCN/master/fgd_override.json",
+        "https://cdn.jsdelivr.net/gh/LaplaceTor/CS2WorkshopToolsLocalizerCN@master/fgd_override.json",
+        "https://raw.githubusercontent.com/LaplaceTor/CS2HammerTranslateCN/main/fgd_override.json",
+        "https://cdn.jsdelivr.net/gh/LaplaceTor/CS2HammerTranslateCN@main/fgd_override.json"
+    };
+
+    auto stripJsonc = [](const QByteArray& input) -> QByteArray {
+        QByteArray output;
+        output.reserve(input.size());
+        const char* p = input.constData();
+        const char* end = p + input.size();
+
+        while (p < end) {
+            if (*p == '"') {
+                output.append(*p++);
+                while (p < end) {
+                    char c = *p++;
+                    output.append(c);
+                    if (c == '"') break;
+                    if (c == '\\' && p < end) output.append(*p++);
+                }
+            } else if (*p == '/' && (p + 1 < end)) {
+                if (*(p + 1) == '/') {
+                    p += 2;
+                    while (p < end && *p != '\n' && *p != '\r') p++;
+                } else if (*(p + 1) == '*') {
+                    p += 2;
+                    while (p + 1 < end && !(*p == '*' && *(p + 1) == '/')) p++;
+                    if (p + 1 < end) p += 2;
+                    else p = end;
+                } else {
+                    output.append(*p++);
+                }
+            } else {
+                output.append(*p++);
+            }
+        }
+        return output;
+    };
+
     // 1. Fetch qt_translations.json
-    appendLog("[1/2] 正在获取 qt_translations.json (界面词典)...", "#e6db74");
-    fetchUrlCandidates(qtUrls, [this, fgdUrls](bool qtOk, const QByteArray& qtData) {
+    appendLog("[1/3] 正在获取 qt_translations.json (界面词典)...", "#e6db74");
+    fetchUrlCandidates(qtUrls, [this, fgdUrls, overrideUrls, stripJsonc](bool qtOk, const QByteArray& qtData) {
         if (!qtOk) {
             appendLog("[-] 获取 qt_translations.json 失败：所有节点连接超时或不可达，请检查网络或代理设置。", "#f92672");
             QMessageBox::critical(this, "更新失败", "获取 qt_translations.json 失败！\n无法连接到 GitHub 仓库，请检查您的网络连接或代理设置。");
@@ -713,40 +755,6 @@ void MainWindow::onUpdateTranslationsClicked() {
             m_statusLabel->setText("状态: 词典更新失败");
             return;
         }
-
-        auto stripJsonc = [](const QByteArray& input) -> QByteArray {
-            QByteArray output;
-            output.reserve(input.size());
-            const char* p = input.constData();
-            const char* end = p + input.size();
-
-            while (p < end) {
-                if (*p == '"') {
-                    output.append(*p++);
-                    while (p < end) {
-                        char c = *p++;
-                        output.append(c);
-                        if (c == '"') break;
-                        if (c == '\\' && p < end) output.append(*p++);
-                    }
-                } else if (*p == '/' && (p + 1 < end)) {
-                    if (*(p + 1) == '/') {
-                        p += 2;
-                        while (p < end && *p != '\n' && *p != '\r') p++;
-                    } else if (*(p + 1) == '*') {
-                        p += 2;
-                        while (p + 1 < end && !(*p == '*' && *(p + 1) == '/')) p++;
-                        if (p + 1 < end) p += 2;
-                        else p = end;
-                    } else {
-                        output.append(*p++);
-                    }
-                } else {
-                    output.append(*p++);
-                }
-            }
-            return output;
-        };
 
         QJsonParseError qtParseErr;
         QJsonDocument qtDoc = QJsonDocument::fromJson(stripJsonc(qtData), &qtParseErr);
@@ -762,8 +770,8 @@ void MainWindow::onUpdateTranslationsClicked() {
         appendLog(QString("[+] qt_translations.json 获取成功，有效词条: %1 条").arg(qtCount), "#a6e22e");
 
         // 2. Fetch fgd_translations.json
-        appendLog("[2/2] 正在获取 fgd_translations.json (实体定义词典)...", "#e6db74");
-        fetchUrlCandidates(fgdUrls, [this, qtData, qtCount, stripJsonc](bool fgdOk, const QByteArray& fgdData) {
+        appendLog("[2/3] 正在获取 fgd_translations.json (实体定义词典)...", "#e6db74");
+        fetchUrlCandidates(fgdUrls, [this, overrideUrls, qtData, qtCount, stripJsonc](bool fgdOk, const QByteArray& fgdData) {
             if (!fgdOk) {
                 appendLog("[-] 获取 fgd_translations.json 失败：所有节点连接超时或不可达，请检查网络设置。", "#f92672");
                 QMessageBox::critical(this, "更新失败", "获取 fgd_translations.json 失败！\n无法连接到 GitHub 仓库，请检查网络连接。");
@@ -785,44 +793,101 @@ void MainWindow::onUpdateTranslationsClicked() {
             qsizetype fgdCount = fgdDoc.object().keys().size();
             appendLog(QString("[+] fgd_translations.json 获取成功，有效词条: %1 条").arg(fgdCount), "#a6e22e");
 
-            // Save both files
-            QString qtLocalPath = QString::fromStdWString((fs::path(m_workingDir) / L"qt_translations.json").wstring());
-            QString fgdLocalPath = QString::fromStdWString((fs::path(m_workingDir) / L"fgd_translations.json").wstring());
+            // 3. Fetch fgd_override.json
+            appendLog("[3/3] 正在获取 fgd_override.json (实体覆盖词典)...", "#e6db74");
+            fetchUrlCandidates(overrideUrls, [this, qtData, fgdData, qtCount, fgdCount, stripJsonc](bool overrideOk, const QByteArray& overrideData) {
+                if (!overrideOk) {
+                    appendLog("[-] 获取 fgd_override.json 失败：所有节点连接超时或不可达，请检查网络设置。", "#f92672");
+                    QMessageBox::critical(this, "更新失败", "获取 fgd_override.json 失败！\n无法连接到 GitHub 仓库，请检查网络连接。");
+                    setUiBusy(false);
+                    m_statusLabel->setText("状态: 词典更新失败");
+                    return;
+                }
 
-            QFile qtFile(qtLocalPath);
-            if (!qtFile.open(QIODevice::WriteOnly | QIODevice::Truncate)) {
-                appendLog("[-] 写入本地 qt_translations.json 失败！", "#f92672");
-                QMessageBox::critical(this, "写入失败", "写入本地 qt_translations.json 失败，请检查文件权限。");
+                QJsonParseError overrideParseErr;
+                QJsonDocument overrideDoc = QJsonDocument::fromJson(stripJsonc(overrideData), &overrideParseErr);
+                if (overrideParseErr.error != QJsonParseError::NoError || !overrideDoc.isObject() || overrideDoc.object().isEmpty()) {
+                    appendLog(QString("[-] 解析 fgd_override.json 失败: %1").arg(overrideParseErr.errorString()), "#f92672");
+                    QMessageBox::critical(this, "更新失败", "下载的 fgd_override.json 格式异常或内容为空，已放弃更新。");
+                    setUiBusy(false);
+                    m_statusLabel->setText("状态: 词典校验失败");
+                    return;
+                }
+
+                qsizetype overrideCount = 0;
+                QJsonObject overrideObj = overrideDoc.object();
+                if (overrideObj.contains("properties") && overrideObj["properties"].isObject()) {
+                    overrideCount += overrideObj["properties"].toObject().keys().size();
+                }
+                if (overrideObj.contains("io") && overrideObj["io"].isObject()) {
+                    overrideCount += overrideObj["io"].toObject().keys().size();
+                }
+                if (overrideObj.contains("classes") && overrideObj["classes"].isObject()) {
+                    overrideCount += overrideObj["classes"].toObject().keys().size();
+                }
+                for (auto it = overrideObj.begin(); it != overrideObj.end(); ++it) {
+                    if (it.key() != "properties" && it.key() != "io" && it.key() != "classes" && !it.key().startsWith("_")) {
+                        overrideCount++;
+                    }
+                }
+                if (overrideCount == 0) {
+                    overrideCount = overrideObj.keys().size();
+                }
+
+                appendLog(QString("[+] fgd_override.json 获取成功，有效规则: %1 条").arg(overrideCount), "#a6e22e");
+
+                // Save all three files
+                QString qtLocalPath = QString::fromStdWString((fs::path(m_workingDir) / L"qt_translations.json").wstring());
+                QString fgdLocalPath = QString::fromStdWString((fs::path(m_workingDir) / L"fgd_translations.json").wstring());
+                QString overrideLocalPath = QString::fromStdWString((fs::path(m_workingDir) / L"fgd_override.json").wstring());
+
+                QFile qtFile(qtLocalPath);
+                if (!qtFile.open(QIODevice::WriteOnly | QIODevice::Truncate)) {
+                    appendLog("[-] 写入本地 qt_translations.json 失败！", "#f92672");
+                    QMessageBox::critical(this, "写入失败", "写入本地 qt_translations.json 失败，请检查文件权限。");
+                    setUiBusy(false);
+                    m_statusLabel->setText("状态: 写入失败");
+                    return;
+                }
+                qtFile.write(qtData);
+                qtFile.close();
+
+                QFile fgdFile(fgdLocalPath);
+                if (!fgdFile.open(QIODevice::WriteOnly | QIODevice::Truncate)) {
+                    appendLog("[-] 写入本地 fgd_translations.json 失败！", "#f92672");
+                    QMessageBox::critical(this, "写入失败", "写入本地 fgd_translations.json 失败，请检查文件权限。");
+                    setUiBusy(false);
+                    m_statusLabel->setText("状态: 写入失败");
+                    return;
+                }
+                fgdFile.write(fgdData);
+                fgdFile.close();
+
+                QFile overrideFile(overrideLocalPath);
+                if (!overrideFile.open(QIODevice::WriteOnly | QIODevice::Truncate)) {
+                    appendLog("[-] 写入本地 fgd_override.json 失败！", "#f92672");
+                    QMessageBox::critical(this, "写入失败", "写入本地 fgd_override.json 失败，请检查文件权限。");
+                    setUiBusy(false);
+                    m_statusLabel->setText("状态: 写入失败");
+                    return;
+                }
+                overrideFile.write(overrideData);
+                overrideFile.close();
+
+                appendLog(QString("[SUCCESS] 翻译词典更新成功！(界面: %1, 实体: %2, 覆盖: %3)").arg(qtCount).arg(fgdCount).arg(overrideCount), "#a6e22e");
+                m_statusLabel->setText("状态: 在线词典更新成功");
                 setUiBusy(false);
-                m_statusLabel->setText("状态: 写入失败");
-                return;
-            }
-            qtFile.write(qtData);
-            qtFile.close();
 
-            QFile fgdFile(fgdLocalPath);
-            if (!fgdFile.open(QIODevice::WriteOnly | QIODevice::Truncate)) {
-                appendLog("[-] 写入本地 fgd_translations.json 失败！", "#f92672");
-                QMessageBox::critical(this, "写入失败", "写入本地 fgd_translations.json 失败，请检查文件权限。");
-                setUiBusy(false);
-                m_statusLabel->setText("状态: 写入失败");
-                return;
-            }
-            fgdFile.write(fgdData);
-            fgdFile.close();
-
-            appendLog(QString("[SUCCESS] 翻译词典更新成功！(界面词条: %1, 实体词条: %2)").arg(qtCount).arg(fgdCount), "#a6e22e");
-            m_statusLabel->setText("状态: 在线词典更新成功");
-            setUiBusy(false);
-
-            QMessageBox::information(
-                this,
-                "更新成功",
-                QString("已成功从 GitHub 获取并更新最新汉化词典！\n\n"
-                        "- 界面词典 (qt_translations.json): %1 条\n"
-                        "- 实体词典 (fgd_translations.json): %2 条\n\n"
-                        "点击“启动 CS2 Workshop Tools (汉化版)”即可应用最新汉化。").arg(qtCount).arg(fgdCount)
-            );
+                QMessageBox::information(
+                    this,
+                    "更新成功",
+                    QString("已成功从 GitHub 获取并更新最新汉化词典！\n\n"
+                            "- 界面词典 (qt_translations.json): %1 条\n"
+                            "- 实体词典 (fgd_translations.json): %2 条\n"
+                            "- 覆盖词典 (fgd_override.json): %3 条\n\n"
+                            "点击“启动 CS2 Workshop Tools (汉化版)”即可应用最新汉化。").arg(qtCount).arg(fgdCount).arg(overrideCount)
+                );
+            });
         });
     });
 }
