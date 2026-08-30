@@ -132,10 +132,13 @@
   "Type": "类型",
   "Tags": "标签",
   "Mod": "模组",
+  "Mods": "模组",
+  "Asset Type": "资产类型",
+  "Asset Types": "资产类型",
   "Size": "尺寸",
   "Count": "数量",
 
-  "%1%2/%3 Tags%4%5": "%1%2/%3 标签%4%5",
+  "Tags + Untagged": "标签 + 无标签",
   "+ Untagged": "+ 无标签",
   "Untagged Only": "仅无标签",
 

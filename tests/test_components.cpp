@@ -230,6 +230,13 @@ int main() {
     bool cs2Running = Cs2Detector::IsCs2ProcessRunning();
     std::cout << "         Is CS2 Running right now: " << (cs2Running ? "YES" : "NO") << "\n";
 
+    // Test Cs2Detector::IsProcessRunning(pid)
+    DWORD curPid = GetCurrentProcessId();
+    assert(Cs2Detector::IsProcessRunning(curPid) && "IsProcessRunning(current_pid) must be true");
+    assert(!Cs2Detector::IsProcessRunning(0) && "IsProcessRunning(0) must be false");
+    assert(!Cs2Detector::IsProcessRunning(99999999) && "IsProcessRunning(non_existent_pid) must be false");
+    std::cout << "         IsProcessRunning(curPid): PASSED\n";
+
     fs::remove_all(tempWorkDir);
     std::cout << "[Test 7] Session State Management & Process Detection: PASSED\n";
 

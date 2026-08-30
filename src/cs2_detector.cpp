@@ -8,6 +8,17 @@
 
 namespace fs = std::filesystem;
 
+bool Cs2Detector::IsProcessRunning(unsigned long pid) {
+    if (pid == 0) return false;
+    HANDLE hProcess = OpenProcess(SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION, FALSE, static_cast<DWORD>(pid));
+    if (hProcess == NULL) {
+        return false;
+    }
+    DWORD waitRes = WaitForSingleObject(hProcess, 0);
+    CloseHandle(hProcess);
+    return (waitRes == WAIT_TIMEOUT);
+}
+
 bool Cs2Detector::IsCs2ProcessRunning() {
     HANDLE hSnapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
     if (hSnapshot == INVALID_HANDLE_VALUE) {

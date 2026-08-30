@@ -20,6 +20,7 @@
 #include <QCloseEvent>
 #include <QApplication>
 #include <QThread>
+#include <QTimer>
 #include <QFileInfo>
 #include <QDir>
 #include <QSettings>
@@ -40,7 +41,11 @@ MainWindow::MainWindow(const std::wstring& cs2Root, QWidget *parent)
     , m_cs2Root(cs2Root)
     , m_networkManager(new QNetworkAccessManager(this))
     , m_hammerProcess(new QProcess(this))
+    , m_monitorTimer(new QTimer(this))
+    , m_notRunningCount(0)
     , m_isHammerRunning(false)
+    , m_hammerPid(0)
+    , m_hammerProcessHandle(nullptr)
 {
     // 获取程序所在目录作为工作目录
     QString appDir = QApplication::applicationDirPath();
@@ -70,6 +75,7 @@ MainWindow::MainWindow(const std::wstring& cs2Root, QWidget *parent)
     connect(m_hammerProcess, &QProcess::started, this, &MainWindow::onHammerStarted);
     connect(m_hammerProcess, QOverload<int, QProcess::ExitStatus>::of(&QProcess::finished), this, &MainWindow::onHammerFinished);
     connect(m_hammerProcess, &QProcess::errorOccurred, this, &MainWindow::onHammerError);
+    connect(m_monitorTimer, &QTimer::timeout, this, &MainWindow::onCheckProcessState);
 
     appendLog("==================================================", "#66d9ef");
     appendLog(" CS2 Workshop Tools Localizer CN 汉化启动器已就绪", "#a6e22e");
@@ -93,6 +99,10 @@ MainWindow::MainWindow(const std::wstring& cs2Root, QWidget *parent)
 }
 
 MainWindow::~MainWindow() {
+    if (m_hammerProcessHandle != nullptr) {
+        CloseHandle(static_cast<HANDLE>(m_hammerProcessHandle));
+        m_hammerProcessHandle = nullptr;
+    }
 }
 
 void MainWindow::setupUi() {
@@ -329,6 +339,16 @@ void MainWindow::onLaunchClicked() {
         return;
     }
 
+    if (Cs2Detector::IsCs2ProcessRunning()) {
+        QMessageBox::warning(
+            this,
+            "提示",
+            "检测到系统中已有 CS2 进程正在运行！\n\n"
+            "为防止文件冲突与补丁写入受阻，请先退出当前运行的 CS2 游戏或编辑器，然后再启动汉化版。"
+        );
+        return;
+    }
+
     saveSettings();
 
     setUiBusy(true);
@@ -461,40 +481,93 @@ void MainWindow::onLaunchClicked() {
     m_hammerProcess->setProgram(cs2ExePath);
     m_hammerProcess->setArguments(processArgs);
     m_hammerProcess->setWorkingDirectory(QString::fromStdWString(cs2Bin.wstring()));
+    m_hammerProcess->setProcessChannelMode(QProcess::ForwardedChannels);
 
     appendLog(QString("[*] 执行命令: %1 %2").arg(cs2ExePath, processArgs.join(" ")), "#75715e");
 
     // 保存运行会话状态，防止运行期间程序被强杀导致下次启动丢失备份
     BackupManager::SaveSessionState(m_workingDir, true);
-    m_hammerProcess->start();
-}
-
-void MainWindow::onHammerStarted() {
     m_isHammerRunning = true;
-    m_statusLabel->setText("状态: Hammer 编辑器正在运行中 (退出后将自动恢复备份)");
+    m_notRunningCount = 0;
+    m_statusLabel->setText("状态: Hammer 编辑器正在启动...");
     m_launchBtn->setText("⏳ Hammer 运行中...");
     m_launchBtn->setEnabled(false);
     m_updateBtn->setEnabled(false);
     m_restoreBtn->setEnabled(false);
-    appendLog("[+] CS2 Hammer 进程已成功启动！正在监听运行生命周期...", "#a6e22e");
+
+    m_hammerProcess->start();
+    m_monitorTimer->start(1000);
+}
+
+void MainWindow::onHammerStarted() {
+    m_isHammerRunning = true;
+    m_notRunningCount = 0;
+    m_hammerPid = m_hammerProcess->processId();
+    if (m_hammerProcessHandle != nullptr) {
+        CloseHandle(static_cast<HANDLE>(m_hammerProcessHandle));
+        m_hammerProcessHandle = nullptr;
+    }
+    if (m_hammerPid > 0) {
+        m_hammerProcessHandle = OpenProcess(SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION, FALSE, static_cast<DWORD>(m_hammerPid));
+    }
+    m_statusLabel->setText("状态: Hammer 编辑器正在运行中 (退出后将自动恢复备份)");
+    appendLog(QString("[+] CS2 Hammer 进程已成功启动 (PID: %1)！正在监听运行生命周期...").arg(m_hammerPid), "#a6e22e");
 }
 
 void MainWindow::onHammerFinished(int exitCode, QProcess::ExitStatus exitStatus) {
+    Q_UNUSED(exitCode);
     Q_UNUSED(exitStatus);
-    m_isHammerRunning = false;
-    appendLog(QString("[*] 检测到 CS2 Hammer 进程已退出 (代码: %1)，正在等待文件释放并执行自动还原...").arg(exitCode), "#66d9ef");
-    m_statusLabel->setText("状态: 正在等待文件句柄释放并恢复原版文件...");
+    handleHammerProcessTerminated();
+}
 
-    // 1. 等待系统内所有 cs2.exe 进程完全释放退出（最多等待 3 秒）
-    int waitCount = 0;
-    while (Cs2Detector::IsCs2ProcessRunning() && waitCount < 30) {
-        QThread::msleep(100);
-        waitCount++;
+void MainWindow::onCheckProcessState() {
+    if (!m_isHammerRunning) {
+        m_monitorTimer->stop();
+        return;
     }
 
-    // 2. 执行安全还原（内部自带多重重试机制）
-    bool restoreOk = doRestore(true);
+    bool isRunning = false;
+    if (m_hammerProcess && m_hammerProcess->state() == QProcess::Running) {
+        isRunning = true;
+    } else if (m_hammerProcessHandle != nullptr) {
+        DWORD waitRes = WaitForSingleObject(static_cast<HANDLE>(m_hammerProcessHandle), 0);
+        if (waitRes == WAIT_TIMEOUT) {
+            isRunning = true;
+        }
+    } else if (m_hammerPid > 0) {
+        isRunning = Cs2Detector::IsProcessRunning(static_cast<DWORD>(m_hammerPid));
+    }
 
+    if (isRunning) {
+        m_notRunningCount = 0;
+        m_statusLabel->setText("状态: Hammer 编辑器正在运行中 (退出后将自动恢复备份)");
+    } else {
+        m_notRunningCount++;
+        // 确认本程序启动的子进程已退出
+        if (m_notRunningCount >= 2) {
+            handleHammerProcessTerminated();
+        }
+    }
+}
+
+void MainWindow::handleHammerProcessTerminated() {
+    if (!m_isHammerRunning) {
+        return;
+    }
+
+    m_monitorTimer->stop();
+    m_isHammerRunning = false;
+
+    if (m_hammerProcessHandle != nullptr) {
+        CloseHandle(static_cast<HANDLE>(m_hammerProcessHandle));
+        m_hammerProcessHandle = nullptr;
+    }
+    m_hammerPid = 0;
+
+    appendLog("[*] 检测到本程序启动的 CS2 与 Hammer 已退出，正在执行自动安全还原...", "#66d9ef");
+    m_statusLabel->setText("状态: 正在恢复原版文件...");
+
+    bool restoreOk = doRestore(true);
     if (restoreOk) {
         BackupManager::ClearSessionState(m_workingDir);
         m_statusLabel->setText("状态: 就绪 (原版环境已安全恢复)");
@@ -512,6 +585,7 @@ void MainWindow::onHammerFinished(int exitCode, QProcess::ExitStatus exitStatus)
 
     m_launchBtn->setText("🚀 启动 CS2 Workshop Tools (汉化版)");
     setUiBusy(false);
+    updateRestoreButtonState();
 }
 
 void MainWindow::onHammerError(QProcess::ProcessError error) {
@@ -850,13 +924,12 @@ void MainWindow::onHelpClicked() {
 }
 
 void MainWindow::closeEvent(QCloseEvent *event) {
-    bool isRunning = m_isHammerRunning || Cs2Detector::IsCs2ProcessRunning();
-    if (isRunning) {
+    if (m_isHammerRunning) {
         QMessageBox::warning(
             this,
             "禁止关闭",
-            "CS2 / Hammer 编辑器正在运行中！\n\n"
-            "为防止 CS2 原版文件损坏或丢失，在 CS2 运行期间严禁关闭本启动器。\n"
+            "本启动器启动的 CS2 / Hammer 编辑器正在运行中！\n\n"
+            "为防止 CS2 原版文件损坏或丢失，在运行期间严禁关闭本启动器。\n"
             "请先在 CS2 / Hammer 中正常退出，启动器将在退出后自动恢复原版文件并允许安全关闭。"
         );
         event->ignore();

@@ -29,6 +29,7 @@ private slots:
     void onHammerStarted();
     void onHammerFinished(int exitCode, QProcess::ExitStatus exitStatus);
     void onHammerError(QProcess::ProcessError error);
+    void onCheckProcessState();
 
 private:
     void setupUi();
@@ -40,6 +41,7 @@ private:
     void updateRestoreButtonState();
     bool doRestore(bool showLog = true);
     void checkAndRecoverAbnormalExit();
+    void handleHammerProcessTerminated();
     void fetchUrlCandidates(const QStringList& urls, std::function<void(bool success, const QByteArray& data)> callback);
 
     std::wstring m_cs2Root;
@@ -57,6 +59,10 @@ private:
 
     QNetworkAccessManager* m_networkManager;
     QProcess* m_hammerProcess;
+    class QTimer* m_monitorTimer;
+    int m_notRunningCount;
     bool m_isHammerRunning;
+    qint64 m_hammerPid;
+    void* m_hammerProcessHandle;
 };
 
