@@ -1147,29 +1147,6 @@ static VOID CALLBACK OnDllNotification(ULONG NotificationReason, PLDR_DLL_NOTIFI
     }
 }
 
-static DWORD WINAPI ToolsHookThread(LPVOID lpParam) {
-    LogHook("[THREAD] ToolsHookThread started");
-
-    // 在后台独立线程中预加载字典，确保不阻塞主线程/DllMain
-    EnsureDictionaryLoaded();
-
-    while ((!g_bWidgetsHooked.load() || !g_bGuiHooked.load()) && !g_bStopHookThread.load()) {
-        TryHookQtToolsModules();
-
-        if ((!g_bWidgetsHooked.load() || !g_bGuiHooked.load()) && !g_bStopHookThread.load()) {
-            if (g_hWakeHookEvent) {
-                WaitForSingleObject(g_hWakeHookEvent, 50);
-            } else {
-                Sleep(50);
-            }
-        }
-    }
-
-    LogHook("[THREAD] ToolsHookThread finishing (widgets=%d, gui=%d, stopRequested=%d)",
-        g_bWidgetsHooked.load(), g_bGuiHooked.load(), g_bStopHookThread.load());
-    return 0;
-}
-
 static bool SafeReadPointer(void* ptr, void*& outVal) {
     __try {
         outVal = *(void**)ptr;
@@ -1180,7 +1157,141 @@ static bool SafeReadPointer(void* ptr, void*& outVal) {
     }
 }
 
-// 基于调用者地址判断是否属于 Workshop Tools/Hammer 相关工具模块（零死锁、零锁竞争安全查询）
+// ==============================================================================
+// 6. 异常诊断捕获器（VEH 保持极简纯内存快照，耗时格式化/文件 I/O/模块查询/MiniDump 全部交给 Worker 线程）
+// ==============================================================================
+static HMODULE g_hModule = NULL;
+
+struct CrashContextSnapshot {
+    std::atomic<bool> captured{false};
+    DWORD threadId{0};
+    DWORD processId{0};
+    DWORD exceptionCode{0};
+    void* rip{nullptr};
+    ULONG_PTR faultAddr{0};
+    int accessType{0};
+    CONTEXT contextRecord{};
+    void* stackSnapshot[32]{};
+    size_t stackDepth{0};
+};
+
+static CrashContextSnapshot g_CrashSnapshot;
+static HANDLE g_hCrashReportEvent = NULL;
+
+static void ProcessCrashReportAsync() {
+    if (!g_CrashSnapshot.captured.load(std::memory_order_acquire)) {
+        return;
+    }
+
+    DWORD code = g_CrashSnapshot.exceptionCode;
+    void* rip = g_CrashSnapshot.rip;
+    std::wstring modName = GetCallerModuleName(rip);
+    int accessType = g_CrashSnapshot.accessType;
+    ULONG_PTR faultAddr = g_CrashSnapshot.faultAddr;
+
+    LogHook("================ [CRASH EXCEPTION CAPTURED (WORKER)] ================");
+    LogHook("Thread ID      : %u (0x%X)", g_CrashSnapshot.threadId, g_CrashSnapshot.threadId);
+    LogHook("Exception Code : 0x%08X", code);
+    LogHook("Faulting RIP   : %p (Module: %ls)", rip, modName.c_str());
+    if (code == EXCEPTION_ACCESS_VIOLATION) {
+        LogHook("Access Violation: Attempt to %s memory at address %p",
+            accessType == 0 ? "READ" : (accessType == 1 ? "WRITE" : "EXECUTE"), (void*)faultAddr);
+    }
+    const CONTEXT& ctx = g_CrashSnapshot.contextRecord;
+    LogHook("Registers:");
+    LogHook("  RAX=%p  RBX=%p  RCX=%p  RDX=%p", (void*)ctx.Rax, (void*)ctx.Rbx, (void*)ctx.Rcx, (void*)ctx.Rdx);
+    LogHook("  RSI=%p  RDI=%p  RSP=%p  RBP=%p", (void*)ctx.Rsi, (void*)ctx.Rdi, (void*)ctx.Rsp, (void*)ctx.Rbp);
+    LogHook("  R8 =%p  R9 =%p  R10=%p  R11=%p", (void*)ctx.R8, (void*)ctx.R9, (void*)ctx.R10, (void*)ctx.R11);
+    LogHook("  R12=%p  R13=%p  R14=%p  R15=%p", (void*)ctx.R12, (void*)ctx.R13, (void*)ctx.R14, (void*)ctx.R15);
+
+    LogHook("Stack Frames (Top %zu):", g_CrashSnapshot.stackDepth);
+    for (size_t i = 0; i < g_CrashSnapshot.stackDepth; ++i) {
+        void* frame = g_CrashSnapshot.stackSnapshot[i];
+        if (frame) {
+            std::wstring m = GetCallerModuleName(frame);
+            if (!m.empty()) {
+                LogHook("  [RSP+0x%02zX] %p (%ls)", i * 8, frame, m.c_str());
+            } else {
+                LogHook("  [RSP+0x%02zX] %p", i * 8, frame);
+            }
+        }
+    }
+    LogHook("====================================================================");
+
+    // 自动写入 MiniDump（在 Worker 线程上下文中安全调用）
+    HMODULE hDbgHelp = LoadLibraryA("dbghelp.dll");
+    if (hDbgHelp) {
+        typedef BOOL(WINAPI* fnMiniDumpWriteDump)(HANDLE, DWORD, HANDLE, int, PVOID, PVOID, PVOID);
+        fnMiniDumpWriteDump pDump = (fnMiniDumpWriteDump)GetProcAddress(hDbgHelp, "MiniDumpWriteDump");
+        if (pDump) {
+            std::wstring dumpPath = GetBinDirectory() + L"captured_crash.dmp";
+            HANDLE hFile = CreateFileW(dumpPath.c_str(), GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+            if (hFile != INVALID_HANDLE_VALUE) {
+                EXCEPTION_POINTERS ep;
+                EXCEPTION_RECORD er = {0};
+                er.ExceptionCode = code;
+                er.ExceptionAddress = rip;
+                er.NumberParameters = 2;
+                er.ExceptionInformation[0] = accessType;
+                er.ExceptionInformation[1] = faultAddr;
+
+                CONTEXT ctxCopy = ctx;
+                ep.ExceptionRecord = &er;
+                ep.ContextRecord = &ctxCopy;
+
+                struct {
+                    DWORD ThreadId;
+                    PEXCEPTION_POINTERS ExceptionPointers;
+                    BOOL ClientPointers;
+                } exInfo;
+                exInfo.ThreadId = g_CrashSnapshot.threadId;
+                exInfo.ExceptionPointers = &ep;
+                exInfo.ClientPointers = FALSE;
+                pDump(GetCurrentProcess(), GetCurrentProcessId(), hFile, 2 /* MiniDumpWithFullMemory */, &exInfo, NULL, NULL);
+                CloseHandle(hFile);
+                LogHook("[DUMP] Full minidump saved to: captured_crash.dmp");
+            }
+        }
+    }
+}
+
+static DWORD WINAPI ToolsHookThread(LPVOID lpParam) {
+    LogHook("[THREAD] ToolsHookThread started");
+
+    // 在后台独立线程中预加载字典，确保不阻塞主线程/DllMain
+    EnsureDictionaryLoaded();
+
+    HANDLE waitHandles[2] = { g_hWakeHookEvent, g_hCrashReportEvent };
+
+    while (!g_bStopHookThread.load(std::memory_order_relaxed)) {
+        if (!g_bWidgetsHooked.load(std::memory_order_relaxed) || !g_bGuiHooked.load(std::memory_order_relaxed)) {
+            TryHookQtToolsModules();
+        }
+
+        // 检查是否有崩溃报告待异步处理
+        if (g_CrashSnapshot.captured.load(std::memory_order_acquire)) {
+            ProcessCrashReportAsync();
+            break;
+        }
+
+        DWORD timeout = (g_bWidgetsHooked.load() && g_bGuiHooked.load()) ? 500 : 50;
+        DWORD waitRes = WaitForMultipleObjects(2, waitHandles, FALSE, timeout);
+        if (waitRes == WAIT_OBJECT_0 + 1) {
+            ProcessCrashReportAsync();
+            break;
+        }
+    }
+
+    if (g_CrashSnapshot.captured.load(std::memory_order_acquire)) {
+        ProcessCrashReportAsync();
+    }
+
+    LogHook("[THREAD] ToolsHookThread finishing (widgets=%d, gui=%d, stopRequested=%d)",
+        g_bWidgetsHooked.load(), g_bGuiHooked.load(), g_bStopHookThread.load());
+    return 0;
+}
+
+// 基于调用者地址判断是否属于 Valve Workshop Tools/Hammer 工具链模块（安全判断）
 static bool IsToolAddress(void* rip) {
     if (!rip) return false;
     HMODULE hMod = NULL;
@@ -1201,28 +1312,7 @@ static bool IsToolAddress(void* rip) {
     return false;
 }
 
-// ==============================================================================
-// 6. 异常诊断捕获器（发生 Hook 自身异常时记录现场并紧急停用 Hook，绝不伪造状态主动跳过机器指令）
-// ==============================================================================
-static HMODULE g_hModule = NULL;
-
-static bool IsOurCodeAddress(void* rip) {
-    if (!rip) return false;
-    HMODULE hOurMod = g_hModule ? g_hModule : GetModuleHandleW(L"qtcore_qm.dll");
-    if (hOurMod) {
-        MODULEINFO mi = {0};
-        if (GetModuleInformation(GetCurrentProcess(), hOurMod, &mi, sizeof(mi))) {
-            uintptr_t base = (uintptr_t)mi.lpBaseOfDll;
-            uintptr_t end = base + mi.SizeOfImage;
-            uintptr_t addr = (uintptr_t)rip;
-            if (addr >= base && addr < end) {
-                return true;
-            }
-        }
-    }
-    return HookManager::Instance().IsHookAddress(rip);
-}
-
+// 极简 VEH 异常拦截器：严格保持 0 锁、0 LoadLibrary、0 文件 I/O、0 MiniDump
 static LONG WINAPI DiagnosticCrashLoggerVEH(PEXCEPTION_POINTERS pExceptionInfo) {
     if (!pExceptionInfo || !pExceptionInfo->ExceptionRecord || !pExceptionInfo->ContextRecord) {
         return EXCEPTION_CONTINUE_SEARCH;
@@ -1230,95 +1320,57 @@ static LONG WINAPI DiagnosticCrashLoggerVEH(PEXCEPTION_POINTERS pExceptionInfo) 
 
     DWORD code = pExceptionInfo->ExceptionRecord->ExceptionCode;
 
-    // 1. 精准工具模块低位空指针写守卫 (Targeted Tool Guard for Workshop Tools null writes)
+    // 1. 精准工具模块低位空指针写守卫 (Targeted Tool Guard for Valve Workshop Tools null/dummy writes)
+    // 修复 Valve 工具链在部分未初始化组件下的空写崩溃 BUG，安全跳过故障指令继续执行
     if (code == EXCEPTION_ACCESS_VIOLATION && pExceptionInfo->ExceptionRecord->NumberParameters >= 2) {
         ULONG_PTR faultAddr = pExceptionInfo->ExceptionRecord->ExceptionInformation[1];
         void* rip = (void*)pExceptionInfo->ContextRecord->Rip;
 
-        // 仅拦截：在 Workshop Tools 工具链模块内部访问低位未映射区 (< 0x10000，如未初始化结构的 0x50 偏移空写)
         if (faultAddr < 0x10000 && IsToolAddress(rip)) {
             hde64s hs;
             unsigned int len = hde64_disasm(rip, &hs);
             if (!(hs.flags & F_ERROR) && len > 0 && len <= 15) {
-                LogHook("[GUARD] Safely stepped over tool dummy write instruction at %p (len=%u, faultAddr=%p)", rip, len, (void*)faultAddr);
                 pExceptionInfo->ContextRecord->Rip += len;
                 return EXCEPTION_CONTINUE_EXECUTION;
             }
         }
     }
 
-    // 2. 诊断严重异常与 Hook 自身异常熔断
+    // 2. 严重异常原子最小化快照（100% 纯寄存器与栈内存抓取，零系统锁与文件操作，交给 Worker 异步处理）
     if (code == EXCEPTION_ACCESS_VIOLATION || code == EXCEPTION_ILLEGAL_INSTRUCTION || code == EXCEPTION_DATATYPE_MISALIGNMENT) {
-        void* rip = (void*)pExceptionInfo->ContextRecord->Rip;
-        std::wstring modName = GetCallerModuleName(rip);
-        ULONG_PTR faultAddr = 0;
-        int accessType = 0;
-        if (code == EXCEPTION_ACCESS_VIOLATION && pExceptionInfo->ExceptionRecord->NumberParameters >= 2) {
-            accessType = (int)pExceptionInfo->ExceptionRecord->ExceptionInformation[0];
-            faultAddr = pExceptionInfo->ExceptionRecord->ExceptionInformation[1];
-        }
-
-        LogHook("================ [CRASH EXCEPTION CAPTURED] ================");
-        LogHook("Exception Code : 0x%08X", code);
-            LogHook("Faulting RIP   : %p (Module: %ls)", rip, modName.c_str());
-            if (code == EXCEPTION_ACCESS_VIOLATION) {
-                LogHook("Access Violation: Attempt to %s memory at address %p",
-                    accessType == 0 ? "READ" : (accessType == 1 ? "WRITE" : "EXECUTE"), (void*)faultAddr);
+        bool expected = false;
+        if (g_CrashSnapshot.captured.compare_exchange_strong(expected, true, std::memory_order_acq_rel)) {
+            g_CrashSnapshot.threadId = GetCurrentThreadId();
+            g_CrashSnapshot.processId = GetCurrentProcessId();
+            g_CrashSnapshot.exceptionCode = code;
+            g_CrashSnapshot.rip = (void*)pExceptionInfo->ContextRecord->Rip;
+            if (code == EXCEPTION_ACCESS_VIOLATION && pExceptionInfo->ExceptionRecord->NumberParameters >= 2) {
+                g_CrashSnapshot.accessType = (int)pExceptionInfo->ExceptionRecord->ExceptionInformation[0];
+                g_CrashSnapshot.faultAddr = pExceptionInfo->ExceptionRecord->ExceptionInformation[1];
             }
-            LogHook("Registers:");
-            LogHook("  RAX=%p  RBX=%p  RCX=%p  RDX=%p",
-                (void*)pExceptionInfo->ContextRecord->Rax, (void*)pExceptionInfo->ContextRecord->Rbx,
-                (void*)pExceptionInfo->ContextRecord->Rcx, (void*)pExceptionInfo->ContextRecord->Rdx);
-            LogHook("  RSI=%p  RDI=%p  RSP=%p  RBP=%p",
-                (void*)pExceptionInfo->ContextRecord->Rsi, (void*)pExceptionInfo->ContextRecord->Rdi,
-                (void*)pExceptionInfo->ContextRecord->Rsp, (void*)pExceptionInfo->ContextRecord->Rbp);
-            LogHook("  R8 =%p  R9 =%p  R10=%p  R11=%p",
-                (void*)pExceptionInfo->ContextRecord->R8, (void*)pExceptionInfo->ContextRecord->R9,
-                (void*)pExceptionInfo->ContextRecord->R10, (void*)pExceptionInfo->ContextRecord->R11);
-            LogHook("  R12=%p  R13=%p  R14=%p  R15=%p",
-                (void*)pExceptionInfo->ContextRecord->R12, (void*)pExceptionInfo->ContextRecord->R13,
-                (void*)pExceptionInfo->ContextRecord->R14, (void*)pExceptionInfo->ContextRecord->R15);
+            g_CrashSnapshot.contextRecord = *pExceptionInfo->ContextRecord;
 
-            // 记录调用栈帧
+            // 纯栈指针无锁快照
             void** rsp = (void**)pExceptionInfo->ContextRecord->Rsp;
-            LogHook("Stack Frames (Top 32):");
-            for (int i = 0; i < 32; ++i) {
-                void* frame = nullptr;
-                if (SafeReadPointer(&rsp[i], frame) && frame) {
-                    std::wstring m = GetCallerModuleName(frame);
-                    if (!m.empty()) {
-                        LogHook("  [RSP+0x%02X] %p (%ls)", i * 8, frame, m.c_str());
+            size_t depth = 0;
+            if (rsp) {
+                for (int i = 0; i < 32; ++i) {
+                    void* frame = nullptr;
+                    if (SafeReadPointer(&rsp[i], frame) && frame) {
+                        g_CrashSnapshot.stackSnapshot[depth++] = frame;
                     }
                 }
             }
-            LogHook("=======================================================");
+            g_CrashSnapshot.stackDepth = depth;
 
-            // 自动写入 MiniDump
-            HMODULE hDbgHelp = LoadLibraryA("dbghelp.dll");
-            if (hDbgHelp) {
-                typedef BOOL(WINAPI* fnMiniDumpWriteDump)(HANDLE, DWORD, HANDLE, int, PVOID, PVOID, PVOID);
-                fnMiniDumpWriteDump pDump = (fnMiniDumpWriteDump)GetProcAddress(hDbgHelp, "MiniDumpWriteDump");
-                if (pDump) {
-                    std::wstring dumpPath = GetBinDirectory() + L"captured_crash.dmp";
-                    HANDLE hFile = CreateFileW(dumpPath.c_str(), GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
-                    if (hFile != INVALID_HANDLE_VALUE) {
-                        struct {
-                            DWORD ThreadId;
-                            PEXCEPTION_POINTERS ExceptionPointers;
-                            BOOL ClientPointers;
-                        } exInfo;
-                        exInfo.ThreadId = GetCurrentThreadId();
-                        exInfo.ExceptionPointers = pExceptionInfo;
-                        exInfo.ClientPointers = FALSE;
-                        pDump(GetCurrentProcess(), GetCurrentProcessId(), hFile, 2 /* MiniDumpWithFullMemory */, &exInfo, NULL, NULL);
-                        CloseHandle(hFile);
-                        LogHook("[DUMP] Full minidump saved to: captured_crash.dmp");
-                    }
-                }
+            // 紧急停用所有 Hook
+            HookManager::Instance().EmergencyDisableAllHooks();
+
+            // 唤醒后台 Worker 线程进行复杂格式化与写盘
+            if (g_hCrashReportEvent) {
+                SetEvent(g_hCrashReportEvent);
             }
-
-        // 紧急禁用所有 Hook，防止死锁与循环崩溃
-        HookManager::Instance().EmergencyDisableAllHooks();
+        }
     }
 
     // 允许异常在宿主进程中继续正常传播
@@ -1388,9 +1440,12 @@ extern "C" __declspec(dllexport) bool InitializeTranslator() {
 
     LogHook("[INIT] Qt5Core=%p, fromUtf8=%p, utf16=%p, dtor=%p, orig_tr=%p", hQtCore, g_pfn_fromUtf8, g_pfn_utf16, g_pfn_QString_dtor, g_o_QMetaObject_tr);
 
-    // 2. 创建异步唤醒事件并注册 DLL 通知
+    // 2. 创建异步唤醒事件与崩溃报告事件，并注册 DLL 通知
     if (!g_hWakeHookEvent) {
         g_hWakeHookEvent = CreateEventW(NULL, FALSE, FALSE, NULL);
+    }
+    if (!g_hCrashReportEvent) {
+        g_hCrashReportEvent = CreateEventW(NULL, FALSE, FALSE, NULL);
     }
     HookManager::Instance().RegisterDllNotification(OnDllNotification);
 
@@ -1436,6 +1491,10 @@ extern "C" __declspec(dllexport) void ShutdownTranslator() {
     if (g_hWakeHookEvent) {
         CloseHandle(g_hWakeHookEvent);
         g_hWakeHookEvent = NULL;
+    }
+    if (g_hCrashReportEvent) {
+        CloseHandle(g_hCrashReportEvent);
+        g_hCrashReportEvent = NULL;
     }
 
     // 3. 统一执行完整生命周期退出：
