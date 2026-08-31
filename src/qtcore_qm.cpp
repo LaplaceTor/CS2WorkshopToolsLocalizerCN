@@ -89,7 +89,47 @@ static std::wstring GetBinDirectory() {
     return std::wstring(szPath);
 }
 
+// 详细翻译日志开关：默认在 Release 模式下关闭以彻底消除巨量 I/O。
+// 仅当 CS2 启动命令行中包含 -debug 或 -verbosehook 时才动态开启逐条翻译日志记录。
+static std::atomic<int> g_nVerboseHookLog{-1}; // -1: 未检测, 0: 关闭, 1: 开启
+
+static bool IsVerboseLogEnabled() {
+    int v = g_nVerboseHookLog.load(std::memory_order_relaxed);
+    if (v != -1) return v == 1;
+
+    bool enabled = false;
+    LPCWSTR pCmdLine = GetCommandLineW();
+    if (pCmdLine) {
+        std::wstring cmd = pCmdLine;
+        std::transform(cmd.begin(), cmd.end(), cmd.begin(), ::towlower);
+        if (cmd.find(L"-debug") != std::wstring::npos ||
+            cmd.find(L"--debug") != std::wstring::npos ||
+            cmd.find(L"-verbosehook") != std::wstring::npos) {
+            enabled = true;
+        }
+    }
+    g_nVerboseHookLog.store(enabled ? 1 : 0, std::memory_order_relaxed);
+    return enabled;
+}
+
 static void LogHook(const char* fmt, ...) {
+    static std::mutex s_logMtx;
+    std::lock_guard<std::mutex> lock(s_logMtx);
+    std::wstring binDir = GetBinDirectory();
+    std::wstring logPath = binDir + L"hook_runtime.log";
+    FILE* fp = _wfopen(logPath.c_str(), L"a");
+    if (!fp) return;
+    va_list va;
+    va_start(va, fmt);
+    vfprintf(fp, fmt, va);
+    va_end(va);
+    fprintf(fp, "\n");
+    fflush(fp);
+    fclose(fp);
+}
+
+static inline void LogVerboseTr(const char* fmt, ...) {
+    if (!IsVerboseLogEnabled()) return;
     static std::mutex s_logMtx;
     std::lock_guard<std::mutex> lock(s_logMtx);
     std::wstring binDir = GetBinDirectory();
@@ -189,8 +229,13 @@ static std::string WStringToUtf8(const wchar_t* wstr) {
     if (!wstr || !*wstr) return "";
     int sizeNeeded = WideCharToMultiByte(CP_UTF8, 0, wstr, -1, NULL, 0, NULL, NULL);
     if (sizeNeeded <= 1) return "";
-    std::string str(sizeNeeded - 1, 0);
-    WideCharToMultiByte(CP_UTF8, 0, wstr, -1, &str[0], sizeNeeded, NULL, NULL);
+    std::string str(static_cast<size_t>(sizeNeeded), '\0');
+    int written = WideCharToMultiByte(CP_UTF8, 0, wstr, -1, str.data(), sizeNeeded, NULL, NULL);
+    if (written > 0) {
+        str.resize(static_cast<size_t>(written - 1));
+    } else {
+        str.clear();
+    }
     return str;
 }
 
@@ -680,9 +725,16 @@ static bool FindTranslationScoped(void* callerAddr, const char* text, std::strin
 
 static bool FindTranslationScopedW(void* callerAddr, const wchar_t* wstr, std::string& outResult) {
     if (!wstr || wstr[0] == L'\0') return false;
-    char utf8[1024] = {0};
-    WideCharToMultiByte(CP_UTF8, 0, wstr, -1, utf8, sizeof(utf8), NULL, NULL);
-    return FindTranslationScoped(callerAddr, utf8, outResult);
+    char utf8Stack[1024] = {0};
+    int written = WideCharToMultiByte(CP_UTF8, 0, wstr, -1, utf8Stack, sizeof(utf8Stack), NULL, NULL);
+    if (written > 0) {
+        return FindTranslationScoped(callerAddr, utf8Stack, outResult);
+    }
+    std::string dynamicUtf8 = WStringToUtf8(wstr);
+    if (!dynamicUtf8.empty()) {
+        return FindTranslationScoped(callerAddr, dynamicUtf8.c_str(), outResult);
+    }
+    return false;
 }
 
 // 检查 QString 内部指针合法性，防止空指针与野指针解引用导致 0xC0000005
@@ -703,7 +755,7 @@ static void* __fastcall hk_QMetaObject_tr(const void* pMetaObject, void* pOutQSt
     if (sourceText && g_pfn_fromUtf8) {
         std::string trans;
         if (FindTranslationScoped(caller, sourceText, trans)) {
-            LogHook("[TR] '%s' -> '%s'", sourceText, trans.c_str());
+            LogVerboseTr("[TR] '%s' -> '%s'", sourceText, trans.c_str());
             return g_pfn_fromUtf8(pOutQString, trans.c_str(), (int)trans.length());
         }
     }
@@ -1300,9 +1352,21 @@ extern "C" __declspec(dllexport) void InitQtCoreQmTranslator() {
     InitializeTranslator();
 }
 
+static DWORD WINAPI BootstrapThread(LPVOID lpParam) {
+    LogHook("[BOOTSTRAP] BootstrapThread started asynchronously outside Loader Lock");
+    InitializeTranslator();
+    return 0;
+}
+
 BOOL APIENTRY DllMain(HMODULE hModule, DWORD ul_reason_for_call, LPVOID lpReserved) {
     if (ul_reason_for_call == DLL_PROCESS_ATTACH) {
         DisableThreadLibraryCalls(hModule);
+        // 彻底脱离 Loader Lock：仅在 DLL attach 时创建后台 bootstrap 线程。
+        // Windows 保证该线程会在 DllMain 以及 Qt5Core.dll 的 EntryPoint 完全返回并释放 OS Loader Lock 之后才开始执行！
+        HANDLE hBootstrap = CreateThread(NULL, 0, BootstrapThread, NULL, 0, NULL);
+        if (hBootstrap) {
+            CloseHandle(hBootstrap);
+        }
     }
     return TRUE;
 }

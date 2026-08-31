@@ -110,6 +110,7 @@ add_executable(test_components
     src/backup_manager.cpp
 )
 target_link_libraries(test_components PRIVATE
+    Qt6::Core
     advapi32
     user32
     shell32

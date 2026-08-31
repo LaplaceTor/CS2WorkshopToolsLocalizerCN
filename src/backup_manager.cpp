@@ -11,6 +11,12 @@
 #include <chrono>
 #include <ctime>
 #include <system_error>
+#include <QJsonDocument>
+#include <QJsonObject>
+#include <QJsonParseError>
+#include <QFile>
+#include <QByteArray>
+#include <QString>
 
 namespace fs = std::filesystem;
 
@@ -151,36 +157,31 @@ bool BackupManager::ReadBackupManifest(const std::wstring& backupDir, GameVersio
             return false;
         }
 
-        std::ifstream ifs(manifestPath);
-        if (!ifs.is_open()) {
-            outError = L"无法读取备份元数据清单文件";
+        QFile file(QString::fromStdWString(manifestPath.wstring()));
+        if (!file.open(QIODevice::ReadOnly)) {
+            outError = L"无法读取备份元数据清单文件: " + file.errorString().toStdWString();
             return false;
         }
 
-        std::stringstream ss;
-        ss << ifs.rdbuf();
-        std::string json = ss.str();
+        QByteArray data = file.readAll();
+        file.close();
 
-        auto extractString = [&](const std::string& key) -> std::string {
-            std::string target = "\"" + key + "\":";
-            size_t pos = json.find(target);
-            if (pos == std::string::npos) return "";
-            size_t startQuote = json.find('"', pos + target.size());
-            if (startQuote == std::string::npos) return "";
-            size_t endQuote = json.find('"', startQuote + 1);
-            if (endQuote == std::string::npos) return "";
-            return json.substr(startQuote + 1, endQuote - startQuote - 1);
-        };
+        QJsonParseError parseError;
+        QJsonDocument doc = QJsonDocument::fromJson(data, &parseError);
+        if (parseError.error != QJsonParseError::NoError || !doc.isObject()) {
+            outError = L"解析备份清单 JSON 失败: " + parseError.errorString().toStdWString();
+            return false;
+        }
 
-        outSig.cs2ProductVersion = extractString("cs2_exe_version");
-        outSig.cs2ExeSha256 = extractString("cs2_exe_sha256");
-        outSig.qt5CoreSha256 = extractString("qt5core_sha256");
-        outSig.qt5WidgetsSha256 = extractString("qt5widgets_sha256");
-        outSig.backupTimestamp = extractString("timestamp");
+        QJsonObject root = doc.object();
+        outSig.cs2ProductVersion = root.value("cs2_exe_version").toString().toStdString();
+        outSig.cs2ExeSha256 = root.value("cs2_exe_sha256").toString().toStdString();
+        outSig.qt5CoreSha256 = root.value("qt5core_sha256").toString().toStdString();
+        outSig.qt5WidgetsSha256 = root.value("qt5widgets_sha256").toString().toStdString();
+        outSig.backupTimestamp = root.value("timestamp").toString().toStdString();
 
-        std::string epochStr = extractString("timestamp_epoch");
-        if (!epochStr.empty()) {
-            outSig.timestampEpoch = std::strtoll(epochStr.c_str(), nullptr, 10);
+        if (root.contains("timestamp_epoch")) {
+            outSig.timestampEpoch = root.value("timestamp_epoch").toInteger();
         }
 
         return !outSig.cs2ProductVersion.empty() && !outSig.qt5CoreSha256.empty();
@@ -195,22 +196,25 @@ bool BackupManager::WriteBackupManifest(const std::wstring& backupDir, const Gam
         fs::path manifestPath = fs::path(backupDir) / L"backup_manifest.json";
         fs::create_directories(manifestPath.parent_path());
 
-        std::ofstream ofs(manifestPath);
-        if (!ofs.is_open()) {
-            outError = L"无法创建并写入 backup_manifest.json";
+        QJsonObject root;
+        root["version"] = 1;
+        root["timestamp"] = QString::fromStdString(sig.backupTimestamp);
+        root["timestamp_epoch"] = static_cast<qint64>(sig.timestampEpoch);
+        root["cs2_exe_version"] = QString::fromStdString(sig.cs2ProductVersion);
+        root["cs2_exe_sha256"] = QString::fromStdString(sig.cs2ExeSha256);
+        root["qt5core_sha256"] = QString::fromStdString(sig.qt5CoreSha256);
+        root["qt5widgets_sha256"] = QString::fromStdString(sig.qt5WidgetsSha256);
+
+        QJsonDocument doc(root);
+        QFile file(QString::fromStdWString(manifestPath.wstring()));
+        if (!file.open(QIODevice::WriteOnly | QIODevice::Truncate)) {
+            outError = L"无法创建并写入 backup_manifest.json: " + file.errorString().toStdWString();
             return false;
         }
 
-        ofs << "{\n";
-        ofs << "  \"version\": 1,\n";
-        ofs << "  \"timestamp\": \"" << sig.backupTimestamp << "\",\n";
-        ofs << "  \"timestamp_epoch\": " << sig.timestampEpoch << ",\n";
-        ofs << "  \"cs2_exe_version\": \"" << sig.cs2ProductVersion << "\",\n";
-        ofs << "  \"cs2_exe_sha256\": \"" << sig.cs2ExeSha256 << "\",\n";
-        ofs << "  \"qt5core_sha256\": \"" << sig.qt5CoreSha256 << "\",\n";
-        ofs << "  \"qt5widgets_sha256\": \"" << sig.qt5WidgetsSha256 << "\"\n";
-        ofs << "}\n";
-        ofs.flush();
+        file.write(doc.toJson(QJsonDocument::Indented));
+        file.flush();
+        file.close();
         return true;
     } catch (const std::exception& e) {
         outError = L"写入备份元数据异常: " + std::wstring(e.what(), e.what() + strlen(e.what()));
