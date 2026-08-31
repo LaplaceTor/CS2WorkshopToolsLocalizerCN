@@ -311,20 +311,32 @@ bool DictionaryCompiler::CompileJsonStringToBinary(const std::string& jsonConten
         return off;
     };
 
-    // 预留 Header 和 Section 数组空间
-    uint32_t totalSections = static_cast<uint32_t>(workItems.size());
-    uint32_t totalEntries = 0;
-    for (const auto& w : workItems) {
-        totalEntries += static_cast<uint32_t>(w.entries.size());
+    // 检查数量上限保护
+    if (workItems.size() > 10000) {
+        outError = L"作用域数量超过安全上限";
+        return false;
     }
 
-    size_t headerSize = sizeof(LcldHeader);
-    size_t sectionsArraySize = totalSections * sizeof(LcldSection);
-    size_t entriesArraySize = totalEntries * sizeof(LcldEntry);
+    uint64_t totalSections64 = workItems.size();
+    uint64_t totalEntries64 = 0;
+    for (const auto& w : workItems) {
+        totalEntries64 += w.entries.size();
+    }
+    if (totalEntries64 > 1000000) {
+        outError = L"字典总条目数超过安全上限";
+        return false;
+    }
 
-    uint32_t sectionsOffset = static_cast<uint32_t>(headerSize);
-    uint32_t entriesStartOffset = static_cast<uint32_t>(headerSize + sectionsArraySize);
-    uint32_t currentEntryOffset = entriesStartOffset;
+    uint32_t totalSections = static_cast<uint32_t>(totalSections64);
+    uint32_t totalEntries = static_cast<uint32_t>(totalEntries64);
+
+    uint64_t headerSize = sizeof(LcldHeader);
+    uint64_t sectionsArraySize = static_cast<uint64_t>(totalSections) * sizeof(LcldSection);
+    uint64_t entriesArraySize = static_cast<uint64_t>(totalEntries) * sizeof(LcldEntry);
+
+    uint64_t sectionsOffset = headerSize;
+    uint64_t entriesStartOffset = headerSize + sectionsArraySize;
+    uint64_t currentEntryOffset = entriesStartOffset;
 
     std::vector<LcldSection> compiledSections;
     std::vector<LcldEntry> compiledEntries;
@@ -333,7 +345,7 @@ bool DictionaryCompiler::CompileJsonStringToBinary(const std::string& jsonConten
         LcldSection sec;
         sec.nameOffset = addString(w.sectionNameUtf8);
         sec.entryCount = static_cast<uint32_t>(w.entries.size());
-        sec.entriesOffset = currentEntryOffset;
+        sec.entriesOffset = static_cast<uint32_t>(currentEntryOffset);
         compiledSections.push_back(sec);
 
         for (const auto& e : w.entries) {
@@ -342,28 +354,34 @@ bool DictionaryCompiler::CompileJsonStringToBinary(const std::string& jsonConten
             entry.valOffset = addString(e.second);
             compiledEntries.push_back(entry);
         }
-        currentEntryOffset += static_cast<uint32_t>(w.entries.size() * sizeof(LcldEntry));
+        currentEntryOffset += static_cast<uint64_t>(w.entries.size()) * sizeof(LcldEntry);
     }
 
-    uint32_t stringTableOffset = static_cast<uint32_t>(headerSize + sectionsArraySize + entriesArraySize);
-    uint32_t stringTableSize = static_cast<uint32_t>(stringTable.size());
+    uint64_t stringTableOffset = headerSize + sectionsArraySize + entriesArraySize;
+    uint64_t stringTableSize = stringTable.size();
+    uint64_t totalBinarySize = stringTableOffset + stringTableSize;
+
+    if (totalBinarySize > 0xFFFFFFFFULL) {
+        outError = L"编译后的字典数据超出 4GB 限制";
+        return false;
+    }
 
     LcldHeader header;
     std::memcpy(header.magic, "LCLD", 4);
     header.version = 1;
     header.totalSections = totalSections;
     header.totalEntries = totalEntries;
-    header.sectionsOffset = sectionsOffset;
-    header.stringTableOffset = stringTableOffset;
-    header.stringTableSize = stringTableSize;
+    header.sectionsOffset = static_cast<uint32_t>(sectionsOffset);
+    header.stringTableOffset = static_cast<uint32_t>(stringTableOffset);
+    header.stringTableSize = static_cast<uint32_t>(stringTableSize);
 
     outBinary.clear();
-    outBinary.resize(stringTableOffset + stringTableSize, 0);
+    outBinary.resize(static_cast<size_t>(totalBinarySize), 0);
 
     std::memcpy(outBinary.data(), &header, sizeof(LcldHeader));
-    std::memcpy(outBinary.data() + sectionsOffset, compiledSections.data(), sectionsArraySize);
-    std::memcpy(outBinary.data() + entriesStartOffset, compiledEntries.data(), entriesArraySize);
-    std::memcpy(outBinary.data() + stringTableOffset, stringTable.data(), stringTableSize);
+    std::memcpy(outBinary.data() + sectionsOffset, compiledSections.data(), static_cast<size_t>(sectionsArraySize));
+    std::memcpy(outBinary.data() + entriesStartOffset, compiledEntries.data(), static_cast<size_t>(entriesArraySize));
+    std::memcpy(outBinary.data() + stringTableOffset, stringTable.data(), static_cast<size_t>(stringTableSize));
 
     return true;
 }
@@ -414,14 +432,39 @@ bool DictionaryCompiler::ParseLcldBinaryToMaps(
         return false;
     }
 
-    if (hdr->stringTableOffset + hdr->stringTableSize > size) return false;
-    const char* strTable = reinterpret_cast<const char*>(data + hdr->stringTableOffset);
+    // 检查合理的 section 和 entry 数量上限，防止畸形数据造成拒绝服务
+    if (hdr->totalSections > 10000 || hdr->totalEntries > 1000000) {
+        return false;
+    }
 
-    if (hdr->sectionsOffset + hdr->totalSections * sizeof(LcldSection) > size) return false;
-    const LcldSection* sections = reinterpret_cast<const LcldSection*>(data + hdr->sectionsOffset);
+    // 1. 严格 64-bit 无溢出计算 String Table 边界
+    uint64_t stringTableStart = static_cast<uint64_t>(hdr->stringTableOffset);
+    uint64_t stringTableSize = static_cast<uint64_t>(hdr->stringTableSize);
+    uint64_t stringTableEnd = stringTableStart + stringTableSize;
+    if (stringTableEnd > size || stringTableEnd < stringTableStart) return false;
+
+    const char* strTable = reinterpret_cast<const char*>(data + stringTableStart);
+
+    // 2. 严格 64-bit 无溢出计算 Sections 数组边界
+    uint64_t sectionsStart = static_cast<uint64_t>(hdr->sectionsOffset);
+    uint64_t sectionsSize = static_cast<uint64_t>(hdr->totalSections) * sizeof(LcldSection);
+    uint64_t sectionsEnd = sectionsStart + sectionsSize;
+    if (sectionsEnd > size || sectionsEnd < sectionsStart) return false;
+
+    const LcldSection* sections = reinterpret_cast<const LcldSection*>(data + sectionsStart);
 
     outCommon.clear();
     outScoped.clear();
+
+    // 3. 安全提取以 '\0' 结尾的字符串，严格杜绝越界读取
+    auto getSafeString = [&](uint32_t offset) -> const char* {
+        if (offset >= stringTableSize) return nullptr;
+        size_t maxLen = static_cast<size_t>(stringTableSize - offset);
+        const char* p = strTable + offset;
+        const char* nullPos = static_cast<const char*>(std::memchr(p, '\0', maxLen));
+        if (!nullPos) return nullptr; // 字符串在 stringTable 剩余范围内没有 '\0' 终结符
+        return p;
+    };
 
     auto NormalizeSectionName = [](const char* name) -> std::wstring {
         std::wstring wname;
@@ -435,23 +478,25 @@ bool DictionaryCompiler::ParseLcldBinaryToMaps(
 
     for (uint32_t s = 0; s < hdr->totalSections; ++s) {
         const LcldSection& sec = sections[s];
-        if (sec.nameOffset >= hdr->stringTableSize) continue;
-        const char* secNameUtf8 = strTable + sec.nameOffset;
+        const char* secNameUtf8 = getSafeString(sec.nameOffset);
+        if (!secNameUtf8) continue;
         std::wstring secName = NormalizeSectionName(secNameUtf8);
 
-        if (sec.entriesOffset + sec.entryCount * sizeof(LcldEntry) > size) continue;
-        const LcldEntry* entries = reinterpret_cast<const LcldEntry*>(data + sec.entriesOffset);
+        // 严格 64-bit 无溢出计算 Entries 数组边界
+        uint64_t entriesStart = static_cast<uint64_t>(sec.entriesOffset);
+        uint64_t entriesSize = static_cast<uint64_t>(sec.entryCount) * sizeof(LcldEntry);
+        uint64_t entriesEnd = entriesStart + entriesSize;
+        if (entriesEnd > size || entriesEnd < entriesStart) continue;
 
+        const LcldEntry* entries = reinterpret_cast<const LcldEntry*>(data + entriesStart);
         auto& targetMap = (secName == L"common" || secName == L"general") ? outCommon : outScoped[secName];
 
         for (uint32_t e = 0; e < sec.entryCount; ++e) {
             const LcldEntry& entry = entries[e];
-            if (entry.keyOffset < hdr->stringTableSize && entry.valOffset < hdr->stringTableSize) {
-                const char* key = strTable + entry.keyOffset;
-                const char* val = strTable + entry.valOffset;
-                if (key[0] != '\0' && val[0] != '\0') {
-                    targetMap[key] = val;
-                }
+            const char* key = getSafeString(entry.keyOffset);
+            const char* val = getSafeString(entry.valOffset);
+            if (key && val && key[0] != '\0' && val[0] != '\0') {
+                targetMap[key] = val;
             }
         }
     }

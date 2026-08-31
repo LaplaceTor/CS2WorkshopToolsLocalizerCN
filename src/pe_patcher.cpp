@@ -6,40 +6,7 @@
 #include <cstring>
 #include <algorithm>
 
-namespace {
 
-class SafePeReader {
-public:
-    const uint8_t* m_data;
-    size_t m_size;
-
-    SafePeReader(const uint8_t* pData, size_t s) : m_data(pData), m_size(s) {}
-
-    bool InBounds(size_t offset, size_t len) const {
-        if (offset > m_size) return false;
-        if (len > m_size - offset) return false;
-        return true;
-    }
-
-    template<typename T>
-    const T* ReadStruct(size_t offset) const {
-        if (!InBounds(offset, sizeof(T))) return nullptr;
-        return reinterpret_cast<const T*>(m_data + offset);
-    }
-
-    const char* ReadNullTerminatedString(size_t offset, size_t maxLen = 256) const {
-        if (offset >= m_size) return nullptr;
-        size_t limit = (std::min)(m_size - offset, maxLen);
-        for (size_t i = 0; i < limit; ++i) {
-            if (m_data[offset + i] == '\0') {
-                return reinterpret_cast<const char*>(m_data + offset);
-            }
-        }
-        return nullptr;
-    }
-};
-
-} // namespace
 
 std::optional<size_t> PePatcher::RvaToFileOffset(
     const IMAGE_NT_HEADERS64* nt,
@@ -767,4 +734,58 @@ bool PePatcher::GetPatchInfo(const std::wstring& dllPath, PatchInfo& outInfo, st
     outInfo.isPatched = false;
     return true;
 }
+
+uint32_t PePatcher::GetModuleSizeOfImage(HMODULE hMod) {
+    if (!hMod) return 0;
+    SafePeReader reader(reinterpret_cast<const uint8_t*>(hMod), 0x100000000ULL /* 4GB memory view limit */);
+    const IMAGE_DOS_HEADER* dos = reader.ReadStruct<IMAGE_DOS_HEADER>(0);
+    if (!dos || dos->e_magic != IMAGE_DOS_SIGNATURE || dos->e_lfanew < 0) {
+        return 0;
+    }
+    const IMAGE_NT_HEADERS64* nt = reader.ReadStruct<IMAGE_NT_HEADERS64>(static_cast<size_t>(dos->e_lfanew));
+    if (!nt || nt->Signature != IMAGE_NT_SIGNATURE || nt->OptionalHeader.Magic != IMAGE_NT_OPTIONAL_HDR64_MAGIC) {
+        return 0;
+    }
+    return nt->OptionalHeader.SizeOfImage;
+}
+
+bool PePatcher::GetPatchInfoFromMemory(HMODULE hMod, PatchInfo& outInfo) {
+    outInfo = PatchInfo{};
+    if (!hMod) return false;
+
+    uint32_t sizeOfImage = GetModuleSizeOfImage(hMod);
+    if (sizeOfImage == 0) return false;
+
+    SafePeReader reader(reinterpret_cast<const uint8_t*>(hMod), sizeOfImage);
+    const IMAGE_DOS_HEADER* dos = reader.ReadStruct<IMAGE_DOS_HEADER>(0);
+    if (!dos || dos->e_magic != IMAGE_DOS_SIGNATURE || dos->e_lfanew < 0) return false;
+
+    const IMAGE_NT_HEADERS64* nt = reader.ReadStruct<IMAGE_NT_HEADERS64>(static_cast<size_t>(dos->e_lfanew));
+    if (!nt || nt->Signature != IMAGE_NT_SIGNATURE) return false;
+
+    WORD numSections = nt->FileHeader.NumberOfSections;
+    if (numSections == 0 || numSections > 96) return false;
+
+    size_t secArrayOffset = static_cast<size_t>(dos->e_lfanew) + sizeof(DWORD) + sizeof(IMAGE_FILE_HEADER) + nt->FileHeader.SizeOfOptionalHeader;
+    for (WORD i = 0; i < numSections; ++i) {
+        const IMAGE_SECTION_HEADER* sec = reader.ReadStruct<IMAGE_SECTION_HEADER>(secArrayOffset + i * sizeof(IMAGE_SECTION_HEADER));
+        if (!sec) continue;
+
+        if (std::memcmp(sec->Name, ".text", 5) == 0) {
+            uint32_t textEndRva = sec->VirtualAddress + sec->Misc.VirtualSize;
+            uint32_t caveRva = (textEndRva + 15) & ~15;
+            const PatchHeader* pH = reader.ReadStruct<PatchHeader>(caveRva);
+            if (pH && std::memcmp(pH->magic, "LCLZ", 4) == 0 && pH->origTrRva != 0) {
+                outInfo.isPatched = true;
+                outInfo.version = pH->version;
+                outInfo.originalEntryRva = pH->originalEntryRva;
+                outInfo.origTrRva = pH->origTrRva;
+                outInfo.payloadSize = pH->payloadSize;
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
 

@@ -184,13 +184,11 @@ static std::wstring NormalizeSectionName(const std::string& name) {
 
 static bool AddModuleRange(HMODULE hMod, const std::wstring& overrideStem = L"") {
     if (!hMod) return false;
-    MODULEINFO mi = {0};
-    if (!GetModuleInformation(GetCurrentProcess(), hMod, &mi, sizeof(mi))) {
-        return false;
-    }
-    uintptr_t base = reinterpret_cast<uintptr_t>(mi.lpBaseOfDll);
-    uintptr_t end = base + mi.SizeOfImage;
-    if (base == 0 || mi.SizeOfImage == 0) return false;
+    uint32_t sizeOfImage = PePatcher::GetModuleSizeOfImage(hMod);
+    if (sizeOfImage == 0) return false;
+
+    uintptr_t base = reinterpret_cast<uintptr_t>(hMod);
+    uintptr_t end = base + sizeOfImage;
 
     std::wstring stem = overrideStem;
     if (stem.empty()) {
@@ -1032,21 +1030,8 @@ static bool TryHookQtToolsModules() {
 }
 
 static VOID CALLBACK OnDllNotification(ULONG NotificationReason, PLDR_DLL_NOTIFICATION_DATA NotificationData, PVOID Context) {
-    if (NotificationReason == LDR_DLL_NOTIFICATION_REASON_LOADED && NotificationData && NotificationData->Loaded.BaseDllName) {
-        if (NotificationData->Loaded.DllBase) {
-            AddModuleRange((HMODULE)NotificationData->Loaded.DllBase);
-        }
-        const UNICODE_STRING* baseName = NotificationData->Loaded.BaseDllName;
-        if (baseName->Buffer && baseName->Length > 0) {
-            std::wstring dllName(baseName->Buffer, baseName->Length / sizeof(wchar_t));
-            std::transform(dllName.begin(), dllName.end(), dllName.begin(), ::towlower);
-            if (dllName == L"qt5widgets.dll" || dllName == L"qt5gui.dll") {
-                LogHook("[NOTIFY] Ldr Dll Notification: loaded %ls, signaling hook thread", dllName.c_str());
-                if (g_hWakeHookEvent) {
-                    SetEvent(g_hWakeHookEvent);
-                }
-            }
-        }
+    if (NotificationReason == LDR_DLL_NOTIFICATION_REASON_LOADED && g_hWakeHookEvent) {
+        SetEvent(g_hWakeHookEvent);
     }
 }
 
@@ -1171,6 +1156,7 @@ static DWORD WINAPI ToolsHookThread(LPVOID lpParam) {
         if (!g_bWidgetsHooked.load(std::memory_order_relaxed) || !g_bGuiHooked.load(std::memory_order_relaxed)) {
             TryHookQtToolsModules();
         }
+        ScanKnownToolModules();
 
         // 检查是否有崩溃报告待异步处理
         if (g_CrashSnapshot.captured.load(std::memory_order_acquire)) {
@@ -1306,27 +1292,10 @@ extern "C" __declspec(dllexport) bool InitializeTranslator() {
     g_pfn_utf16 = (fnQString_utf16)GetProcAddress(hQtCore, "?utf16@QString@@QEBAPEBGXZ");
     g_pfn_QString_dtor = (fnQString_dtor)GetProcAddress(hQtCore, "??1QString@@QEAA@XZ");
 
-    // 优先从 LCLZ 补丁元数据头直接读取原始真实 QMetaObject::tr 地址（杜绝 EAT 重定向环境下的自死锁/死循环）
-    const PatchHeader* pHeader = nullptr;
-    PIMAGE_DOS_HEADER dos = (PIMAGE_DOS_HEADER)hQtCore;
-    if (dos->e_magic == IMAGE_DOS_SIGNATURE) {
-        PIMAGE_NT_HEADERS nt = (PIMAGE_NT_HEADERS)((uint8_t*)hQtCore + dos->e_lfanew);
-        PIMAGE_SECTION_HEADER sec = IMAGE_FIRST_SECTION(nt);
-        for (WORD i = 0; i < nt->FileHeader.NumberOfSections; ++i) {
-            if (memcmp(sec[i].Name, ".text", 5) == 0) {
-                uint32_t textEndRva = sec[i].VirtualAddress + sec[i].Misc.VirtualSize;
-                uint32_t caveRva = (textEndRva + 15) & ~15;
-                const PatchHeader* pH = (const PatchHeader*)((uint8_t*)hQtCore + caveRva);
-                if (memcmp(pH->magic, "LCLZ", 4) == 0 && pH->origTrRva != 0) {
-                    pHeader = pH;
-                }
-                break;
-            }
-        }
-    }
-
-    if (pHeader && pHeader->origTrRva != 0) {
-        g_o_QMetaObject_tr = (fnQMetaObject_tr)((uint8_t*)hQtCore + pHeader->origTrRva);
+    // 优先通过 PePatcher 统一安全读取 LCLZ 补丁元数据头中的原始真实 QMetaObject::tr 地址
+    PatchInfo patchInfo;
+    if (PePatcher::GetPatchInfoFromMemory(hQtCore, patchInfo) && patchInfo.origTrRva != 0) {
+        g_o_QMetaObject_tr = (fnQMetaObject_tr)((uint8_t*)hQtCore + patchInfo.origTrRva);
         LogHook("[INIT] EAT Redirect: real QMetaObject::tr resolved from LCLZ header at %p", g_o_QMetaObject_tr);
     } else {
         void* pTr = (void*)GetProcAddress(hQtCore, "?tr@QMetaObject@@QEBA?AVQString@@PEBD0H@Z");

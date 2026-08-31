@@ -631,6 +631,52 @@ int main() {
         std::cout << "[Test 10] DictionaryCompiler LCLD Binary Compilation & Zero-ABI Parsing: PASSED\n";
     }
 
+    // 11. Test LCLD Integer Overflow & String Bounds Hardening + PePatcher Memory Reader
+    std::cout << "[Test 11] Testing LCLD Integer Overflow & Bounds Hardening + PePatcher Memory Reader...\n";
+    {
+        // 11.1 Test PePatcher Memory Reader on current process module
+        HMODULE hSelf = GetModuleHandleW(NULL);
+        uint32_t selfImageSize = PePatcher::GetModuleSizeOfImage(hSelf);
+        assert(selfImageSize > 0 && "GetModuleSizeOfImage on self must be > 0");
+
+        // 11.2 Test LCLD Parser with corrupted integer overflow headers
+        std::vector<uint8_t> corruptedData(sizeof(LcldHeader) + 64, 0);
+        LcldHeader* cHdr = reinterpret_cast<LcldHeader*>(corruptedData.data());
+        std::memcpy(cHdr->magic, "LCLD", 4);
+        cHdr->version = 1;
+        cHdr->totalSections = 0xFFFFFFFF; // Overflow attempt
+        cHdr->sectionsOffset = sizeof(LcldHeader);
+        cHdr->stringTableOffset = sizeof(LcldHeader) + 16;
+        cHdr->stringTableSize = 16;
+
+        std::unordered_map<std::string, std::string> cCommon;
+        std::unordered_map<std::wstring, std::unordered_map<std::string, std::string>> cScoped;
+        bool reject1 = DictionaryCompiler::ParseLcldBinaryToMaps(corruptedData.data(), corruptedData.size(), cCommon, cScoped);
+        assert(!reject1 && "LCLD parser must reject totalSections overflow");
+
+        // 11.3 Test String Table without null terminator (must not crash or read out of bounds)
+        cHdr->totalSections = 1;
+        cHdr->totalEntries = 1;
+        cHdr->sectionsOffset = sizeof(LcldHeader);
+        cHdr->stringTableOffset = sizeof(LcldHeader) + sizeof(LcldSection) + sizeof(LcldEntry);
+        cHdr->stringTableSize = 8;
+        corruptedData.resize(cHdr->stringTableOffset + cHdr->stringTableSize, 'A'); // All 'A's without '\0'
+        std::memcpy(corruptedData.data(), cHdr, sizeof(LcldHeader));
+
+        LcldSection* cSec = reinterpret_cast<LcldSection*>(corruptedData.data() + cHdr->sectionsOffset);
+        cSec->nameOffset = 0;
+        cSec->entryCount = 1;
+        cSec->entriesOffset = cHdr->sectionsOffset + sizeof(LcldSection);
+
+        LcldEntry* cEntry = reinterpret_cast<LcldEntry*>(corruptedData.data() + cSec->entriesOffset);
+        cEntry->keyOffset = 0;
+        cEntry->valOffset = 0;
+
+        bool reject2 = DictionaryCompiler::ParseLcldBinaryToMaps(corruptedData.data(), corruptedData.size(), cCommon, cScoped);
+        assert(!reject2 && "LCLD parser must reject string table without null terminator");
+        std::cout << "[Test 11] LCLD Bounds Hardening & PePatcher Memory Reader: PASSED\n";
+    }
+
     std::cout << "\n[ALL TESTS PASSED SUCCESSFULLY!]\n";
     return 0;
 }

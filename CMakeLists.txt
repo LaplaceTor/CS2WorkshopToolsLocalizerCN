@@ -32,6 +32,8 @@ add_library(qtcore_qm SHARED
     src/qtcore_qm.cpp
     src/hook_manager.h
     src/hook_manager.cpp
+    src/pe_patcher.h
+    src/pe_patcher.cpp
     src/lcld_format.h
     src/dictionary_compiler.h
     src/dictionary_compiler.cpp
