@@ -1,4 +1,5 @@
 #include "backup_manager.h"
+#include "pe_patcher.h"
 #include <windows.h>
 #include <wincrypt.h>
 #include <winver.h>
@@ -132,7 +133,8 @@ bool BackupManager::GetCurrentGameSignature(const std::wstring& cs2Root, GameVer
         }
 
         outSig.cs2ProductVersion = GetFileProductVersion(cs2Exe.wstring());
-        outSig.qt5CoreSha256 = ComputeFileSha256(qt5Core.wstring());
+        outSig.cs2ExeSha256 = ComputeFileSha256(cs2Exe.wstring());
+        outSig.qt5CoreSha256 = fs::exists(qt5Core) ? ComputeFileSha256(qt5Core.wstring()) : "";
         outSig.qt5WidgetsSha256 = fs::exists(qt5Widgets) ? ComputeFileSha256(qt5Widgets.wstring()) : "";
         return true;
     } catch (const std::exception& e) {
@@ -171,6 +173,7 @@ bool BackupManager::ReadBackupManifest(const std::wstring& backupDir, GameVersio
         };
 
         outSig.cs2ProductVersion = extractString("cs2_exe_version");
+        outSig.cs2ExeSha256 = extractString("cs2_exe_sha256");
         outSig.qt5CoreSha256 = extractString("qt5core_sha256");
         outSig.qt5WidgetsSha256 = extractString("qt5widgets_sha256");
         outSig.backupTimestamp = extractString("timestamp");
@@ -203,6 +206,7 @@ bool BackupManager::WriteBackupManifest(const std::wstring& backupDir, const Gam
         ofs << "  \"timestamp\": \"" << sig.backupTimestamp << "\",\n";
         ofs << "  \"timestamp_epoch\": " << sig.timestampEpoch << ",\n";
         ofs << "  \"cs2_exe_version\": \"" << sig.cs2ProductVersion << "\",\n";
+        ofs << "  \"cs2_exe_sha256\": \"" << sig.cs2ExeSha256 << "\",\n";
         ofs << "  \"qt5core_sha256\": \"" << sig.qt5CoreSha256 << "\",\n";
         ofs << "  \"qt5widgets_sha256\": \"" << sig.qt5WidgetsSha256 << "\"\n";
         ofs << "}\n";
@@ -247,7 +251,16 @@ BackupValidationResult BackupManager::BackupMatchesCurrentGame(const std::wstrin
         return res;
     }
 
-    // 2. 校验 Qt5Widgets.dll SHA-256（如果存在）
+    // 2. 严格校验 cs2.exe 的 SHA-256 二进制哈希（捕捉同 ProductVersion 下的 Steam depot 补丁与热更新）
+    if (!res.backupSig.cs2ExeSha256.empty() && !res.currentSig.cs2ExeSha256.empty()) {
+        if (res.backupSig.cs2ExeSha256 != res.currentSig.cs2ExeSha256) {
+            res.status = BackupMatchStatus::GameUpdated;
+            res.reason = L"检测到 cs2.exe 二进制哈希发生变动 (Steam depot 更新或完整性修复)。";
+            return res;
+        }
+    }
+
+    // 3. 校验 Qt5Widgets.dll SHA-256（如果存在）
     if (!res.backupSig.qt5WidgetsSha256.empty() && !res.currentSig.qt5WidgetsSha256.empty()) {
         if (res.backupSig.qt5WidgetsSha256 != res.currentSig.qt5WidgetsSha256) {
             res.status = BackupMatchStatus::GameUpdated;
@@ -259,11 +272,35 @@ BackupValidationResult BackupManager::BackupMatchesCurrentGame(const std::wstrin
     // 3. 校验备份中 Qt5Core.dll 与清单记录的一致性
     fs::path backupQtCore = fs::path(backupDir) / L"game" / L"bin" / L"win64" / L"Qt5Core.dll";
     if (fs::exists(backupQtCore)) {
+        PatchInfo bInfo;
+        std::wstring pErr;
+        if (PePatcher::GetPatchInfo(backupQtCore.wstring(), bInfo, pErr) && bInfo.isPatched) {
+            res.status = BackupMatchStatus::GameUpdated;
+            res.reason = L"备份目录内的 Qt5Core.dll 包含 LCLZ 补丁标记（非纯净原版），备份不可用。";
+            return res;
+        }
+
         std::string backupQtCoreHash = ComputeFileSha256(backupQtCore.wstring());
         if (backupQtCoreHash != res.backupSig.qt5CoreSha256) {
             res.status = BackupMatchStatus::GameUpdated;
             res.reason = L"备份目录内的 Qt5Core.dll 与版本清单记录哈希不一致，备份可能已被篡改。";
             return res;
+        }
+    }
+
+    // 4. 校验当前游戏目录中未补丁状态的 Qt5Core.dll (若当前游戏文件是纯净状态，比对是否与备份一致)
+    fs::path gameQtCore = fs::path(cs2Root) / L"game" / L"bin" / L"win64" / L"Qt5Core.dll";
+    if (fs::exists(gameQtCore)) {
+        PatchInfo gInfo;
+        std::wstring pErr;
+        bool isPatched = (PePatcher::GetPatchInfo(gameQtCore.wstring(), gInfo, pErr) && gInfo.isPatched);
+        if (!isPatched) {
+            std::string gameQtCoreHash = ComputeFileSha256(gameQtCore.wstring());
+            if (gameQtCoreHash != res.backupSig.qt5CoreSha256) {
+                res.status = BackupMatchStatus::GameUpdated;
+                res.reason = L"检测到 CS2 目录下的原版 Qt5Core.dll 哈希发生变动，游戏可能已经历更新或完整性验证。";
+                return res;
+            }
         }
     }
 
@@ -273,6 +310,17 @@ BackupValidationResult BackupManager::BackupMatchesCurrentGame(const std::wstrin
 }
 
 bool BackupManager::CreateOrUpdateBackup(const std::wstring& cs2Root, const std::wstring& backupDir, std::vector<std::wstring>& outBackedUpFiles, std::wstring& outError, bool forceRecreate) {
+    fs::path manifestPath = fs::path(backupDir) / L"backup_manifest.json";
+
+    // 核心安全防线 1：如果不是显式 forceRecreate，且有效备份与 manifest 已存在，绝不重复更新 manifest！
+    if (!forceRecreate && HasBackup(backupDir) && fs::exists(manifestPath)) {
+        GameVersionSignature existingSig;
+        std::wstring mErr;
+        if (ReadBackupManifest(backupDir, existingSig, mErr)) {
+            return true;
+        }
+    }
+
     if (forceRecreate) {
         std::error_code ec;
         fs::remove_all(backupDir, ec);
@@ -286,10 +334,27 @@ bool BackupManager::CreateOrUpdateBackup(const std::wstring& cs2Root, const std:
         return false;
     }
 
+    fs::path backupQtCore = fs::path(backupDir) / L"game" / L"bin" / L"win64" / L"Qt5Core.dll";
+    if (!fs::exists(backupQtCore)) {
+        outError = L"备份目标目录未找到 Qt5Core.dll";
+        return false;
+    }
+
+    // 核心安全防线 2：严格验证备份目录中的 Qt5Core.dll 绝不能是 patched 的！
+    PatchInfo patchInfo;
+    std::wstring pErr;
+    if (PePatcher::GetPatchInfo(backupQtCore.wstring(), patchInfo, pErr) && patchInfo.isPatched) {
+        outError = L"备份的 Qt5Core.dll 包含 LCLZ 补丁标记，严禁用 patched 文件生成 manifest！";
+        return false;
+    }
+
     GameVersionSignature sig;
     if (!GetCurrentGameSignature(cs2Root, sig, outError)) {
         return false;
     }
+
+    // 核心安全防线 3：必须使用备份中经由验证的纯净原版 Qt5Core.dll 的哈希写入清单，绝不用当前可能已被修补的游戏文件哈希！
+    sig.qt5CoreSha256 = ComputeFileSha256(backupQtCore.wstring());
 
     // 记录备份时间戳
     auto now = std::chrono::system_clock::now();
@@ -347,11 +412,31 @@ bool BackupManager::BackupQtCore(const std::wstring& cs2Root, const std::wstring
             return false;
         }
 
-        // 安全策略：若备份已存在则保留，防止覆盖
-        if (!fs::exists(dstQtCore)) {
-            fs::create_directories(dstQtCore.parent_path());
-            fs::copy_file(srcQtCore, dstQtCore, fs::copy_options::overwrite_existing);
+        // 安全策略：若备份已存在
+        if (fs::exists(dstQtCore)) {
+            // 验证已存在的备份是否是未补丁的纯净原版
+            PatchInfo bInfo;
+            std::wstring pErr;
+            if (PePatcher::GetPatchInfo(dstQtCore.wstring(), bInfo, pErr) && bInfo.isPatched) {
+                // 备份文件已被污染（包含 LCLZ），必须将其移除
+                std::error_code ec;
+                fs::remove(dstQtCore, ec);
+            } else {
+                // 备份中已存在纯净原版，安全保留，绝不覆盖
+                return true;
+            }
         }
+
+        // 检查源 Qt5Core.dll 是否已被修补 (包含 LCLZ 补丁)
+        PatchInfo srcInfo;
+        std::wstring pErr;
+        if (PePatcher::GetPatchInfo(srcQtCore.wstring(), srcInfo, pErr) && srcInfo.isPatched) {
+            outError = L"当前 CS2 目录下的 Qt5Core.dll 处于已补丁状态 (包含 LCLZ 标记)，严禁将其作为原版备份复制！";
+            return false;
+        }
+
+        fs::create_directories(dstQtCore.parent_path());
+        fs::copy_file(srcQtCore, dstQtCore, fs::copy_options::overwrite_existing);
         return true;
     } catch (const std::exception& e) {
         outError = L"备份 Qt5Core.dll 异常: " + std::wstring(e.what(), e.what() + strlen(e.what()));

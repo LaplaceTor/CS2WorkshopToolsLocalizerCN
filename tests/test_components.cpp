@@ -308,7 +308,7 @@ int main() {
     // 4.5 验证游戏更新时 RestoreAll 默认拒绝恢复
     bool rFail = BackupManager::RestoreAll(mockRoot.wstring(), mockBackup.wstring(), err, false);
     assert(!rFail && "RestoreAll must refuse when CS2 game was updated");
-    std::wcout << L"         [4.3] Refuse Restore on Update: PASSED (Reason: " << err << L")\n";
+    std::cout << "         [4.3] Refuse Restore on Update: PASSED\n";
 
     // 4.6 重新建立备份以适配新版本
     bool bRecreate = BackupManager::CreateOrUpdateBackup(mockRoot.wstring(), mockBackup.wstring(), backedFgd, err, true);
@@ -331,10 +331,43 @@ int main() {
     assert(!fs::exists(mockRoot / L"game" / L"bin" / L"win64" / L"qtcore_qm.dll") && "qtcore_qm.dll must be cleaned");
     assert(!fs::exists(mockRoot / L"game" / L"bin" / L"win64" / L"qt_translations.json") && "qt_translations.json must be cleaned");
 
+    // 4.8 测试：严禁从 LCLZ 已补丁的 Qt5Core.dll 建立纯净备份或生成 manifest
+    {
+        fs::path patchedDllPath = fs::current_path() / L"mock_lclz_patched.dll";
+        fs::path realQtCore = fs::path(cs2Root) / L"game" / L"bin" / L"win64" / L"Qt5Core.dll";
+        if (fs::exists(backupQtCore)) realQtCore = backupQtCore;
+        
+        std::wstring pErr;
+        bool pOk = PePatcher::PatchQtCore(realQtCore.wstring(), patchedDllPath.wstring(), pErr);
+        assert(pOk && "PatchQtCore must succeed for mock test");
+
+        fs::path testBadRoot = fs::current_path() / L"mock_bad_root";
+        fs::path testBadBackup = fs::current_path() / L"mock_bad_backup";
+        fs::create_directories(testBadRoot / L"game" / L"core");
+        fs::create_directories(testBadRoot / L"game" / L"bin" / L"win64");
+        
+        {
+            std::ofstream mockFgd(testBadRoot / L"game" / L"core" / L"test.fgd");
+            mockFgd << "@PointClass = light_omni : \"Light\" []\n";
+        }
+        
+        std::vector<std::wstring> badBacked;
+        std::wstring badErr;
+        bool bBad = BackupManager::CreateOrUpdateBackup(testBadRoot.wstring(), testBadBackup.wstring(), badBacked, badErr, true);
+        assert(!bBad && "CreateOrUpdateBackup must strictly refuse when source Qt5Core.dll is patched with LCLZ!");
+        std::cout << "         [4.5] Refuse Creating Backup from LCLZ-Patched File: PASSED\n";
+
+        std::error_code ec;
+        if (fs::exists(patchedDllPath, ec)) fs::remove(patchedDllPath, ec);
+        fs::remove_all(testBadRoot, ec);
+        fs::remove_all(testBadBackup, ec);
+    }
+
     // 清理测试目录
-    fs::remove_all(mockRoot);
-    fs::remove_all(mockBackup);
-    fs::remove_all(mockTrans);
+    std::error_code ec;
+    fs::remove_all(mockRoot, ec);
+    fs::remove_all(mockBackup, ec);
+    fs::remove_all(mockTrans, ec);
     std::cout << "[Test 4] Version-Bound Backup & Restore Pipeline: PASSED\n";
 
     // 5. Test Dictionary Generation when Missing

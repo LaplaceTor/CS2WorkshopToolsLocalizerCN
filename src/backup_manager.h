@@ -6,6 +6,7 @@
 
 struct GameVersionSignature {
     std::string cs2ProductVersion;
+    std::string cs2ExeSha256;
     std::string qt5CoreSha256;
     std::string qt5WidgetsSha256;
     std::string backupTimestamp;
