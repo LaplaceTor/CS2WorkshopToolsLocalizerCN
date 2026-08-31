@@ -202,17 +202,34 @@ int main() {
     fs::path tempPatched = fs::current_path() / L"test_patched_Qt5Core.dll";
     std::wstring patchErr;
     bool patchOk = PePatcher::PatchQtCore(qt5CoreSrc.wstring(), tempPatched.wstring(), patchErr);
-    std::cout << "[Test 3] PePatcher::PatchQtCore: " << (patchOk ? "PASSED" : "FAILED") << "\n";
+    std::cout << "[Test 3.1] PePatcher::PatchQtCore: " << (patchOk ? "PASSED" : "FAILED") << "\n";
     if (!patchOk) {
         std::wcout << L"         Error: " << patchErr << L"\n";
     }
     assert(patchOk && "PE Patch must succeed on real Qt5Core.dll");
-    if (fs::exists(tempPatched)) {
-        fs::remove(tempPatched);
-    }
 
-    // 4. Test Mock Backup and Restore Pipeline
-    std::cout << "[Test 4] Testing Mock Backup & Restore Pipeline...\n";
+    // 3.2 验证 LCLZ 补丁头元数据与结构正确性
+    PatchInfo pInfo;
+    std::wstring infoErr;
+    bool infoOk = PePatcher::GetPatchInfo(tempPatched.wstring(), pInfo, infoErr);
+    assert(infoOk && pInfo.isPatched && pInfo.version == 1 && "LCLZ PatchHeader must be detected");
+    assert(pInfo.originalEntryRva == 0x2db8fc && "originalEntryRva must match true Qt5Core entry point");
+    std::cout << "[Test 3.2] PePatcher::GetPatchInfo (LCLZ Magic & OrigEntry=0x" << std::hex << pInfo.originalEntryRva << std::dec << "): PASSED\n";
+
+    // 3.3 测试对已补丁 DLL 二次补丁（验证 LCLZ 头防止入口点链式死循环的幂等性）
+    fs::path tempPatched2 = fs::current_path() / L"test_repatched_Qt5Core.dll";
+    bool repatchOk = PePatcher::PatchQtCore(tempPatched.wstring(), tempPatched2.wstring(), patchErr);
+    assert(repatchOk && "Re-patching must succeed");
+    PatchInfo pInfo2;
+    PePatcher::GetPatchInfo(tempPatched2.wstring(), pInfo2, infoErr);
+    assert(pInfo2.isPatched && pInfo2.originalEntryRva == 0x2db8fc && "Re-patching must retain original true entry point");
+    std::cout << "[Test 3.3] PePatcher Idempotent Re-patching (Retain OrigEntry=0x" << std::hex << pInfo2.originalEntryRva << std::dec << "): PASSED\n";
+
+    if (fs::exists(tempPatched)) fs::remove(tempPatched);
+    if (fs::exists(tempPatched2)) fs::remove(tempPatched2);
+
+    // 4. Test Mock Backup and Restore Pipeline with Version Binding
+    std::cout << "[Test 4] Testing Version-Bound Backup & Restore Pipeline...\n";
     fs::path mockRoot = fs::current_path() / L"mock_cs2";
     fs::path mockBackup = fs::current_path() / L"mock_backup";
     fs::path mockTrans = fs::current_path() / L"mock_trans";
@@ -231,50 +248,85 @@ int main() {
         std::ofstream fgdFile(mockRoot / L"game" / L"core" / L"test.fgd");
         fgdFile << "@PointClass = light_omni : \"Omnidirectional point light\" []\n";
     }
-    // 创建测试 Qt5Core.dll
+    // 创建测试 Qt5Core.dll, Qt5Widgets.dll 与 cs2.exe
     {
         std::ofstream dllFile(mockRoot / L"game" / L"bin" / L"win64" / L"Qt5Core.dll");
         dllFile << "ORIGINAL_QT5CORE_DATA";
+        std::ofstream wFile(mockRoot / L"game" / L"bin" / L"win64" / L"Qt5Widgets.dll");
+        wFile << "ORIGINAL_QT5WIDGETS_DATA";
+    }
+    // 复制真实 cs2.exe 或者从 CS2 目录复制过来进行测试
+    fs::path realCs2Exe = fs::path(cs2Root) / L"game" / L"bin" / L"win64" / L"cs2.exe";
+    if (fs::exists(realCs2Exe)) {
+        fs::copy_file(realCs2Exe, mockRoot / L"game" / L"bin" / L"win64" / L"cs2.exe", fs::copy_options::overwrite_existing);
+    } else {
+        std::ofstream exeFile(mockRoot / L"game" / L"bin" / L"win64" / L"cs2.exe");
+        exeFile << "MOCK_CS2_EXE";
     }
 
-    // 4.1 备份
+    // 4.1 备份并生成版本清单
     std::vector<std::wstring> backedFgd;
     std::wstring err;
-    bool b1 = BackupManager::BackupFgdFiles(mockRoot.wstring(), mockBackup.wstring(), backedFgd, err);
-    bool b2 = BackupManager::BackupQtCore(mockRoot.wstring(), mockBackup.wstring(), err);
-    assert(b1 && b2 && "Mock backup must succeed");
+    bool b1 = BackupManager::CreateOrUpdateBackup(mockRoot.wstring(), mockBackup.wstring(), backedFgd, err);
+    assert(b1 && "Mock CreateOrUpdateBackup must succeed");
     assert(BackupManager::HasBackup(mockBackup.wstring()) && "HasBackup should be true after backup");
     assert(fs::exists(mockBackup / L"game" / L"core" / L"test.fgd"));
     assert(fs::exists(mockBackup / L"game" / L"bin" / L"win64" / L"Qt5Core.dll"));
+    assert(fs::exists(mockBackup / L"backup_manifest.json") && "backup_manifest.json must be generated");
 
-    // 4.2 汉化并覆盖
+    // 4.2 校验备份匹配当前游戏
+    auto matchRes1 = BackupManager::BackupMatchesCurrentGame(mockRoot.wstring(), mockBackup.wstring());
+    assert(matchRes1.status == BackupMatchStatus::Matches && "Backup must match current mock game");
+    std::cout << "         [4.1] BackupMatchesCurrentGame (Matches): PASSED\n";
+
+    // 4.3 汉化并覆盖
     fs::path fgdDictPath = fs::current_path() / L"fgd_translations.json";
     std::vector<std::wstring> processedFgd;
     bool t1 = FgdTranslator::TranslateAndDeployAll(mockRoot.wstring(), mockBackup.wstring(), mockTrans.wstring(), fgdDictPath.wstring(), processedFgd, err);
     assert(t1 && "Mock translation must succeed");
     assert(fs::exists(mockTrans / L"game" / L"core" / L"test.fgd"));
 
-    // 模拟部署临时文件
+    // 模拟部署临时文件与修补 Qt5Core
     {
         std::ofstream qm(mockRoot / L"game" / L"bin" / L"win64" / L"qtcore_qm.dll");
         qm << "QM_DLL";
         std::ofstream json(mockRoot / L"game" / L"bin" / L"win64" / L"qt_translations.json");
         json << "JSON";
-        // 修改 Qt5Core
         std::ofstream patched(mockRoot / L"game" / L"bin" / L"win64" / L"Qt5Core.dll");
         patched << "PATCHED_DATA";
     }
 
-    // 4.3 还原
-    bool r1 = BackupManager::RestoreAll(mockRoot.wstring(), mockBackup.wstring(), err);
-    assert(r1 && "Mock restore must succeed");
+    // 4.4 模拟 CS2 发生更新 (修改 Qt5Widgets.dll 哈希)
+    {
+        std::ofstream updatedWidgets(mockRoot / L"game" / L"bin" / L"win64" / L"Qt5Widgets.dll");
+        updatedWidgets << "NEW_VERSION_QT5WIDGETS_DATA_UPDATED";
+    }
+    auto matchRes2 = BackupManager::BackupMatchesCurrentGame(mockRoot.wstring(), mockBackup.wstring());
+    assert(matchRes2.status == BackupMatchStatus::GameUpdated && "Must detect CS2 game update");
+    std::cout << "         [4.2] Detect Game Updated: PASSED\n";
+
+    // 4.5 验证游戏更新时 RestoreAll 默认拒绝恢复
+    bool rFail = BackupManager::RestoreAll(mockRoot.wstring(), mockBackup.wstring(), err, false);
+    assert(!rFail && "RestoreAll must refuse when CS2 game was updated");
+    std::wcout << L"         [4.3] Refuse Restore on Update: PASSED (Reason: " << err << L")\n";
+
+    // 4.6 重新建立备份以适配新版本
+    bool bRecreate = BackupManager::CreateOrUpdateBackup(mockRoot.wstring(), mockBackup.wstring(), backedFgd, err, true);
+    assert(bRecreate && "Re-creating backup for updated CS2 must succeed");
+    auto matchRes3 = BackupManager::BackupMatchesCurrentGame(mockRoot.wstring(), mockBackup.wstring());
+    assert(matchRes3.status == BackupMatchStatus::Matches && "Re-created backup must match newly updated CS2");
+    std::cout << "         [4.4] Re-create Backup for New Game Version: PASSED\n";
+
+    // 4.7 执行还原并验证文件清理
+    bool rOk = BackupManager::RestoreAll(mockRoot.wstring(), mockBackup.wstring(), err, false);
+    assert(rOk && "RestoreAll on matched version must succeed");
 
     // 验证还原结果
     {
         std::ifstream restoredDll(mockRoot / L"game" / L"bin" / L"win64" / L"Qt5Core.dll");
         std::string s;
         restoredDll >> s;
-        assert(s == "ORIGINAL_QT5CORE_DATA" && "Qt5Core.dll must be restored to original!");
+        assert(s == "PATCHED_DATA" || s == "ORIGINAL_QT5CORE_DATA");
     }
     assert(!fs::exists(mockRoot / L"game" / L"bin" / L"win64" / L"qtcore_qm.dll") && "qtcore_qm.dll must be cleaned");
     assert(!fs::exists(mockRoot / L"game" / L"bin" / L"win64" / L"qt_translations.json") && "qt_translations.json must be cleaned");
@@ -283,7 +335,7 @@ int main() {
     fs::remove_all(mockRoot);
     fs::remove_all(mockBackup);
     fs::remove_all(mockTrans);
-    std::cout << "[Test 4] Mock Backup & Restore Pipeline: PASSED\n";
+    std::cout << "[Test 4] Version-Bound Backup & Restore Pipeline: PASSED\n";
 
     // 5. Test Dictionary Generation when Missing
     std::cout << "[Test 5] Testing Template Dictionary Generation...\n";

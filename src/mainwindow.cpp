@@ -331,7 +331,14 @@ void MainWindow::updateRestoreButtonState() {
     bool hasBackup = BackupManager::HasBackup(backupDir.wstring());
     m_restoreBtn->setEnabled(hasBackup);
     if (hasBackup) {
-        m_restoreBtn->setToolTip("从 backup 目录恢复所有原版 FGD 实体定义及 Qt5Core.dll");
+        auto val = BackupManager::BackupMatchesCurrentGame(m_cs2Root, backupDir.wstring());
+        if (val.status == BackupMatchStatus::GameUpdated) {
+            m_restoreBtn->setToolTip("警告: 检测到 CS2 版本已更新，旧版备份与当前游戏不匹配");
+        } else if (!val.backupSig.cs2ProductVersion.empty()) {
+            m_restoreBtn->setToolTip(QString("从 backup 目录恢复原版文件 (备份版本: %1)").arg(QString::fromStdString(val.backupSig.cs2ProductVersion)));
+        } else {
+            m_restoreBtn->setToolTip("从 backup 目录恢复所有原版 FGD 实体定义及 Qt5Core.dll");
+        }
     } else {
         m_restoreBtn->setToolTip("当前未检测到原版备份文件 (启动汉化版时会自动创建备份)");
     }
@@ -380,18 +387,26 @@ void MainWindow::onLaunchClicked() {
 
     fs::path qmDllSrc = workPath / L"qtcore_qm.dll";
 
-    // 步骤 1: 将 CS2 文件夹内的 FGD 按相对路径复制到 backup
-    appendLog("[1/6] 正在备份 CS2 FGD 实体定义文件至 backup 目录...", "#e6db74");
+    // 步骤 1: 检查游戏版本并创建/更新绑定版本清单的纯净原版备份
+    appendLog("[1/6] 正在校验游戏版本签名并备份 CS2 原版文件...", "#e6db74");
+    auto matchResult = BackupManager::BackupMatchesCurrentGame(m_cs2Root, backupDir.wstring());
+    bool forceRecreate = false;
+    if (matchResult.status == BackupMatchStatus::GameUpdated) {
+        appendLog(QString("[!] 检测到 CS2 游戏已更新: %1").arg(QString::fromStdWString(matchResult.reason)), "#fd971f");
+        appendLog("[*] 正在自动丢弃旧版过期备份，为新版本重新捕获纯净原版文件与版本清单...", "#66d9ef");
+        forceRecreate = true;
+    }
+
     std::vector<std::wstring> backedFgd;
     std::wstring err;
-    if (!BackupManager::BackupFgdFiles(m_cs2Root, backupDir.wstring(), backedFgd, err)) {
-        appendLog(QString("[-] 备份 FGD 失败: %1").arg(QString::fromStdWString(err)), "#f92672");
-        QMessageBox::critical(this, "错误", "备份 CS2 FGD 文件失败，已中止启动！\n" + QString::fromStdWString(err));
+    if (!BackupManager::CreateOrUpdateBackup(m_cs2Root, backupDir.wstring(), backedFgd, err, forceRecreate)) {
+        appendLog(QString("[-] 备份原版文件失败: %1").arg(QString::fromStdWString(err)), "#f92672");
+        QMessageBox::critical(this, "错误", "备份 CS2 原版文件失败，已中止启动！\n" + QString::fromStdWString(err));
         setUiBusy(false);
         m_statusLabel->setText("状态: 准备失败");
         return;
     }
-    appendLog(QString("[+] 成功备份 %1 个 FGD 文件至 backup 相对路径").arg(backedFgd.size()), "#a6e22e");
+    appendLog(QString("[+] 成功捕获并绑定 %1 个原版 FGD 与 Qt5Core.dll (版本清单已就绪)").arg(backedFgd.size()), "#a6e22e");
 
     // 步骤 2: 使用 fgd_translations.json 与 fgd_override.json 汉化输出到 translations 文件夹相对路径，并覆盖到 CS2
     appendLog("[2/6] 正在解析字典与覆盖规则并汉化 FGD 实体定义...", "#e6db74");
@@ -406,20 +421,8 @@ void MainWindow::onLaunchClicked() {
     }
     appendLog(QString("[+] 成功汉化并覆盖部署 %1 个 FGD 文件至 CS2 目录").arg(transFgd.size()), "#a6e22e");
 
-    // 步骤 3: 备份原版 Qt5Core.dll 到 backup 文件夹相对路径
-    appendLog("[3/6] 正在备份原版 Qt5Core.dll 至 backup 目录...", "#e6db74");
-    if (!BackupManager::BackupQtCore(m_cs2Root, backupDir.wstring(), err)) {
-        appendLog(QString("[-] 备份 Qt5Core.dll 失败: %1").arg(QString::fromStdWString(err)), "#f92672");
-        QMessageBox::critical(this, "错误", "备份 Qt5Core.dll 失败，已中止启动！\n" + QString::fromStdWString(err));
-        doRestore(false);
-        setUiBusy(false);
-        m_statusLabel->setText("状态: 备份失败");
-        return;
-    }
-    appendLog("[+] 原版 Qt5Core.dll 备份成功", "#a6e22e");
-
-    // 步骤 4: 复制 qt_translations.json 与 qtcore_qm.dll 到 Qt5Core.dll 旁，并修补 Qt5Core.dll
-    appendLog("[4/6] 正在部署 qt_translations.json 与 qtcore_qm.dll 并修补 Qt5Core.dll...", "#e6db74");
+    // 步骤 3: 复制 qt_translations.json 与 qtcore_qm.dll 到 Qt5Core.dll 旁，并修补 Qt5Core.dll
+    appendLog("[3/6] 正在部署 qt_translations.json 与 qtcore_qm.dll 并修补 Qt5Core.dll...", "#e6db74");
     try {
         fs::path destQtJson = cs2Bin / L"qt_translations.json";
         fs::path destQmDll = cs2Bin / L"qtcore_qm.dll";
@@ -902,6 +905,19 @@ void MainWindow::onRestoreClicked() {
     if (!BackupManager::HasBackup(backupDir.wstring())) {
         QMessageBox::information(this, "提示", "未检测到原版备份文件，无需执行还原。");
         updateRestoreButtonState();
+        return;
+    }
+
+    auto val = BackupManager::BackupMatchesCurrentGame(m_cs2Root, backupDir.wstring());
+    if (val.status == BackupMatchStatus::GameUpdated) {
+        QMessageBox::warning(
+            this,
+            "拒绝恢复旧版备份",
+            "检测到 CS2 游戏已经更新，备份版本与当前游戏不一致！\n\n" +
+            QString::fromStdWString(val.reason) +
+            "\n\n为防止旧版本文件覆盖破坏新版 CS2，已拒绝还原。\n"
+            "建议直接点击【启动 CS2 Workshop Tools (汉化版)】，启动器将自动为新版本游戏创建纯净备份。"
+        );
         return;
     }
 

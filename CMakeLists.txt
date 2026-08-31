@@ -78,6 +78,7 @@ target_link_libraries(CS2WorkshopToolsLocalizerCN PRIVATE
     advapi32
     user32
     shell32
+    version
 )
 
 # 复制字典文件和 DLL 到输出目录方便调试运行
@@ -112,4 +113,5 @@ target_link_libraries(test_components PRIVATE
     advapi32
     user32
     shell32
+    version
 )

@@ -1,21 +1,97 @@
 #pragma once
 #include <windows.h>
+#include <winternl.h>
+#include <vector>
+#include <string>
+#include <mutex>
+#include <atomic>
+
+#ifndef LDR_DLL_NOTIFICATION_REASON_LOADED
+#define LDR_DLL_NOTIFICATION_REASON_LOADED 1
+#define LDR_DLL_NOTIFICATION_REASON_UNLOADED 2
+
+typedef struct _LDR_DLL_LOADED_NOTIFICATION_DATA {
+    ULONG Flags;
+    const UNICODE_STRING* FullDllName;
+    const UNICODE_STRING* BaseDllName;
+    PVOID DllBase;
+    ULONG SizeOfImage;
+} LDR_DLL_LOADED_NOTIFICATION_DATA, *PLDR_DLL_LOADED_NOTIFICATION_DATA;
+
+typedef struct _LDR_DLL_UNLOADED_NOTIFICATION_DATA {
+    ULONG Flags;
+    const UNICODE_STRING* FullDllName;
+    const UNICODE_STRING* BaseDllName;
+    PVOID DllBase;
+    ULONG SizeOfImage;
+} LDR_DLL_UNLOADED_NOTIFICATION_DATA, *PLDR_DLL_UNLOADED_NOTIFICATION_DATA;
+
+typedef union _LDR_DLL_NOTIFICATION_DATA {
+    LDR_DLL_LOADED_NOTIFICATION_DATA Loaded;
+    LDR_DLL_UNLOADED_NOTIFICATION_DATA Unloaded;
+} LDR_DLL_NOTIFICATION_DATA, *PLDR_DLL_NOTIFICATION_DATA;
+
+typedef VOID (CALLBACK *PLDR_DLL_NOTIFICATION_FUNCTION)(
+    ULONG NotificationReason,
+    PLDR_DLL_NOTIFICATION_DATA NotificationData,
+    PVOID Context
+);
+#endif
+
+struct HookEntry {
+    void* target = nullptr;
+    void* detour = nullptr;
+    void** original = nullptr;
+    std::string name;
+    bool enabled = false;
+};
 
 class HookManager {
 public:
-    // 初始化 MinHook 引擎与系统异常守卫 / 模块监控
-    static bool Initialize();
+    static HookManager& Instance();
 
-    // 搜索并安装所有 Qt 模块（Qt5Core, Qt5Widgets, Qt5Gui）的函数 Hook
-    static bool InstallHooks();
+    // 1. 初始化 MinHook 引擎与异常守卫 (VEH)
+    bool Initialize(PVECTORED_EXCEPTION_HANDLER pVehHandler = nullptr);
 
-    // 禁用/移除当前安装的所有 Hook
-    static bool RemoveHooks();
+    // 2. 注册 DLL 加载/卸载全局通知回调（LdrRegisterDllNotification）
+    bool RegisterDllNotification(PLDR_DLL_NOTIFICATION_FUNCTION pfnCallback, PVOID pContext = nullptr);
 
-    // 卸载 Hook 引擎并清理全局资源
-    static void Shutdown();
+    // 3. 显式注销 DLL 通知回调（LdrUnregisterDllNotification）
+    void UnregisterDllNotification();
 
-    // 通用 Hook 创建与启用辅助函数
-    static bool CreateAndEnableHook(void* pTarget, void* pDetour, void** ppOriginal, const char* hookName = nullptr);
+    // 4. 显式注销 VEH 异常过滤器
+    void UnregisterVeh();
+
+    // 5. 安装并启用单个 Hook，统一记录到 m_hooks
+    bool InstallHook(void* pTarget, void* pDetour, void** ppOriginal, const char* hookName = nullptr);
+
+    // 6. 禁用并移除所有 Hook（保留 MinHook 上下文）
+    void UninstallHooks();
+
+    // 7. 完整的统一生命周期退出：
+    //    LdrUnregisterDllNotification -> disable/remove hooks -> free trampolines -> RemoveVectoredExceptionHandler -> MH_Uninitialize
+    void Shutdown();
+
+    // 状态查询
+    bool IsInitialized() const;
+    size_t GetHookCount() const;
+
+    // 静态便捷方法
+    static bool CreateAndEnableHook(void* pTarget, void* pDetour, void** ppOriginal, const char* hookName = nullptr) {
+        return Instance().InstallHook(pTarget, pDetour, ppOriginal, hookName);
+    }
+    static void ShutdownAll() { Instance().Shutdown(); }
+
+private:
+    HookManager() = default;
+    ~HookManager();
+
+    std::mutex m_mutex;
+    std::vector<HookEntry> m_hooks;
+    void* m_pVehHandle = nullptr;
+    void* m_pDllNotificationCookie = nullptr;
+    std::atomic<bool> m_bInitialized{false};
 };
+
+
 

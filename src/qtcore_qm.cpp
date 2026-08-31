@@ -76,7 +76,7 @@ static std::unordered_map<std::wstring, std::unordered_map<std::string, std::str
 static std::unordered_map<HMODULE, std::wstring> g_ModuleStemCache;
 static std::mutex g_DictMutex;
 static std::mutex g_StemCacheMutex;
-static bool g_bDictLoaded = false;
+static std::once_flag g_dictInitFlag;
 
 // 获取 CS2 根二进制目录 (game/bin/win64/)
 static std::wstring GetBinDirectory() {
@@ -150,25 +150,72 @@ static std::wstring GetCallerModuleName(void* callerAddr) {
     return L"";
 }
 
-// 快速、零依赖的高性能 JSON/JSONC 解析器（支持 UTF-8、注释 // 与 /* */、子块对象以及扁平键值对）
-static bool ParseSectionedJson(const char* jsonContent, size_t length) {
-    g_CommonDict.clear();
-    g_CommonCache.clear();
-    g_ScopedDicts.clear();
-    g_ScopedCaches.clear();
+// ==============================================================================
+// 3. Qt 原生 QJsonDocument / QJsonParseError 字典解析器
+// ==============================================================================
+struct QJsonParseError {
+    int offset;
+    int error;
+};
 
-    const char* p = jsonContent;
-    const char* end = jsonContent + length;
+typedef void* (__fastcall *fnQByteArray_ctor)(void* pThis, const char* str, int size);
+typedef void (__fastcall *fnQByteArray_dtor)(void* pThis);
 
-    // 跳过 UTF-8 BOM
-    if (length >= 3 && (unsigned char)p[0] == 0xEF && (unsigned char)p[1] == 0xBB && (unsigned char)p[2] == 0xBF) {
-        p += 3;
-    }
+typedef void* (__fastcall *fnQJsonDocument_fromJson)(void* pOutDoc, const void* pByteArray, QJsonParseError* pError);
+typedef void (__fastcall *fnQJsonDocument_dtor)(void* pThis);
+typedef bool (__fastcall *fnQJsonDocument_isObject)(const void* pThis);
+typedef void* (__fastcall *fnQJsonDocument_object)(const void* pThis, void* pOutObject);
+typedef void (__fastcall *fnQJsonObject_dtor)(void* pThis);
+typedef void* (__fastcall *fnQJsonObject_keys)(const void* pThis, void* pOutStringList);
+typedef void (__fastcall *fnQStringList_dtor)(void* pThis);
 
-    auto skipWhitespaceAndComments = [&]() {
-        while (p < end) {
-            if (*p == ' ' || *p == '\t' || *p == '\r' || *p == '\n' || *p == ',') {
-                p++;
+typedef void* (__fastcall *fnQJsonObject_value)(const void* pThis, void* pOutValue, const void* pKeyQString);
+typedef void (__fastcall *fnQJsonValue_dtor)(void* pThis);
+typedef bool (__fastcall *fnQJsonValue_isObject)(const void* pThis);
+typedef bool (__fastcall *fnQJsonValue_isString)(const void* pThis);
+typedef void* (__fastcall *fnQJsonValue_toObject)(const void* pThis, void* pOutObject);
+typedef void* (__fastcall *fnQJsonValue_toString)(const void* pThis, void* pOutQString);
+
+// QList<QString> 64-bit 内存布局
+struct QListData_Qt5 {
+    int ref;
+    int alloc;
+    int begin;
+    int end;
+    void* array[1];
+};
+
+static std::string WStringToUtf8(const wchar_t* wstr) {
+    if (!wstr || !*wstr) return "";
+    int sizeNeeded = WideCharToMultiByte(CP_UTF8, 0, wstr, -1, NULL, 0, NULL, NULL);
+    if (sizeNeeded <= 1) return "";
+    std::string str(sizeNeeded - 1, 0);
+    WideCharToMultiByte(CP_UTF8, 0, wstr, -1, &str[0], sizeNeeded, NULL, NULL);
+    return str;
+}
+
+static std::string StripJsonComments(const char* p, size_t length) {
+    std::string out;
+    out.reserve(length);
+    const char* end = p + length;
+    bool inQuote = false;
+    bool escape = false;
+
+    while (p < end) {
+        if (inQuote) {
+            char c = *p++;
+            out.push_back(c);
+            if (escape) {
+                escape = false;
+            } else if (c == '\\') {
+                escape = true;
+            } else if (c == '"') {
+                inQuote = false;
+            }
+        } else {
+            if (*p == '"') {
+                inQuote = true;
+                out.push_back(*p++);
             } else if (*p == '/' && (p + 1 < end)) {
                 if (*(p + 1) == '/') {
                     p += 2;
@@ -179,129 +226,172 @@ static bool ParseSectionedJson(const char* jsonContent, size_t length) {
                     if (p + 1 < end) p += 2;
                     else p = end;
                 } else {
-                    break;
+                    out.push_back(*p++);
                 }
             } else {
-                break;
+                out.push_back(*p++);
             }
-        }
-    };
-
-    auto parseString = [&](std::string& str) -> bool {
-        if (p >= end || *p != '"') return false;
-        p++;
-        str.clear();
-        str.reserve(64);
-
-        while (p < end) {
-            char c = *p++;
-            if (c == '"') return true;
-            if (c == '\\') {
-                if (p >= end) return false;
-                char esc = *p++;
-                switch (esc) {
-                    case '"':  str.push_back('"'); break;
-                    case '\\': str.push_back('\\'); break;
-                    case '/':  str.push_back('/'); break;
-                    case 'b':  str.push_back('\b'); break;
-                    case 'f':  str.push_back('\f'); break;
-                    case 'n':  str.push_back('\n'); break;
-                    case 'r':  str.push_back('\r'); break;
-                    case 't':  str.push_back('\t'); break;
-                    case 'u': {
-                        if (p + 4 > end) return false;
-                        unsigned int codepoint = 0;
-                        for (int i = 0; i < 4; i++) {
-                            char h = *p++;
-                            codepoint <<= 4;
-                            if (h >= '0' && h <= '9') codepoint |= (h - '0');
-                            else if (h >= 'a' && h <= 'f') codepoint |= (h - 'a' + 10);
-                            else if (h >= 'A' && h <= 'F') codepoint |= (h - 'A' + 10);
-                            else return false;
-                        }
-                        if (codepoint <= 0x7F) {
-                            str.push_back((char)codepoint);
-                        } else if (codepoint <= 0x7FF) {
-                            str.push_back((char)(0xC0 | ((codepoint >> 6) & 0x1F)));
-                            str.push_back((char)(0x80 | (codepoint & 0x3F)));
-                        } else if (codepoint <= 0xFFFF) {
-                            str.push_back((char)(0xE0 | ((codepoint >> 12) & 0x0F)));
-                            str.push_back((char)(0x80 | ((codepoint >> 6) & 0x3F)));
-                            str.push_back((char)(0x80 | (codepoint & 0x3F)));
-                        }
-                        break;
-                    }
-                    default:
-                        str.push_back(esc);
-                        break;
-                }
-            } else {
-                str.push_back(c);
-            }
-        }
-        return false;
-    };
-
-    skipWhitespaceAndComments();
-    if (p >= end || *p != '{') return false;
-    p++;
-
-    std::string key, val;
-    while (p < end) {
-        skipWhitespaceAndComments();
-        if (p >= end || *p == '}') break;
-
-        if (!parseString(key)) break;
-
-        skipWhitespaceAndComments();
-        if (p >= end || *p != ':') break;
-        p++;
-
-        skipWhitespaceAndComments();
-        if (p >= end) break;
-
-        if (*p == '{') {
-            p++;
-            std::wstring sectionName = NormalizeSectionName(key);
-            auto& targetMap = (sectionName == L"common" || sectionName == L"general") ? g_CommonDict : g_ScopedDicts[sectionName];
-
-            std::string subKey, subVal;
-            while (p < end) {
-                skipWhitespaceAndComments();
-                if (p >= end || *p == '}') break;
-
-                if (!parseString(subKey)) break;
-
-                skipWhitespaceAndComments();
-                if (p >= end || *p != ':') break;
-                p++;
-
-                skipWhitespaceAndComments();
-                if (!parseString(subVal)) break;
-
-                if (!subKey.empty() && !subVal.empty()) {
-                    targetMap[subKey] = subVal;
-                }
-            }
-            if (p < end && *p == '}') p++;
-        } else if (*p == '"') {
-            if (!parseString(val)) break;
-            if (!key.empty() && !val.empty()) {
-                g_CommonDict[key] = val;
-            }
-        } else {
-            while (p < end && *p != ',' && *p != '}') p++;
         }
     }
+    return out;
+}
+
+// 基于 Qt 原生 QJsonDocument / QJsonParseError 的高性能字典解析器
+static bool ParseSectionedJson(const char* jsonContent, size_t length) {
+    g_CommonDict.clear();
+    g_CommonCache.clear();
+    g_ScopedDicts.clear();
+    g_ScopedCaches.clear();
+
+    if (!jsonContent || length == 0) return false;
+
+    // 跳过 UTF-8 BOM
+    if (length >= 3 && (unsigned char)jsonContent[0] == 0xEF && (unsigned char)jsonContent[1] == 0xBB && (unsigned char)jsonContent[2] == 0xBF) {
+        jsonContent += 3;
+        length -= 3;
+    }
+
+    HMODULE hQtCore = GetModuleHandleW(L"Qt5Core.dll");
+    if (!hQtCore) {
+        LogHook("[JSON] Qt5Core.dll not found in process!");
+        return false;
+    }
+
+    auto pfnQByteArray_ctor = (fnQByteArray_ctor)GetProcAddress(hQtCore, "??0QByteArray@@QEAA@PEBDH@Z");
+    auto pfnQByteArray_dtor = (fnQByteArray_dtor)GetProcAddress(hQtCore, "??1QByteArray@@QEAA@XZ");
+    auto pfnQJsonDoc_fromJson = (fnQJsonDocument_fromJson)GetProcAddress(hQtCore, "?fromJson@QJsonDocument@@SA?AV1@AEBVQByteArray@@PEAUQJsonParseError@@@Z");
+    auto pfnQJsonDoc_dtor = (fnQJsonDocument_dtor)GetProcAddress(hQtCore, "??1QJsonDocument@@QEAA@XZ");
+    auto pfnQJsonDoc_isObject = (fnQJsonDocument_isObject)GetProcAddress(hQtCore, "?isObject@QJsonDocument@@QEBA_NXZ");
+    auto pfnQJsonDoc_object = (fnQJsonDocument_object)GetProcAddress(hQtCore, "?object@QJsonDocument@@QEBA?AVQJsonObject@@XZ");
+    auto pfnQJsonObject_dtor = (fnQJsonObject_dtor)GetProcAddress(hQtCore, "??1QJsonObject@@QEAA@XZ");
+    auto pfnQJsonObject_keys = (fnQJsonObject_keys)GetProcAddress(hQtCore, "?keys@QJsonObject@@QEBA?AVQStringList@@XZ");
+    auto pfnQStringList_dtor = (fnQStringList_dtor)GetProcAddress(hQtCore, "??1QStringList@@QEAA@XZ");
+    if (!pfnQStringList_dtor) pfnQStringList_dtor = (fnQStringList_dtor)GetProcAddress(hQtCore, "??1?$QList@VQString@@@@QEAA@XZ");
+    auto pfnQListData_dispose = (void(__fastcall*)(void*))GetProcAddress(hQtCore, "?dispose@QListData@@QEAAXXZ");
+
+    auto pfnQString_dtor = (fnQString_dtor)GetProcAddress(hQtCore, "??1QString@@QEAA@XZ");
+    auto pfnQString_utf16 = (fnQString_utf16)GetProcAddress(hQtCore, "?utf16@QString@@QEBAPEBGXZ");
+
+    auto pfnQJsonObject_value = (fnQJsonObject_value)GetProcAddress(hQtCore, "?value@QJsonObject@@QEBA?AVQJsonValue@@AEBVQString@@@Z");
+    auto pfnQJsonValue_dtor = (fnQJsonValue_dtor)GetProcAddress(hQtCore, "??1QJsonValue@@QEAA@XZ");
+    auto pfnQJsonValue_isObject = (fnQJsonValue_isObject)GetProcAddress(hQtCore, "?isObject@QJsonValue@@QEBA_NXZ");
+    auto pfnQJsonValue_isString = (fnQJsonValue_isString)GetProcAddress(hQtCore, "?isString@QJsonValue@@QEBA_NXZ");
+    auto pfnQJsonValue_toObject = (fnQJsonValue_toObject)GetProcAddress(hQtCore, "?toObject@QJsonValue@@QEBA?AVQJsonObject@@XZ");
+    auto pfnQJsonValue_toString = (fnQJsonValue_toString)GetProcAddress(hQtCore, "?toString@QJsonValue@@QEBA?AVQString@@XZ");
+
+    if (!pfnQByteArray_ctor || !pfnQByteArray_dtor || !pfnQJsonDoc_fromJson || !pfnQJsonDoc_dtor ||
+        !pfnQJsonDoc_isObject || !pfnQJsonDoc_object || !pfnQJsonObject_dtor || !pfnQJsonObject_keys ||
+        !pfnQJsonObject_value || !pfnQJsonValue_dtor || !pfnQJsonValue_isObject || !pfnQJsonValue_isString ||
+        !pfnQJsonValue_toObject || !pfnQJsonValue_toString || !pfnQString_dtor || !pfnQString_utf16) {
+        LogHook("[JSON] Failed to resolve Qt5Core QJson symbols!");
+        return false;
+    }
+
+    std::string cleanJson = StripJsonComments(jsonContent, length);
+
+    // 1. 构建 QByteArray 并调用 QJsonDocument::fromJson
+    char byteArrBuf[32] = {0};
+    pfnQByteArray_ctor(byteArrBuf, cleanJson.c_str(), (int)cleanJson.size());
+
+    char docBuf[32] = {0};
+    QJsonParseError parseError = {0, 0};
+    pfnQJsonDoc_fromJson(docBuf, byteArrBuf, &parseError);
+    pfnQByteArray_dtor(byteArrBuf);
+
+    if (parseError.error != 0) {
+        LogHook("[JSON] QJsonDocument::fromJson failed! error code=%d at offset=%d", parseError.error, parseError.offset);
+        pfnQJsonDoc_dtor(docBuf);
+        return false;
+    }
+
+    if (!pfnQJsonDoc_isObject(docBuf)) {
+        LogHook("[JSON] QJsonDocument root is not an object!");
+        pfnQJsonDoc_dtor(docBuf);
+        return false;
+    }
+
+    // 2. 提取根 QJsonObject
+    char rootObjBuf[32] = {0};
+    pfnQJsonDoc_object(docBuf, rootObjBuf);
+
+    char rootListBuf[32] = {0};
+    pfnQJsonObject_keys(rootObjBuf, rootListBuf);
+    void** pRootListData = (void**)rootListBuf;
+    QListData_Qt5* pRootD = (QListData_Qt5*)pRootListData[0];
+
+    if (pRootD && pRootD->end > pRootD->begin) {
+        int secCount = pRootD->end - pRootD->begin;
+        for (int i = 0; i < secCount; ++i) {
+            void* pSecKeyStr = &pRootD->array[pRootD->begin + i];
+            std::string secNameUtf8 = WStringToUtf8(pfnQString_utf16(pSecKeyStr));
+            std::wstring sectionName = NormalizeSectionName(secNameUtf8);
+
+            char secValBuf[32] = {0};
+            pfnQJsonObject_value(rootObjBuf, secValBuf, pSecKeyStr);
+
+            if (pfnQJsonValue_isObject(secValBuf)) {
+                // 子块对象 (Scoped Section)
+                auto& targetMap = (sectionName == L"common" || sectionName == L"general") 
+                                  ? g_CommonDict : g_ScopedDicts[sectionName];
+
+                char subObjBuf[32] = {0};
+                pfnQJsonValue_toObject(secValBuf, subObjBuf);
+
+                char subListBuf[32] = {0};
+                pfnQJsonObject_keys(subObjBuf, subListBuf);
+                void** pSubListData = (void**)subListBuf;
+                QListData_Qt5* pSubD = (QListData_Qt5*)pSubListData[0];
+
+                if (pSubD && pSubD->end > pSubD->begin) {
+                    int kvCount = pSubD->end - pSubD->begin;
+                    for (int j = 0; j < kvCount; ++j) {
+                        void* pSubKeyStr = &pSubD->array[pSubD->begin + j];
+                        std::string keyUtf8 = WStringToUtf8(pfnQString_utf16(pSubKeyStr));
+
+                        char itemValBuf[32] = {0};
+                        pfnQJsonObject_value(subObjBuf, itemValBuf, pSubKeyStr);
+                        if (pfnQJsonValue_isString(itemValBuf)) {
+                            char transStrBuf[32] = {0};
+                            pfnQJsonValue_toString(itemValBuf, transStrBuf);
+                            std::string valUtf8 = WStringToUtf8(pfnQString_utf16(transStrBuf));
+                            if (!keyUtf8.empty() && !valUtf8.empty()) {
+                                targetMap[keyUtf8] = valUtf8;
+                            }
+                            pfnQString_dtor(transStrBuf);
+                        }
+                        pfnQJsonValue_dtor(itemValBuf);
+                    }
+                }
+
+                if (pfnQStringList_dtor) pfnQStringList_dtor(subListBuf);
+                else if (pfnQListData_dispose) pfnQListData_dispose(subListBuf);
+                pfnQJsonObject_dtor(subObjBuf);
+            } else if (pfnQJsonValue_isString(secValBuf)) {
+                // 扁平根级键值对
+                char transStrBuf[32] = {0};
+                pfnQJsonValue_toString(secValBuf, transStrBuf);
+                std::string valUtf8 = WStringToUtf8(pfnQString_utf16(transStrBuf));
+                if (!secNameUtf8.empty() && !valUtf8.empty()) {
+                    g_CommonDict[secNameUtf8] = valUtf8;
+                }
+                pfnQString_dtor(transStrBuf);
+            }
+            pfnQJsonValue_dtor(secValBuf);
+        }
+    }
+
+    if (pfnQStringList_dtor) pfnQStringList_dtor(rootListBuf);
+    else if (pfnQListData_dispose) pfnQListData_dispose(rootListBuf);
+    pfnQJsonObject_dtor(rootObjBuf);
+    pfnQJsonDoc_dtor(docBuf);
+
+    LogHook("[JSON] QJsonDocument parsed successfully: %zu common entries, %zu scoped modules",
+        g_CommonDict.size(), g_ScopedDicts.size());
 
     return (!g_CommonDict.empty() || !g_ScopedDicts.empty());
 }
 
 static void LoadMasterTranslations() {
-    std::lock_guard<std::mutex> lock(g_DictMutex);
-    if (g_bDictLoaded) return;
-    g_bDictLoaded = true;
-
     std::wstring binDir = GetBinDirectory();
     std::wstring mainPath = binDir + L"qt_translations.json";
     std::wstring backupPath = binDir + L"translations_cache.json";
@@ -329,6 +419,12 @@ static void LoadMasterTranslations() {
     if (!tryLoadFile(mainPath)) {
         tryLoadFile(backupPath);
     }
+}
+
+static void EnsureDictionaryLoaded() {
+    std::call_once(g_dictInitFlag, [] {
+        LoadMasterTranslations();
+    });
 }
 
 // ==============================================================================
@@ -514,7 +610,7 @@ static bool MatchAndTranslateInternal(const std::unordered_map<std::string, std:
 // 核心多级分层翻译查找函数（基于 Caller Address 精准隔离）
 static bool FindTranslationScoped(void* callerAddr, const char* text, std::string& outResult) {
     if (!text || text[0] == '\0') return false;
-    if (!g_bDictLoaded) LoadMasterTranslations();
+    EnsureDictionaryLoaded();
 
     std::string textStr(text);
 
@@ -871,72 +967,127 @@ static void __fastcall hk_QComboBox_addItem(void* pBox, const void* pQString, co
 }
 
 // ==============================================================================
-// 5. 后台监听与 Hook 安装线程
+// 5. 后台监听、Ldr DLL 通知与 Hook 安装
 // ==============================================================================
-static DWORD WINAPI ToolsHookThread(LPVOID lpParam) {
-    LogHook("[THREAD] ToolsHookThread started");
-    bool bWidgetsHooked = false;
-    bool bGuiHooked = false;
+static std::atomic<bool> g_bStopHookThread{false};
+static std::atomic<bool> g_bWidgetsHooked{false};
+static std::atomic<bool> g_bGuiHooked{false};
+static HANDLE g_hToolsHookThread = NULL;
+static HANDLE g_hWakeHookEvent = NULL;
 
-    while (!bWidgetsHooked || !bGuiHooked) {
-        if (!bWidgetsHooked) {
-            HMODULE hQtWidgets = GetModuleHandleW(L"Qt5Widgets.dll");
-            if (hQtWidgets) {
-                LogHook("[THREAD] Found Qt5Widgets.dll (%p), installing widget hooks...", hQtWidgets);
-                void* pActionSetText   = (void*)GetProcAddress(hQtWidgets, "?setText@QAction@@QEAAXAEBVQString@@@Z");
-                void* pActionSetTip    = (void*)GetProcAddress(hQtWidgets, "?setToolTip@QAction@@QEAAXAEBVQString@@@Z");
-                void* pActionSetStatus = (void*)GetProcAddress(hQtWidgets, "?setStatusTip@QAction@@QEAAXAEBVQString@@@Z");
-                void* pActionSetWhats  = (void*)GetProcAddress(hQtWidgets, "?setWhatsThis@QAction@@QEAAXAEBVQString@@@Z");
-                void* pButtonSetText   = (void*)GetProcAddress(hQtWidgets, "?setText@QAbstractButton@@QEAAXAEBVQString@@@Z");
-                void* pLabelSetText    = (void*)GetProcAddress(hQtWidgets, "?setText@QLabel@@QEAAXAEBVQString@@@Z");
-                void* pSetTitle        = (void*)GetProcAddress(hQtWidgets, "?setWindowTitle@QWidget@@QEAAXAEBVQString@@@Z");
-
-                void* pTreeSetText     = (void*)GetProcAddress(hQtWidgets, "?setText@QTreeWidgetItem@@QEAAXHAEBVQString@@@Z");
-                void* pTableSetText    = (void*)GetProcAddress(hQtWidgets, "?setText@QTableWidgetItem@@QEAAXAEBVQString@@@Z");
-                void* pListSetText     = (void*)GetProcAddress(hQtWidgets, "?setText@QListWidgetItem@@QEAAXAEBVQString@@@Z");
-                void* pComboAddItem    = (void*)GetProcAddress(hQtWidgets, "?addItem@QComboBox@@QEAAXAEBVQString@@AEBVQVariant@@@Z");
-
-                if (pActionSetText && !g_o_QAction_setText) HookManager::CreateAndEnableHook(pActionSetText, (void*)hk_QAction_setText, (void**)&g_o_QAction_setText, "QAction::setText");
-                if (pActionSetTip && !g_o_QAction_setToolTip) HookManager::CreateAndEnableHook(pActionSetTip, (void*)hk_QAction_setToolTip, (void**)&g_o_QAction_setToolTip, "QAction::setToolTip");
-                if (pActionSetStatus && !g_o_QAction_setStatusTip) HookManager::CreateAndEnableHook(pActionSetStatus, (void*)hk_QAction_setStatusTip, (void**)&g_o_QAction_setStatusTip, "QAction::setStatusTip");
-                if (pActionSetWhats && !g_o_QAction_setWhatsThis) HookManager::CreateAndEnableHook(pActionSetWhats, (void*)hk_QAction_setWhatsThis, (void**)&g_o_QAction_setWhatsThis, "QAction::setWhatsThis");
-                if (pButtonSetText && !g_o_QAbstractButton_setText) HookManager::CreateAndEnableHook(pButtonSetText, (void*)hk_QAbstractButton_setText, (void**)&g_o_QAbstractButton_setText, "QAbstractButton::setText");
-                if (pLabelSetText && !g_o_QLabel_setText) HookManager::CreateAndEnableHook(pLabelSetText, (void*)hk_QLabel_setText, (void**)&g_o_QLabel_setText, "QLabel::setText");
-                if (pSetTitle && !g_o_QWidget_setWindowTitle) HookManager::CreateAndEnableHook(pSetTitle, (void*)hk_QWidget_setWindowTitle, (void**)&g_o_QWidget_setWindowTitle, "QWidget::setWindowTitle");
-
-                if (pTreeSetText && !g_o_QTreeWidgetItem_setText) HookManager::CreateAndEnableHook(pTreeSetText, (void*)hk_QTreeWidgetItem_setText, (void**)&g_o_QTreeWidgetItem_setText, "QTreeWidgetItem::setText");
-                if (pTableSetText && !g_o_QTableWidgetItem_setText) HookManager::CreateAndEnableHook(pTableSetText, (void*)hk_QTableWidgetItem_setText, (void**)&g_o_QTableWidgetItem_setText, "QTableWidgetItem::setText");
-                if (pListSetText && !g_o_QListWidgetItem_setText) HookManager::CreateAndEnableHook(pListSetText, (void*)hk_QListWidgetItem_setText, (void**)&g_o_QListWidgetItem_setText, "QListWidgetItem::setText");
-                if (pComboAddItem && !g_o_QComboBox_addItem) HookManager::CreateAndEnableHook(pComboAddItem, (void*)hk_QComboBox_addItem, (void**)&g_o_QComboBox_addItem, "QComboBox::addItem");
-
-                bWidgetsHooked = true;
-                LogHook("[THREAD] Qt5Widgets hooks installed successfully");
+static bool TryHookQtToolsModules() {
+    auto installHookSafe = [](void* pTarget, void* pDetour, void** ppOriginal, const char* name) -> bool {
+        if (!*ppOriginal) {
+            if (!pTarget) {
+                LogHook("[HOOK] %s symbol not found!", name);
+                return false;
             }
-        }
-
-        if (!bGuiHooked) {
-            HMODULE hQtGui = GetModuleHandleW(L"Qt5Gui.dll");
-            if (hQtGui) {
-                LogHook("[THREAD] Found Qt5Gui.dll (%p), installing GUI hooks...", hQtGui);
-                void* pDrawRect   = (void*)GetProcAddress(hQtGui, "?drawText@QPainter@@QEAAXAEBVQRect@@HAEBVQString@@PEAV2@@Z");
-                void* pDrawRectF  = (void*)GetProcAddress(hQtGui, "?drawText@QPainter@@QEAAXAEBVQRectF@@HAEBVQString@@PEAV2@@Z");
-                void* pDrawPointF = (void*)GetProcAddress(hQtGui, "?drawText@QPainter@@QEAAXAEBVQPointF@@AEBVQString@@@Z");
-
-                if (pDrawRect && !g_o_QPainter_drawText_Rect) HookManager::CreateAndEnableHook(pDrawRect, (void*)hk_QPainter_drawText_Rect, (void**)&g_o_QPainter_drawText_Rect, "QPainter::drawText(Rect)");
-                if (pDrawRectF && !g_o_QPainter_drawText_RectF) HookManager::CreateAndEnableHook(pDrawRectF, (void*)hk_QPainter_drawText_RectF, (void**)&g_o_QPainter_drawText_RectF, "QPainter::drawText(RectF)");
-                if (pDrawPointF && !g_o_QPainter_drawText_PointF) HookManager::CreateAndEnableHook(pDrawPointF, (void*)hk_QPainter_drawText_PointF, (void**)&g_o_QPainter_drawText_PointF, "QPainter::drawText(PointF)");
-
-                bGuiHooked = true;
-                LogHook("[THREAD] Qt5Gui hooks installed successfully");
+            bool ok = HookManager::Instance().InstallHook(pTarget, pDetour, ppOriginal, name);
+            if (!ok) {
+                LogHook("[HOOK] %s InstallHook failed!", name);
+                return false;
             }
+            LogHook("[HOOK] %s hooked successfully (orig=%p)", name, *ppOriginal);
         }
+        return true;
+    };
 
-        if (!bWidgetsHooked || !bGuiHooked) {
-            Sleep(200);
+    if (!g_bWidgetsHooked.load()) {
+        HMODULE hQtWidgets = GetModuleHandleW(L"Qt5Widgets.dll");
+        if (hQtWidgets) {
+            LogHook("[HOOK] Found Qt5Widgets.dll (%p), installing widget hooks...", hQtWidgets);
+            void* pActionSetText   = (void*)GetProcAddress(hQtWidgets, "?setText@QAction@@QEAAXAEBVQString@@@Z");
+            void* pActionSetTip    = (void*)GetProcAddress(hQtWidgets, "?setToolTip@QAction@@QEAAXAEBVQString@@@Z");
+            void* pActionSetStatus = (void*)GetProcAddress(hQtWidgets, "?setStatusTip@QAction@@QEAAXAEBVQString@@@Z");
+            void* pActionSetWhats  = (void*)GetProcAddress(hQtWidgets, "?setWhatsThis@QAction@@QEAAXAEBVQString@@@Z");
+            void* pButtonSetText   = (void*)GetProcAddress(hQtWidgets, "?setText@QAbstractButton@@QEAAXAEBVQString@@@Z");
+            void* pLabelSetText    = (void*)GetProcAddress(hQtWidgets, "?setText@QLabel@@QEAAXAEBVQString@@@Z");
+            void* pSetTitle        = (void*)GetProcAddress(hQtWidgets, "?setWindowTitle@QWidget@@QEAAXAEBVQString@@@Z");
+
+            void* pTreeSetText     = (void*)GetProcAddress(hQtWidgets, "?setText@QTreeWidgetItem@@QEAAXHAEBVQString@@@Z");
+            void* pTableSetText    = (void*)GetProcAddress(hQtWidgets, "?setText@QTableWidgetItem@@QEAAXAEBVQString@@@Z");
+            void* pListSetText     = (void*)GetProcAddress(hQtWidgets, "?setText@QListWidgetItem@@QEAAXAEBVQString@@@Z");
+            void* pComboAddItem    = (void*)GetProcAddress(hQtWidgets, "?addItem@QComboBox@@QEAAXAEBVQString@@AEBVQVariant@@@Z");
+
+            bool success = true;
+            success &= installHookSafe(pActionSetText,   (void*)hk_QAction_setText,          (void**)&g_o_QAction_setText,          "QAction::setText");
+            success &= installHookSafe(pActionSetTip,    (void*)hk_QAction_setToolTip,       (void**)&g_o_QAction_setToolTip,       "QAction::setToolTip");
+            success &= installHookSafe(pActionSetStatus, (void*)hk_QAction_setStatusTip,     (void**)&g_o_QAction_setStatusTip,     "QAction::setStatusTip");
+            success &= installHookSafe(pActionSetWhats,  (void*)hk_QAction_setWhatsThis,     (void**)&g_o_QAction_setWhatsThis,     "QAction::setWhatsThis");
+            success &= installHookSafe(pButtonSetText,   (void*)hk_QAbstractButton_setText,  (void**)&g_o_QAbstractButton_setText,  "QAbstractButton::setText");
+            success &= installHookSafe(pLabelSetText,    (void*)hk_QLabel_setText,           (void**)&g_o_QLabel_setText,           "QLabel::setText");
+            success &= installHookSafe(pSetTitle,        (void*)hk_QWidget_setWindowTitle,   (void**)&g_o_QWidget_setWindowTitle,   "QWidget::setWindowTitle");
+            success &= installHookSafe(pTreeSetText,     (void*)hk_QTreeWidgetItem_setText,  (void**)&g_o_QTreeWidgetItem_setText,  "QTreeWidgetItem::setText");
+            success &= installHookSafe(pTableSetText,    (void*)hk_QTableWidgetItem_setText, (void**)&g_o_QTableWidgetItem_setText, "QTableWidgetItem::setText");
+            success &= installHookSafe(pListSetText,     (void*)hk_QListWidgetItem_setText,  (void**)&g_o_QListWidgetItem_setText,  "QListWidgetItem::setText");
+            success &= installHookSafe(pComboAddItem,    (void*)hk_QComboBox_addItem,       (void**)&g_o_QComboBox_addItem,       "QComboBox::addItem");
+
+            if (success) {
+                g_bWidgetsHooked.store(true);
+                LogHook("[HOOK] Qt5Widgets hooks installed successfully (all 11/11 OK)");
+            }
         }
     }
 
-    LogHook("[THREAD] All hooks installed, ToolsHookThread finishing");
+    if (!g_bGuiHooked.load()) {
+        HMODULE hQtGui = GetModuleHandleW(L"Qt5Gui.dll");
+        if (hQtGui) {
+            LogHook("[HOOK] Found Qt5Gui.dll (%p), installing GUI hooks...", hQtGui);
+            void* pDrawRect   = (void*)GetProcAddress(hQtGui, "?drawText@QPainter@@QEAAXAEBVQRect@@HAEBVQString@@PEAV2@@Z");
+            void* pDrawRectF  = (void*)GetProcAddress(hQtGui, "?drawText@QPainter@@QEAAXAEBVQRectF@@HAEBVQString@@PEAV2@@Z");
+            void* pDrawPointF = (void*)GetProcAddress(hQtGui, "?drawText@QPainter@@QEAAXAEBVQPointF@@AEBVQString@@@Z");
+
+            bool success = true;
+            success &= installHookSafe(pDrawRect,   (void*)hk_QPainter_drawText_Rect,   (void**)&g_o_QPainter_drawText_Rect,   "QPainter::drawText(Rect)");
+            success &= installHookSafe(pDrawRectF,  (void*)hk_QPainter_drawText_RectF,  (void**)&g_o_QPainter_drawText_RectF,  "QPainter::drawText(RectF)");
+            success &= installHookSafe(pDrawPointF, (void*)hk_QPainter_drawText_PointF, (void**)&g_o_QPainter_drawText_PointF, "QPainter::drawText(PointF)");
+
+            if (success) {
+                g_bGuiHooked.store(true);
+                LogHook("[HOOK] Qt5Gui hooks installed successfully (all 3/3 OK)");
+            }
+        }
+    }
+
+    return (g_bWidgetsHooked.load() && g_bGuiHooked.load());
+}
+
+static VOID CALLBACK OnDllNotification(ULONG NotificationReason, PLDR_DLL_NOTIFICATION_DATA NotificationData, PVOID Context) {
+    if (NotificationReason == LDR_DLL_NOTIFICATION_REASON_LOADED && NotificationData && NotificationData->Loaded.BaseDllName) {
+        const UNICODE_STRING* baseName = NotificationData->Loaded.BaseDllName;
+        if (baseName->Buffer && baseName->Length > 0) {
+            std::wstring dllName(baseName->Buffer, baseName->Length / sizeof(wchar_t));
+            std::transform(dllName.begin(), dllName.end(), dllName.begin(), ::towlower);
+            if (dllName == L"qt5widgets.dll" || dllName == L"qt5gui.dll") {
+                LogHook("[NOTIFY] Ldr Dll Notification: loaded %ls, signaling hook thread", dllName.c_str());
+                if (g_hWakeHookEvent) {
+                    SetEvent(g_hWakeHookEvent);
+                }
+            }
+        }
+    }
+}
+
+static DWORD WINAPI ToolsHookThread(LPVOID lpParam) {
+    LogHook("[THREAD] ToolsHookThread started");
+
+    // 在后台独立线程中预加载字典，确保不阻塞主线程/DllMain
+    EnsureDictionaryLoaded();
+
+    while ((!g_bWidgetsHooked.load() || !g_bGuiHooked.load()) && !g_bStopHookThread.load()) {
+        TryHookQtToolsModules();
+
+        if ((!g_bWidgetsHooked.load() || !g_bGuiHooked.load()) && !g_bStopHookThread.load()) {
+            if (g_hWakeHookEvent) {
+                WaitForSingleObject(g_hWakeHookEvent, 50);
+            } else {
+                Sleep(50);
+            }
+        }
+    }
+
+    LogHook("[THREAD] ToolsHookThread finishing (widgets=%d, gui=%d, stopRequested=%d)",
+        g_bWidgetsHooked.load(), g_bGuiHooked.load(), g_bStopHookThread.load());
     return 0;
 }
 
@@ -1079,11 +1230,13 @@ extern "C" __declspec(dllexport) bool InitializeTranslator() {
         return true;
     }
 
-    // 注册只读诊断异常捕获器
-    AddVectoredExceptionHandler(1, DiagnosticCrashLoggerVEH);
+    LogHook("[INIT] InitializeTranslator invoked");
 
-    LogHook("[INIT] InitializeTranslator invoked outside DllMain");
-    HookManager::Initialize();
+    // 1. 统一由 HookManager 管理 MinHook 初始化与 VEH 异常守卫
+    if (!HookManager::Instance().Initialize(DiagnosticCrashLoggerVEH)) {
+        LogHook("[INIT] HookManager::Initialize failed!");
+        return false;
+    }
 
     HMODULE hQtCore = GetModuleHandleW(L"Qt5Core.dll");
     if (!hQtCore) {
@@ -1099,13 +1252,48 @@ extern "C" __declspec(dllexport) bool InitializeTranslator() {
     LogHook("[INIT] Qt5Core=%p, fromUtf8=%p, utf16=%p, dtor=%p, tr=%p", hQtCore, g_pfn_fromUtf8, g_pfn_utf16, g_pfn_QString_dtor, pTr);
 
     if (pTr && g_pfn_fromUtf8 && !g_o_QMetaObject_tr) {
-        bool ok = HookManager::CreateAndEnableHook(pTr, (void*)hk_QMetaObject_tr, (void**)&g_o_QMetaObject_tr, "QMetaObject::tr");
+        bool ok = HookManager::Instance().InstallHook(pTr, (void*)hk_QMetaObject_tr, (void**)&g_o_QMetaObject_tr, "QMetaObject::tr");
         LogHook("[INIT] Hooked QMetaObject::tr, result=%d, orig=%p", ok, g_o_QMetaObject_tr);
     }
 
-    CreateThread(NULL, 0, ToolsHookThread, NULL, 0, NULL);
+    // 2. 创建异步唤醒事件并注册 DLL 通知
+    g_hWakeHookEvent = CreateEventW(NULL, FALSE, FALSE, NULL);
+    HookManager::Instance().RegisterDllNotification(OnDllNotification);
+
+    // 3. 启动后台线程异步完成所有耗时操作与挂钩（彻底脱离 DllMain 与 Loader Lock）
+    g_hToolsHookThread = CreateThread(NULL, 0, ToolsHookThread, NULL, 0, NULL);
     LogHook("[INIT] ToolsHookThread spawned successfully");
     return true;
+}
+
+extern "C" __declspec(dllexport) void ShutdownTranslator() {
+    static std::atomic<bool> s_bShutdown{false};
+    bool expected = false;
+    if (!s_bShutdown.compare_exchange_strong(expected, true)) {
+        return;
+    }
+
+    LogHook("[SHUTDOWN] ShutdownTranslator invoked");
+
+    // 1. 通知并等待后台 Hook 线程优雅退出
+    g_bStopHookThread.store(true);
+    if (g_hWakeHookEvent) {
+        SetEvent(g_hWakeHookEvent);
+    }
+    if (g_hToolsHookThread) {
+        WaitForSingleObject(g_hToolsHookThread, 2000);
+        CloseHandle(g_hToolsHookThread);
+        g_hToolsHookThread = NULL;
+    }
+    if (g_hWakeHookEvent) {
+        CloseHandle(g_hWakeHookEvent);
+        g_hWakeHookEvent = NULL;
+    }
+
+    // 2. 统一执行完整生命周期退出：
+    //    disable -> remove -> free trampoline -> unregister VEH -> uninitialize MinHook
+    HookManager::Instance().Shutdown();
+    LogHook("[SHUTDOWN] ShutdownTranslator completed cleanly");
 }
 
 extern "C" __declspec(dllexport) void InitQtCoreQmTranslator() {
@@ -1115,8 +1303,6 @@ extern "C" __declspec(dllexport) void InitQtCoreQmTranslator() {
 BOOL APIENTRY DllMain(HMODULE hModule, DWORD ul_reason_for_call, LPVOID lpReserved) {
     if (ul_reason_for_call == DLL_PROCESS_ATTACH) {
         DisableThreadLibraryCalls(hModule);
-    } else if (ul_reason_for_call == DLL_PROCESS_DETACH) {
-        HookManager::Shutdown();
     }
     return TRUE;
 }
