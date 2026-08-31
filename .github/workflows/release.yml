@@ -16,6 +16,8 @@ jobs:
     steps:
       - name: Checkout Repository
         uses: actions/checkout@v4
+        with:
+          submodules: recursive
 
       - name: Install Qt 6.8.0
         uses: jurplel/install-qt-action@v4
