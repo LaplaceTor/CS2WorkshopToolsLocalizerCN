@@ -1325,10 +1325,16 @@ static LONG WINAPI DiagnosticCrashLoggerVEH(PEXCEPTION_POINTERS pExceptionInfo) 
     return EXCEPTION_CONTINUE_SEARCH;
 }
 
+static std::atomic<bool> g_bTranslatorInitialized{false};
+static std::mutex g_TranslatorInitMutex;
+
 extern "C" __declspec(dllexport) bool InitializeTranslator() {
-    static std::atomic<bool> s_bInitialized{false};
-    bool expected = false;
-    if (!s_bInitialized.compare_exchange_strong(expected, true)) {
+    if (g_bTranslatorInitialized.load(std::memory_order_acquire)) {
+        return true;
+    }
+
+    std::lock_guard<std::mutex> lock(g_TranslatorInitMutex);
+    if (g_bTranslatorInitialized.load(std::memory_order_relaxed)) {
         return true;
     }
 
@@ -1383,21 +1389,31 @@ extern "C" __declspec(dllexport) bool InitializeTranslator() {
     LogHook("[INIT] Qt5Core=%p, fromUtf8=%p, utf16=%p, dtor=%p, orig_tr=%p", hQtCore, g_pfn_fromUtf8, g_pfn_utf16, g_pfn_QString_dtor, g_o_QMetaObject_tr);
 
     // 2. 创建异步唤醒事件并注册 DLL 通知
-    g_hWakeHookEvent = CreateEventW(NULL, FALSE, FALSE, NULL);
+    if (!g_hWakeHookEvent) {
+        g_hWakeHookEvent = CreateEventW(NULL, FALSE, FALSE, NULL);
+    }
     HookManager::Instance().RegisterDllNotification(OnDllNotification);
 
     // 3. 启动后台线程异步完成所有耗时操作与挂钩（彻底脱离 DllMain 与 Loader Lock）
-    g_hToolsHookThread = CreateThread(NULL, 0, ToolsHookThread, NULL, 0, NULL);
-    LogHook("[INIT] ToolsHookThread spawned successfully");
+    if (!g_hToolsHookThread) {
+        g_hToolsHookThread = CreateThread(NULL, 0, ToolsHookThread, NULL, 0, NULL);
+        if (!g_hToolsHookThread) {
+            LogHook("[INIT] CreateThread for ToolsHookThread failed!");
+            return false;
+        }
+        LogHook("[INIT] ToolsHookThread spawned successfully");
+    }
+
+    g_bTranslatorInitialized.store(true, std::memory_order_release);
     return true;
 }
 
 extern "C" __declspec(dllexport) void ShutdownTranslator() {
-    static std::atomic<bool> s_bShutdown{false};
-    bool expected = false;
-    if (!s_bShutdown.compare_exchange_strong(expected, true)) {
+    std::lock_guard<std::mutex> lock(g_TranslatorInitMutex);
+    if (!g_bTranslatorInitialized.load(std::memory_order_relaxed)) {
         return;
     }
+    g_bTranslatorInitialized.store(false, std::memory_order_release);
 
     LogHook("[SHUTDOWN] ShutdownTranslator invoked");
 

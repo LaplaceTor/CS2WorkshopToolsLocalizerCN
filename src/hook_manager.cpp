@@ -197,6 +197,7 @@ bool HookManager::IsInitialized() const {
 }
 
 size_t HookManager::GetHookCount() const {
+    std::lock_guard<std::mutex> lock(m_mutex);
     return m_hooks.size();
 }
 

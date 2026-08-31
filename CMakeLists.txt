@@ -108,6 +108,22 @@ add_executable(test_components
     src/fgd_translator.cpp
     src/backup_manager.h
     src/backup_manager.cpp
+    src/hook_manager.h
+    src/hook_manager.cpp
+    third_party/minhook/include/MinHook.h
+    third_party/minhook/src/buffer.h
+    third_party/minhook/src/buffer.c
+    third_party/minhook/src/hook.c
+    third_party/minhook/src/trampoline.h
+    third_party/minhook/src/trampoline.c
+    third_party/minhook/src/hde/hde64.h
+    third_party/minhook/src/hde/hde64.c
+    third_party/minhook/src/hde/pstdint.h
+    third_party/minhook/src/hde/table64.h
+)
+target_include_directories(test_components PRIVATE
+    third_party/minhook/include
+    third_party/minhook/src
 )
 target_link_libraries(test_components PRIVATE
     Qt6::Core
@@ -115,4 +131,5 @@ target_link_libraries(test_components PRIVATE
     user32
     shell32
     version
+    psapi
 )

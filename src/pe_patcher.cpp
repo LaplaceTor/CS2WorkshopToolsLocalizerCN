@@ -346,6 +346,10 @@ bool PePatcher::PatchQtCore(const std::wstring& srcDllPath, const std::wstring& 
                             const char* symName = reader.ReadNullTerminatedString(*optNameOff, 128);
                             if (symName && std::strcmp(symName, "?tr@QMetaObject@@QEBA?AVQString@@PEBD0H@Z") == 0) {
                                 WORD ordIndex = pOrdinals[i];
+                                if (ordIndex >= expDir->NumberOfFunctions) {
+                                    outError = L"导出表中函数序号超出 NumberOfFunctions 范围";
+                                    return false;
+                                }
                                 if (origTrRva == 0) {
                                     origTrRva = pFunctions[ordIndex];
                                 }
@@ -388,6 +392,26 @@ bool PePatcher::PatchQtCore(const std::wstring& srcDllPath, const std::wstring& 
     DWORD totalDataLen = (funcNameRva + funcNameLen - caveRva);
     DWORD epCodeStartRva = caveRva + totalDataLen;
 
+    auto SafeComputeRel32 = [](uint64_t targetRva, uint64_t nextInstrRva, int32_t& outDisp, const wchar_t* ctx, std::wstring& err) -> bool {
+        int64_t diff = static_cast<int64_t>(targetRva) - static_cast<int64_t>(nextInstrRva);
+        if (diff < INT32_MIN || diff > INT32_MAX) {
+            err = std::wstring(L"相对偏移计算溢出 32 位整型范围: ") + ctx;
+            return false;
+        }
+        outDisp = static_cast<int32_t>(diff);
+        return true;
+    };
+
+    auto SafeComputeRel8 = [](size_t targetIdx, size_t nextInstrIdx, uint8_t& outDisp, const wchar_t* ctx, std::wstring& err) -> bool {
+        int64_t diff = static_cast<int64_t>(targetIdx) - static_cast<int64_t>(nextInstrIdx);
+        if (diff < -128 || diff > 127) {
+            err = std::wstring(L"短跳转相对偏移计算溢出 8 位整型范围: ") + ctx;
+            return false;
+        }
+        outDisp = static_cast<uint8_t>(static_cast<int8_t>(diff));
+        return true;
+    };
+
     // 8. 构建纯净 EntryPoint Shellcode (仅记录需要初始化并立即返回原 EntryPoint，绝不在 Loader Lock 中执行任何 API 或 I/O)
     std::vector<uint8_t> epShellcode;
 
@@ -398,14 +422,20 @@ bool PePatcher::PatchQtCore(const std::wstring& srcDllPath, const std::wstring& 
 
     // jne origEntryPoint (2 字节 short jump 或 6 字节 near jump)
     DWORD currEpRva = epCodeStartRva + static_cast<DWORD>(epShellcode.size());
-    int32_t dispSkip = static_cast<int32_t>(origEntryPointRva) - static_cast<int32_t>(currEpRva + 6);
+    int32_t dispSkip = 0;
+    if (!SafeComputeRel32(origEntryPointRva, currEpRva + 6, dispSkip, L"epShellcode jne origEntryPoint", outError)) {
+        return false;
+    }
     epShellcode.push_back(0x0f);
     epShellcode.push_back(0x85);
     epShellcode.insert(epShellcode.end(), reinterpret_cast<uint8_t*>(&dispSkip), reinterpret_cast<uint8_t*>(&dispSkip) + 4);
 
     // mov byte ptr [rip + dispInitFlag], 1 (仅在内存 Code Cave 中标记状态，耗时 5ns)
     currEpRva = epCodeStartRva + static_cast<DWORD>(epShellcode.size());
-    int32_t dispInitFlag = static_cast<int32_t>(initFlagRva) - static_cast<int32_t>(currEpRva + 7);
+    int32_t dispInitFlag = 0;
+    if (!SafeComputeRel32(initFlagRva, currEpRva + 7, dispInitFlag, L"epShellcode initFlag", outError)) {
+        return false;
+    }
     epShellcode.push_back(0xc6);
     epShellcode.push_back(0x05);
     epShellcode.insert(epShellcode.end(), reinterpret_cast<uint8_t*>(&dispInitFlag), reinterpret_cast<uint8_t*>(&dispInitFlag) + 4);
@@ -413,7 +443,10 @@ bool PePatcher::PatchQtCore(const std::wstring& srcDllPath, const std::wstring& 
 
     // jmp origEntryPoint (直接跳回原始 EntryPoint)
     currEpRva = epCodeStartRva + static_cast<DWORD>(epShellcode.size());
-    int32_t dispBack = static_cast<int32_t>(origEntryPointRva) - static_cast<int32_t>(currEpRva + 5);
+    int32_t dispBack = 0;
+    if (!SafeComputeRel32(origEntryPointRva, currEpRva + 5, dispBack, L"epShellcode jmp origEntryPoint", outError)) {
+        return false;
+    }
     epShellcode.push_back(0xe9);
     epShellcode.insert(epShellcode.end(), reinterpret_cast<uint8_t*>(&dispBack), reinterpret_cast<uint8_t*>(&dispBack) + 4);
 
@@ -424,7 +457,10 @@ bool PePatcher::PatchQtCore(const std::wstring& srcDllPath, const std::wstring& 
 
     // 0. cmp byte ptr [rip + dispTrHooked], 1 (已初始化则直接跳转 Detour)
     DWORD currTrRva = trCodeStartRva + static_cast<DWORD>(trShellcode.size());
-    int32_t dispTrHooked = static_cast<int32_t>(trHookedFlagRva) - static_cast<int32_t>(currTrRva + 7);
+    int32_t dispTrHooked = 0;
+    if (!SafeComputeRel32(trHookedFlagRva, currTrRva + 7, dispTrHooked, L"trShellcode trHookedFlag", outError)) {
+        return false;
+    }
     trShellcode.push_back(0x80);
     trShellcode.push_back(0x3d);
     trShellcode.insert(trShellcode.end(), reinterpret_cast<uint8_t*>(&dispTrHooked), reinterpret_cast<uint8_t*>(&dispTrHooked) + 4);
@@ -445,14 +481,20 @@ bool PePatcher::PatchQtCore(const std::wstring& srcDllPath, const std::wstring& 
 
     // 3. LoadLibraryA("qtcore_qm.dll") (在脱离 Loader Lock 后的普通工作线程中安全调用)
     currTrRva = trCodeStartRva + static_cast<DWORD>(trShellcode.size());
-    int32_t dispDllName = static_cast<int32_t>(dllNameRva) - static_cast<int32_t>(currTrRva + 7);
+    int32_t dispDllName = 0;
+    if (!SafeComputeRel32(dllNameRva, currTrRva + 7, dispDllName, L"trShellcode dllName", outError)) {
+        return false;
+    }
     trShellcode.push_back(0x48);
     trShellcode.push_back(0x8d);
     trShellcode.push_back(0x0d);
     trShellcode.insert(trShellcode.end(), reinterpret_cast<uint8_t*>(&dispDllName), reinterpret_cast<uint8_t*>(&dispDllName) + 4);
 
     currTrRva = trCodeStartRva + static_cast<DWORD>(trShellcode.size());
-    int32_t dispLoadLib = static_cast<int32_t>(iatLoadLibRva) - static_cast<int32_t>(currTrRva + 6);
+    int32_t dispLoadLib = 0;
+    if (!SafeComputeRel32(iatLoadLibRva, currTrRva + 6, dispLoadLib, L"trShellcode iatLoadLib", outError)) {
+        return false;
+    }
     trShellcode.push_back(0xff);
     trShellcode.push_back(0x15);
     trShellcode.insert(trShellcode.end(), reinterpret_cast<uint8_t*>(&dispLoadLib), reinterpret_cast<uint8_t*>(&dispLoadLib) + 4);
@@ -473,14 +515,20 @@ bool PePatcher::PatchQtCore(const std::wstring& srcDllPath, const std::wstring& 
     trShellcode.push_back(0xc1); // mov rcx, rax
 
     currTrRva = trCodeStartRva + static_cast<DWORD>(trShellcode.size());
-    int32_t dispTrFuncName = static_cast<int32_t>(funcNameRva) - static_cast<int32_t>(currTrRva + 7);
+    int32_t dispTrFuncName = 0;
+    if (!SafeComputeRel32(funcNameRva, currTrRva + 7, dispTrFuncName, L"trShellcode funcName", outError)) {
+        return false;
+    }
     trShellcode.push_back(0x48);
     trShellcode.push_back(0x8d);
     trShellcode.push_back(0x15);
     trShellcode.insert(trShellcode.end(), reinterpret_cast<uint8_t*>(&dispTrFuncName), reinterpret_cast<uint8_t*>(&dispTrFuncName) + 4);
 
     currTrRva = trCodeStartRva + static_cast<DWORD>(trShellcode.size());
-    int32_t dispGetProc = static_cast<int32_t>(iatGetProcRva) - static_cast<int32_t>(currTrRva + 6);
+    int32_t dispGetProc = 0;
+    if (!SafeComputeRel32(iatGetProcRva, currTrRva + 6, dispGetProc, L"trShellcode iatGetProc", outError)) {
+        return false;
+    }
     trShellcode.push_back(0xff);
     trShellcode.push_back(0x15);
     trShellcode.insert(trShellcode.end(), reinterpret_cast<uint8_t*>(&dispGetProc), reinterpret_cast<uint8_t*>(&dispGetProc) + 4);
@@ -497,14 +545,20 @@ bool PePatcher::PatchQtCore(const std::wstring& srcDllPath, const std::wstring& 
 
     // 5. 保存解析出的 detour 函数指针并置标志位
     currTrRva = trCodeStartRva + static_cast<DWORD>(trShellcode.size());
-    int32_t dispDetour = static_cast<int32_t>(detourPtrRva) - static_cast<int32_t>(currTrRva + 7);
+    int32_t dispDetour = 0;
+    if (!SafeComputeRel32(detourPtrRva, currTrRva + 7, dispDetour, L"trShellcode detourPtr", outError)) {
+        return false;
+    }
     trShellcode.push_back(0x48);
     trShellcode.push_back(0x89);
     trShellcode.push_back(0x05);
     trShellcode.insert(trShellcode.end(), reinterpret_cast<uint8_t*>(&dispDetour), reinterpret_cast<uint8_t*>(&dispDetour) + 4);
 
     currTrRva = trCodeStartRva + static_cast<DWORD>(trShellcode.size());
-    int32_t dispTrHooked2 = static_cast<int32_t>(trHookedFlagRva) - static_cast<int32_t>(currTrRva + 7);
+    int32_t dispTrHooked2 = 0;
+    if (!SafeComputeRel32(trHookedFlagRva, currTrRva + 7, dispTrHooked2, L"trShellcode trHookedFlag2", outError)) {
+        return false;
+    }
     trShellcode.push_back(0xc6);
     trShellcode.push_back(0x05);
     trShellcode.insert(trShellcode.end(), reinterpret_cast<uint8_t*>(&dispTrHooked2), reinterpret_cast<uint8_t*>(&dispTrHooked2) + 4);
@@ -512,8 +566,12 @@ bool PePatcher::PatchQtCore(const std::wstring& srcDllPath, const std::wstring& 
 
     // fallback_exit 目标点
     size_t fallbackIdx = trShellcode.size();
-    trShellcode[jzLoadFail + 1] = static_cast<uint8_t>(fallbackIdx - (jzLoadFail + 2));
-    trShellcode[jzGetProcFail + 1] = static_cast<uint8_t>(fallbackIdx - (jzGetProcFail + 2));
+    if (!SafeComputeRel8(fallbackIdx, jzLoadFail + 2, trShellcode[jzLoadFail + 1], L"trShellcode jzLoadFail", outError)) {
+        return false;
+    }
+    if (!SafeComputeRel8(fallbackIdx, jzGetProcFail + 2, trShellcode[jzGetProcFail + 1], L"trShellcode jzGetProcFail", outError)) {
+        return false;
+    }
 
     // 6. 恢复栈与寄存器
     const uint8_t addRsp[] = { 0x48, 0x83, 0xc4, 0x28 };
@@ -524,11 +582,16 @@ bool PePatcher::PatchQtCore(const std::wstring& srcDllPath, const std::wstring& 
 
     // jump_detour 目标点
     size_t jumpDetourIdx = trShellcode.size();
-    trShellcode[jeDetourIdx + 1] = static_cast<uint8_t>(jumpDetourIdx - (jeDetourIdx + 2));
+    if (!SafeComputeRel8(jumpDetourIdx, jeDetourIdx + 2, trShellcode[jeDetourIdx + 1], L"trShellcode jeDetour", outError)) {
+        return false;
+    }
 
     // 7. cmp qword ptr [rip + dispDetourPtr], 0
     currTrRva = trCodeStartRva + static_cast<DWORD>(trShellcode.size());
-    int32_t dispDetour2 = static_cast<int32_t>(detourPtrRva) - static_cast<int32_t>(currTrRva + 8);
+    int32_t dispDetour2 = 0;
+    if (!SafeComputeRel32(detourPtrRva, currTrRva + 8, dispDetour2, L"trShellcode detourPtr2", outError)) {
+        return false;
+    }
     trShellcode.push_back(0x48);
     trShellcode.push_back(0x83);
     trShellcode.push_back(0x3d);
@@ -541,14 +604,20 @@ bool PePatcher::PatchQtCore(const std::wstring& srcDllPath, const std::wstring& 
 
     // jmp qword ptr [rip + dispDetourJump] (ff 25 disp32)
     currTrRva = trCodeStartRva + static_cast<DWORD>(trShellcode.size());
-    int32_t dispDetourJump = static_cast<int32_t>(detourPtrRva) - static_cast<int32_t>(currTrRva + 6);
+    int32_t dispDetourJump = 0;
+    if (!SafeComputeRel32(detourPtrRva, currTrRva + 6, dispDetourJump, L"trShellcode detourJump", outError)) {
+        return false;
+    }
     trShellcode.push_back(0xff);
     trShellcode.push_back(0x25);
     trShellcode.insert(trShellcode.end(), reinterpret_cast<uint8_t*>(&dispDetourJump), reinterpret_cast<uint8_t*>(&dispDetourJump) + 4);
 
     // jump_orig: jmp origTrRva (e9 dispOrigTr)
     currTrRva = trCodeStartRva + static_cast<DWORD>(trShellcode.size());
-    int32_t dispOrigTr = static_cast<int32_t>(origTrRva) - static_cast<int32_t>(currTrRva + 5);
+    int32_t dispOrigTr = 0;
+    if (!SafeComputeRel32(origTrRva, currTrRva + 5, dispOrigTr, L"trShellcode origTr", outError)) {
+        return false;
+    }
     trShellcode.push_back(0xe9);
     trShellcode.insert(trShellcode.end(), reinterpret_cast<uint8_t*>(&dispOrigTr), reinterpret_cast<uint8_t*>(&dispOrigTr) + 4);
 

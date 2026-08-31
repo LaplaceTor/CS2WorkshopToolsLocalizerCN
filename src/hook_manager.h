@@ -92,7 +92,7 @@ private:
     HookManager() = default;
     ~HookManager();
 
-    std::mutex m_mutex;
+    mutable std::mutex m_mutex;
     std::vector<HookEntry> m_hooks;
     void* m_pVehHandle = nullptr;
     void* m_pDllNotificationCookie = nullptr;

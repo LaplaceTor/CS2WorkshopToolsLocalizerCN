@@ -9,6 +9,7 @@
 #include "../src/pe_patcher.h"
 #include "../src/fgd_translator.h"
 #include "../src/backup_manager.h"
+#include "../src/hook_manager.h"
 
 namespace fs = std::filesystem;
 
@@ -563,6 +564,28 @@ int main() {
     fs::remove_all(mockCs2Root);
     fs::remove_all(mockBackupDir);
     std::cout << "[Test 8] File Lock Retry & Failure Handling: PASSED\n";
+
+    // 9. Test HookManager GetHookCount locking & Thread Safety
+    std::cout << "[Test 9] Testing HookManager GetHookCount & Thread Safety...\n";
+    {
+        HookManager& hm = HookManager::Instance();
+        assert(hm.GetHookCount() == 0);
+        
+        // Concurrent GetHookCount calls
+        std::vector<std::thread> threads;
+        for (int i = 0; i < 8; ++i) {
+            threads.emplace_back([&hm]() {
+                for (int j = 0; j < 1000; ++j) {
+                    size_t count = hm.GetHookCount();
+                    (void)count;
+                }
+            });
+        }
+        for (auto& t : threads) {
+            t.join();
+        }
+        std::cout << "[Test 9] HookManager GetHookCount Concurrent Locking: PASSED\n";
+    }
 
     std::cout << "\n[ALL TESTS PASSED SUCCESSFULLY!]\n";
     return 0;
