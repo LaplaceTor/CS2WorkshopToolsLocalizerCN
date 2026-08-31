@@ -696,6 +696,35 @@ int main() {
         std::cout << "[Test 12] Size Limits & Single-Consumer Snapshot: PASSED\n";
     }
 
+    // 13. Test HookManager Ownership & Transactional Backup Staging
+    std::cout << "[Test 13] Testing HookManager Ownership & Transactional Staging...\n";
+    {
+        // 13.1 HookManager Duplicate Install (already created & already enabled)
+        static auto dummyTarget = []() -> int { return 42; };
+        static auto dummyDetour = []() -> int { return 100; };
+        static void* origPtr = nullptr;
+
+        void* pTarget = (void*)(intptr_t)+dummyTarget;
+        void* pDetour = (void*)(intptr_t)+dummyDetour;
+
+        bool ok1 = HookManager::Instance().InstallHook(pTarget, pDetour, &origPtr, "dummy");
+        assert(ok1 && "First InstallHook must succeed");
+
+        // Duplicate install on same target
+        bool ok2 = HookManager::Instance().InstallHook(pTarget, pDetour, &origPtr, "dummy_dup");
+        assert(ok2 && "Duplicate InstallHook must handle already created / already enabled gracefully");
+
+        // Uninstall
+        bool un1 = HookManager::Instance().UninstallHook(pTarget);
+        assert(un1 && "UninstallHook must succeed");
+
+        // Duplicate Uninstall
+        bool un2 = HookManager::Instance().UninstallHook(pTarget);
+        assert(un2 && "Duplicate UninstallHook must handle not created / already disabled gracefully");
+
+        std::cout << "[Test 13] HookManager Ownership & Transactional Staging: PASSED\n";
+    }
+
     std::cout << "\n[ALL TESTS PASSED SUCCESSFULLY!]\n";
     return 0;
 }

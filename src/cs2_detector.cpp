@@ -5,6 +5,11 @@
 #include <fstream>
 #include <regex>
 #include <algorithm>
+#include <QSettings>
+#include <QDir>
+#include <QFileInfo>
+#include <QString>
+#include <QStringList>
 
 namespace fs = std::filesystem;
 
@@ -44,15 +49,8 @@ bool Cs2Detector::IsCs2ProcessRunning() {
 
 bool Cs2Detector::IsValidCs2Root(const std::wstring& rootPath) {
     if (rootPath.empty()) return false;
-    try {
-        fs::path p(rootPath);
-        fs::path bin = p / L"game" / L"bin" / L"win64";
-        fs::path cs2Exe = bin / L"cs2.exe";
-        fs::path qt5Core = bin / L"Qt5Core.dll";
-        return fs::exists(cs2Exe) || fs::exists(qt5Core) || fs::exists(bin);
-    } catch (...) {
-        return false;
-    }
+    QDir dir(QString::fromStdWString(rootPath));
+    return dir.exists("game/bin/win64/cs2.exe") || dir.exists("game/bin/win64/Qt5Core.dll") || dir.exists("game/bin/win64");
 }
 
 std::wstring Cs2Detector::GetWin64BinDir(const std::wstring& cs2Root) {
@@ -67,44 +65,33 @@ std::wstring Cs2Detector::GetAddonsDir(const std::wstring& cs2Root) {
 
 std::vector<std::wstring> Cs2Detector::GetAvailableAddons(const std::wstring& cs2Root) {
     std::vector<std::wstring> addons;
-    try {
-        fs::path addonsPath = fs::path(cs2Root) / L"content" / L"csgo_addons";
-        if (fs::exists(addonsPath) && fs::is_directory(addonsPath)) {
-            for (const auto& entry : fs::directory_iterator(addonsPath)) {
-                if (entry.is_directory()) {
-                    std::wstring name = entry.path().filename().wstring();
-                    addons.push_back(name);
-                }
-            }
+    QString addonsPath = QString::fromStdWString(cs2Root) + "/content/csgo_addons";
+    QDir dir(addonsPath);
+    if (dir.exists()) {
+        QStringList entries = dir.entryList(QDir::Dirs | QDir::NoDotAndDotDot, QDir::Name);
+        addons.reserve(entries.size());
+        for (const QString& entry : entries) {
+            addons.push_back(entry.toStdWString());
         }
-    } catch (...) {}
-    std::sort(addons.begin(), addons.end());
+    }
     return addons;
 }
 
 bool Cs2Detector::CheckRegistryUninstall(std::wstring& outPath) {
-    const wchar_t* subkeys[] = {
-        L"SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\Steam App 730",
-        L"SOFTWARE\\WOW6432Node\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\Steam App 730"
+    const QString subkeys[] = {
+        "HKEY_LOCAL_MACHINE\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\Steam App 730",
+        "HKEY_LOCAL_MACHINE\\SOFTWARE\\WOW6432Node\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\Steam App 730",
+        "HKEY_CURRENT_USER\\Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\Steam App 730"
     };
 
-    HKEY roots[] = { HKEY_LOCAL_MACHINE, HKEY_CURRENT_USER };
-
-    for (HKEY root : roots) {
-        for (const wchar_t* subkey : subkeys) {
-            HKEY hKey = NULL;
-            if (RegOpenKeyExW(root, subkey, 0, KEY_READ, &hKey) == ERROR_SUCCESS) {
-                wchar_t buffer[MAX_PATH] = {0};
-                DWORD bufSize = sizeof(buffer);
-                DWORD type = 0;
-                if (RegQueryValueExW(hKey, L"InstallLocation", NULL, &type, (LPBYTE)buffer, &bufSize) == ERROR_SUCCESS) {
-                    RegCloseKey(hKey);
-                    if (buffer[0] != L'\0' && IsValidCs2Root(buffer)) {
-                        outPath = buffer;
-                        return true;
-                    }
-                }
-                RegCloseKey(hKey);
+    for (const QString& subkey : subkeys) {
+        QSettings reg(subkey, QSettings::NativeFormat);
+        QString loc = reg.value("InstallLocation").toString();
+        if (!loc.isEmpty()) {
+            std::wstring wloc = loc.toStdWString();
+            if (IsValidCs2Root(wloc)) {
+                outPath = wloc;
+                return true;
             }
         }
     }
@@ -152,42 +139,31 @@ bool Cs2Detector::ParseSteamLibraryFolders(const std::wstring& vdfPath, std::vec
 }
 
 bool Cs2Detector::CheckRegistrySteam(std::wstring& outPath) {
-    struct SteamRegQuery {
-        HKEY root;
-        const wchar_t* subkey;
-        const wchar_t* valName;
+    const QString subkeys[] = {
+        "HKEY_CURRENT_USER\\Software\\Valve\\Steam",
+        "HKEY_LOCAL_MACHINE\\SOFTWARE\\Valve\\Steam",
+        "HKEY_LOCAL_MACHINE\\SOFTWARE\\WOW6432Node\\Valve\\Steam"
     };
 
-    SteamRegQuery queries[] = {
-        { HKEY_CURRENT_USER, L"Software\\Valve\\Steam", L"SteamPath" },
-        { HKEY_LOCAL_MACHINE, L"SOFTWARE\\Valve\\Steam", L"InstallPath" },
-        { HKEY_LOCAL_MACHINE, L"SOFTWARE\\WOW6432Node\\Valve\\Steam", L"InstallPath" }
-    };
-
-    std::wstring steamPath;
-    for (const auto& q : queries) {
-        HKEY hKey = NULL;
-        if (RegOpenKeyExW(q.root, q.subkey, 0, KEY_READ, &hKey) == ERROR_SUCCESS) {
-            wchar_t buffer[MAX_PATH] = {0};
-            DWORD bufSize = sizeof(buffer);
-            DWORD type = 0;
-            if (RegQueryValueExW(hKey, q.valName, NULL, &type, (LPBYTE)buffer, &bufSize) == ERROR_SUCCESS) {
-                RegCloseKey(hKey);
-                if (buffer[0] != L'\0') {
-                    steamPath = buffer;
-                    break;
-                }
-            }
-            RegCloseKey(hKey);
+    QString steamPath;
+    for (const QString& subkey : subkeys) {
+        QSettings reg(subkey, QSettings::NativeFormat);
+        QString p = reg.value("SteamPath").toString();
+        if (p.isEmpty()) {
+            p = reg.value("InstallPath").toString();
+        }
+        if (!p.isEmpty()) {
+            steamPath = p;
+            break;
         }
     }
 
-    if (steamPath.empty()) return false;
+    if (steamPath.isEmpty()) return false;
 
-    // 检查 steamapps/libraryfolders.vdf
-    fs::path vdfPath = fs::path(steamPath) / L"steamapps" / L"libraryfolders.vdf";
+    std::wstring wSteamPath = steamPath.toStdWString();
+    fs::path vdfPath = fs::path(wSteamPath) / L"steamapps" / L"libraryfolders.vdf";
     std::vector<std::wstring> libraries;
-    libraries.push_back(steamPath);
+    libraries.push_back(wSteamPath);
 
     if (fs::exists(vdfPath)) {
         ParseSteamLibraryFolders(vdfPath.wstring(), libraries);

@@ -34,6 +34,7 @@
 #include <QJsonObject>
 #include <QUrl>
 #include <QFile>
+#include <QSaveFile>
 #include <memory>
 #include <filesystem>
 
@@ -851,45 +852,52 @@ void MainWindow::onUpdateTranslationsClicked() {
 
                 appendLog(QString("[+] fgd_override.json 获取成功，有效规则: %1 条").arg(overrideCount), "#a6e22e");
 
-                // Save all three files
+                // Save all three files atomically using Qt QSaveFile (.tmp -> validate -> commit)
+                auto atomicSave = [this](const QString& localPath, const QByteArray& data, const QString& name) -> bool {
+                    // 校验内容
+                    std::string clean = DictionaryCompiler::StripJsonComments(data.constData(), data.size());
+                    QJsonParseError parseErr;
+                    QJsonDocument doc = QJsonDocument::fromJson(QByteArray::fromRawData(clean.c_str(), clean.size()), &parseErr);
+                    if (parseErr.error != QJsonParseError::NoError || !doc.isObject()) {
+                        appendLog(QString("[-] %1 校验失败: %2").arg(name).arg(parseErr.errorString()), "#f92672");
+                        return false;
+                    }
+
+                    // 使用 QSaveFile 原子写入
+                    QSaveFile saveFile(localPath);
+                    if (!saveFile.open(QIODevice::WriteOnly)) {
+                        appendLog(QString("[-] 无法创建文件 %1: %2").arg(name).arg(saveFile.errorString()), "#f92672");
+                        return false;
+                    }
+
+                    if (saveFile.write(data) != data.size()) {
+                        saveFile.cancelWriting();
+                        appendLog(QString("[-] 写入 %1 数据不完整").arg(name), "#f92672");
+                        return false;
+                    }
+
+                    if (!saveFile.commit()) {
+                        appendLog(QString("[-] 原子提交 %1 失败: %2").arg(name).arg(saveFile.errorString()), "#f92672");
+                        return false;
+                    }
+
+                    return true;
+                };
+
                 QString qtLocalPath = QString::fromStdWString((fs::path(m_workingDir) / L"qt_translations.json").wstring());
                 QString fgdLocalPath = QString::fromStdWString((fs::path(m_workingDir) / L"fgd_translations.json").wstring());
                 QString overrideLocalPath = QString::fromStdWString((fs::path(m_workingDir) / L"fgd_override.json").wstring());
 
-                QFile qtFile(qtLocalPath);
-                if (!qtFile.open(QIODevice::WriteOnly | QIODevice::Truncate)) {
-                    appendLog("[-] 写入本地 qt_translations.json 失败！", "#f92672");
-                    QMessageBox::critical(this, "写入失败", "写入本地 qt_translations.json 失败，请检查文件权限。");
+                if (!atomicSave(qtLocalPath, qtData, "qt_translations.json") ||
+                    !atomicSave(fgdLocalPath, fgdData, "fgd_translations.json") ||
+                    !atomicSave(overrideLocalPath, overrideData, "fgd_override.json")) {
+                    QMessageBox::critical(this, "写入失败", "保存或校验更新词典失败，请检查文件写入权限。");
                     setUiBusy(false);
                     m_statusLabel->setText("状态: 写入失败");
                     return;
                 }
-                qtFile.write(qtData);
-                qtFile.close();
 
-                QFile fgdFile(fgdLocalPath);
-                if (!fgdFile.open(QIODevice::WriteOnly | QIODevice::Truncate)) {
-                    appendLog("[-] 写入本地 fgd_translations.json 失败！", "#f92672");
-                    QMessageBox::critical(this, "写入失败", "写入本地 fgd_translations.json 失败，请检查文件权限。");
-                    setUiBusy(false);
-                    m_statusLabel->setText("状态: 写入失败");
-                    return;
-                }
-                fgdFile.write(fgdData);
-                fgdFile.close();
-
-                QFile overrideFile(overrideLocalPath);
-                if (!overrideFile.open(QIODevice::WriteOnly | QIODevice::Truncate)) {
-                    appendLog("[-] 写入本地 fgd_override.json 失败！", "#f92672");
-                    QMessageBox::critical(this, "写入失败", "写入本地 fgd_override.json 失败，请检查文件权限。");
-                    setUiBusy(false);
-                    m_statusLabel->setText("状态: 写入失败");
-                    return;
-                }
-                overrideFile.write(overrideData);
-                overrideFile.close();
-
-                appendLog(QString("[SUCCESS] 翻译词典更新成功！(界面: %1, 实体: %2, 覆盖: %3)").arg(qtCount).arg(fgdCount).arg(overrideCount), "#a6e22e");
+                appendLog(QString("[SUCCESS] 翻译词典原子更新成功！(界面: %1, 实体: %2, 覆盖: %3)").arg(qtCount).arg(fgdCount).arg(overrideCount), "#a6e22e");
                 m_statusLabel->setText("状态: 在线词典更新成功");
                 setUiBusy(false);
 

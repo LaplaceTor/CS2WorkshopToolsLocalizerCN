@@ -78,6 +78,9 @@ static std::unordered_map<std::wstring, std::unordered_map<std::string, std::str
 static std::unordered_map<std::wstring, std::unordered_map<std::string, std::string>> g_ScopedCaches;
 static std::mutex g_DictMutex;
 static std::once_flag g_dictInitFlag;
+static std::atomic<bool> g_bDictLoaded{false};
+static std::atomic<bool> g_bTranslatorInitialized{false};
+static std::mutex g_TranslatorInitMutex;
 
 // ==============================================================================
 // 预扫描调用者模块地址区间表（0 锁、0 系统 API、无锁极速判断）
@@ -390,9 +393,13 @@ static void LoadMasterTranslations() {
 }
 
 static void EnsureDictionaryLoaded() {
+    if (g_bDictLoaded.load(std::memory_order_acquire)) {
+        return;
+    }
     std::call_once(g_dictInitFlag, [] {
         ScanKnownToolModules();
         LoadMasterTranslations();
+        g_bDictLoaded.store(true, std::memory_order_release);
     });
 }
 
@@ -579,7 +586,11 @@ static bool MatchAndTranslateInternal(const std::unordered_map<std::string, std:
 // 核心多级分层翻译查找函数（基于 Caller Address 精准隔离）
 static bool FindTranslationScoped(void* callerAddr, const char* text, std::string& outResult) {
     if (!text || text[0] == '\0') return false;
-    EnsureDictionaryLoaded();
+
+    // 若字典尚未由后台 Worker 线程加载完毕，绝不在此同步阻塞业务线程，直接返回 false
+    if (!g_bDictLoaded.load(std::memory_order_acquire)) {
+        return false;
+    }
 
     std::string textStr(text);
 
@@ -712,14 +723,16 @@ static inline void SafeDestroyQString(fnQString_dtor pfn, void* pQString) {
 
 extern "C" __declspec(dllexport) bool InitializeTranslator();
 static inline void EnsureInitialized() {
-    InitializeTranslator();
+    if (!g_bTranslatorInitialized.load(std::memory_order_acquire)) {
+        InitializeTranslator();
+    }
 }
 
 // 1. QMetaObject::tr (导出作为 EAT 延迟引导入口)
 extern "C" __declspec(dllexport) void* __fastcall hk_QMetaObject_tr(const void* pMetaObject, void* pOutQString, const char* sourceText, const char* disambiguation, int n) {
     void* caller = _ReturnAddress();
     EnsureInitialized();
-    if (sourceText && g_pfn_fromUtf8 && pOutQString) {
+    if (sourceText && g_pfn_fromUtf8 && pOutQString && g_bDictLoaded.load(std::memory_order_acquire)) {
         std::string trans;
         if (FindTranslationScoped(caller, sourceText, trans)) {
             LogVerboseTr("[TR] '%s' -> '%s'", sourceText, trans.c_str());
@@ -1219,10 +1232,15 @@ static void ProcessCrashReportAsync() {
                 } exInfo;
                 exInfo.ThreadId = g_CrashSnapshot.threadId;
                 exInfo.ExceptionPointers = &ep;
-                exInfo.ClientPointers = FALSE;
-                pDump(GetCurrentProcess(), GetCurrentProcessId(), hFile, 2 /* MiniDumpWithFullMemory */, &exInfo, NULL, NULL);
+                // 默认生成轻量级 MiniDumpNormal (0x00000000)，开发模式通过环境变量 CS2_TRANSLATOR_FULL_DUMP=1 开启 FullMemory
+                int dumpType = 0; // MiniDumpNormal
+                wchar_t envBuf[16] = {0};
+                if (GetEnvironmentVariableW(L"CS2_TRANSLATOR_FULL_DUMP", envBuf, 16) > 0 && envBuf[0] == L'1') {
+                    dumpType = 2; // MiniDumpWithFullMemory
+                }
+                pDump(GetCurrentProcess(), GetCurrentProcessId(), hFile, dumpType, &exInfo, NULL, NULL);
                 CloseHandle(hFile);
-                LogHook("[DUMP] Full minidump saved to: captured_crash.dmp");
+                LogHook("[DUMP] %s minidump saved to: captured_crash.dmp", (dumpType == 2 ? "Full" : "Standard"));
             }
         }
     }
@@ -1342,9 +1360,6 @@ static LONG WINAPI DiagnosticCrashLoggerVEH(PEXCEPTION_POINTERS pExceptionInfo) 
     // 允许异常在宿主进程中继续正常传播
     return EXCEPTION_CONTINUE_SEARCH;
 }
-
-static std::atomic<bool> g_bTranslatorInitialized{false};
-static std::mutex g_TranslatorInitMutex;
 
 extern "C" __declspec(dllexport) bool InitializeTranslator() {
     if (g_bTranslatorInitialized.load(std::memory_order_acquire)) {

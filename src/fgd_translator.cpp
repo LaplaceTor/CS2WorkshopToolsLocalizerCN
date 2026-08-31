@@ -1,4 +1,5 @@
 #include "fgd_translator.h"
+#include "dictionary_compiler.h"
 #include <windows.h>
 #include <fstream>
 #include <sstream>
@@ -6,268 +7,41 @@
 #include <filesystem>
 #include <iostream>
 #include <memory>
+#include <QJsonDocument>
+#include <QJsonObject>
+#include <QJsonValue>
+#include <QJsonParseError>
+#include <QFile>
+#include <QSaveFile>
+#include <QString>
 
 namespace fs = std::filesystem;
 
 // ==============================================================================
-// 轻量级 JSON / JSONC 解析器
-// 支持 // 单行注释、/* ... */ 块注释、转义字符以及嵌套 Object / Array
-// ==============================================================================
-namespace {
-
-enum class JsonType {
-    Null,
-    Bool,
-    Number,
-    String,
-    Array,
-    Object
-};
-
-struct JsonValue {
-    JsonType type = JsonType::Null;
-    std::string str;
-    std::vector<JsonValue> arr;
-    std::unordered_map<std::string, JsonValue> obj;
-
-    bool isString() const { return type == JsonType::String; }
-    bool isObject() const { return type == JsonType::Object; }
-    bool isArray() const { return type == JsonType::Array; }
-    bool isNull() const { return type == JsonType::Null; }
-};
-
-class JsoncParser {
-public:
-    JsoncParser(const char* data, size_t length)
-        : p(data), end(data + length)
-    {
-        // 跳过 UTF-8 BOM
-        if (length >= 3 && (unsigned char)p[0] == 0xEF && (unsigned char)p[1] == 0xBB && (unsigned char)p[2] == 0xBF) {
-            p += 3;
-        }
-    }
-
-    bool parse(JsonValue& root) {
-        skipWhitespaceAndComments();
-        if (p >= end) return false;
-        return parseValue(root);
-    }
-
-private:
-    const char* p;
-    const char* end;
-
-    void skipWhitespaceAndComments() {
-        while (p < end) {
-            if (*p == ' ' || *p == '\t' || *p == '\r' || *p == '\n' || *p == ',') {
-                p++;
-            } else if (*p == '/' && (p + 1 < end)) {
-                if (*(p + 1) == '/') {
-                    p += 2;
-                    while (p < end && *p != '\n' && *p != '\r') {
-                        p++;
-                    }
-                } else if (*(p + 1) == '*') {
-                    p += 2;
-                    while (p + 1 < end && !(*p == '*' && *(p + 1) == '/')) {
-                        p++;
-                    }
-                    if (p + 1 < end) {
-                        p += 2;
-                    } else {
-                        p = end;
-                    }
-                } else {
-                    break;
-                }
-            } else {
-                break;
-            }
-        }
-    }
-
-    bool parseString(std::string& outStr) {
-        if (p >= end || *p != '"') return false;
-        p++;
-        outStr.clear();
-        outStr.reserve(64);
-
-        while (p < end) {
-            char c = *p++;
-            if (c == '"') return true;
-            if (c == '\\') {
-                if (p >= end) return false;
-                char esc = *p++;
-                switch (esc) {
-                    case '"':  outStr.push_back('"'); break;
-                    case '\\': outStr.push_back('\\'); break;
-                    case '/':  outStr.push_back('/'); break;
-                    case 'b':  outStr.push_back('\b'); break;
-                    case 'f':  outStr.push_back('\f'); break;
-                    case 'n':  outStr.push_back('\n'); break;
-                    case 'r':  outStr.push_back('\r'); break;
-                    case 't':  outStr.push_back('\t'); break;
-                    case 'u': {
-                        if (p + 4 > end) return false;
-                        unsigned int codepoint = 0;
-                        for (int i = 0; i < 4; i++) {
-                            char h = *p++;
-                            codepoint <<= 4;
-                            if (h >= '0' && h <= '9') codepoint |= (h - '0');
-                            else if (h >= 'a' && h <= 'f') codepoint |= (h - 'a' + 10);
-                            else if (h >= 'A' && h <= 'F') codepoint |= (h - 'A' + 10);
-                            else return false;
-                        }
-                        if (codepoint <= 0x7F) {
-                            outStr.push_back((char)codepoint);
-                        } else if (codepoint <= 0x7FF) {
-                            outStr.push_back((char)(0xC0 | ((codepoint >> 6) & 0x1F)));
-                            outStr.push_back((char)(0x80 | (codepoint & 0x3F)));
-                        } else if (codepoint <= 0xFFFF) {
-                            outStr.push_back((char)(0xE0 | ((codepoint >> 12) & 0x0F)));
-                            outStr.push_back((char)(0x80 | ((codepoint >> 6) & 0x3F)));
-                            outStr.push_back((char)(0x80 | (codepoint & 0x3F)));
-                        }
-                        break;
-                    }
-                    default:
-                        outStr.push_back(esc);
-                        break;
-                }
-            } else {
-                outStr.push_back(c);
-            }
-        }
-        return false;
-    }
-
-    bool parseObject(JsonValue& val) {
-        if (p >= end || *p != '{') return false;
-        p++;
-        val.type = JsonType::Object;
-        val.obj.clear();
-
-        while (p < end) {
-            skipWhitespaceAndComments();
-            if (p >= end) return false;
-            if (*p == '}') {
-                p++;
-                return true;
-            }
-
-            std::string key;
-            if (!parseString(key)) return false;
-
-            skipWhitespaceAndComments();
-            if (p >= end || *p != ':') return false;
-            p++;
-
-            skipWhitespaceAndComments();
-            JsonValue child;
-            if (!parseValue(child)) return false;
-
-            val.obj[key] = std::move(child);
-        }
-        return false;
-    }
-
-    bool parseArray(JsonValue& val) {
-        if (p >= end || *p != '[') return false;
-        p++;
-        val.type = JsonType::Array;
-        val.arr.clear();
-
-        while (p < end) {
-            skipWhitespaceAndComments();
-            if (p >= end) return false;
-            if (*p == ']') {
-                p++;
-                return true;
-            }
-
-            JsonValue item;
-            if (!parseValue(item)) return false;
-            val.arr.push_back(std::move(item));
-        }
-        return false;
-    }
-
-    bool parseValue(JsonValue& val) {
-        skipWhitespaceAndComments();
-        if (p >= end) return false;
-
-        if (*p == '{') {
-            return parseObject(val);
-        } else if (*p == '[') {
-            return parseArray(val);
-        } else if (*p == '"') {
-            val.type = JsonType::String;
-            return parseString(val.str);
-        } else if (*p == 't' || *p == 'f') {
-            // boolean
-            if (p + 4 <= end && memcmp(p, "true", 4) == 0) {
-                p += 4;
-                val.type = JsonType::Bool;
-                val.str = "true";
-                return true;
-            } else if (p + 5 <= end && memcmp(p, "false", 5) == 0) {
-                p += 5;
-                val.type = JsonType::Bool;
-                val.str = "false";
-                return true;
-            }
-            return false;
-        } else if (*p == 'n' && p + 4 <= end && memcmp(p, "null", 4) == 0) {
-            p += 4;
-            val.type = JsonType::Null;
-            return true;
-        } else if (*p == '-' || (*p >= '0' && *p <= '9')) {
-            // number
-            val.type = JsonType::Number;
-            val.str.clear();
-            while (p < end && (*p == '-' || *p == '+' || *p == '.' || *p == 'e' || *p == 'E' || (*p >= '0' && *p <= '9'))) {
-                val.str.push_back(*p++);
-            }
-            return true;
-        }
-        return false;
-    }
-};
-
-} // anonymous namespace
-
-// ==============================================================================
-// 字典加载与解析
+// 字典加载与解析（使用 Qt 原生 QJsonDocument 解析）
 // ==============================================================================
 
 bool FgdTranslator::LoadDictionary(const std::wstring& jsonPath, std::unordered_map<std::string, std::string>& outDict) {
     outDict.clear();
-    FILE* fp = _wfopen(jsonPath.c_str(), L"rb");
-    if (!fp) return false;
+    QFile file(QString::fromStdWString(jsonPath));
+    if (!file.open(QIODevice::ReadOnly)) return false;
+    QByteArray rawData = file.readAll();
+    file.close();
 
-    fseek(fp, 0, SEEK_END);
-    long fsize = ftell(fp);
-    fseek(fp, 0, SEEK_SET);
-
-    if (fsize <= 0) {
-        fclose(fp);
+    std::string clean = DictionaryCompiler::StripJsonComments(rawData.constData(), rawData.size());
+    QJsonParseError err;
+    QJsonDocument doc = QJsonDocument::fromJson(QByteArray::fromRawData(clean.c_str(), clean.size()), &err);
+    if (err.error != QJsonParseError::NoError || !doc.isObject()) {
         return false;
     }
 
-    std::vector<char> buffer(fsize + 1, 0);
-    fread(buffer.data(), 1, fsize, fp);
-    fclose(fp);
-
-    JsonValue root;
-    JsoncParser parser(buffer.data(), fsize);
-    if (!parser.parse(root) || !root.isObject()) {
-        return false;
-    }
-
-    outDict.reserve(root.obj.size());
-    for (const auto& kv : root.obj) {
-        if (kv.second.isString() && !kv.second.str.empty()) {
-            outDict[kv.first] = kv.second.str;
+    QJsonObject obj = doc.object();
+    for (auto it = obj.begin(); it != obj.end(); ++it) {
+        if (it.value().isString()) {
+            QString val = it.value().toString();
+            if (!val.isEmpty()) {
+                outDict[it.key().toStdString()] = val.toStdString();
+            }
         }
     }
 
@@ -276,119 +50,106 @@ bool FgdTranslator::LoadDictionary(const std::wstring& jsonPath, std::unordered_
 
 bool FgdTranslator::LoadOverrideDictionary(const std::wstring& jsonPath, FgdOverrideData& outOverride) {
     outOverride = FgdOverrideData();
-    FILE* fp = _wfopen(jsonPath.c_str(), L"rb");
-    if (!fp) return false;
+    QFile file(QString::fromStdWString(jsonPath));
+    if (!file.open(QIODevice::ReadOnly)) return false;
+    QByteArray rawData = file.readAll();
+    file.close();
 
-    fseek(fp, 0, SEEK_END);
-    long fsize = ftell(fp);
-    fseek(fp, 0, SEEK_SET);
-
-    if (fsize <= 0) {
-        fclose(fp);
+    std::string clean = DictionaryCompiler::StripJsonComments(rawData.constData(), rawData.size());
+    QJsonParseError err;
+    QJsonDocument doc = QJsonDocument::fromJson(QByteArray::fromRawData(clean.c_str(), clean.size()), &err);
+    if (err.error != QJsonParseError::NoError || !doc.isObject()) {
         return false;
     }
 
-    std::vector<char> buffer(fsize + 1, 0);
-    fread(buffer.data(), 1, fsize, fp);
-    fclose(fp);
+    QJsonObject root = doc.object();
 
-    JsonValue root;
-    JsoncParser parser(buffer.data(), fsize);
-    if (!parser.parse(root) || !root.isObject()) {
-        return false;
-    }
-
-    auto parsePropOverride = [](const JsonValue& val, FgdPropertyOverride& propOut) {
+    auto parsePropOverride = [](const QJsonValue& val, FgdPropertyOverride& propOut) {
         if (val.isString()) {
-            propOut.description = val.str;
+            propOut.description = val.toString().toStdString();
         } else if (val.isObject()) {
-            auto itDesc = val.obj.find("description");
-            if (itDesc != val.obj.end() && itDesc->second.isString()) {
-                propOut.description = itDesc->second.str;
+            QJsonObject o = val.toObject();
+            if (o.contains("description") && o["description"].isString()) {
+                propOut.description = o["description"].toString().toStdString();
             }
-            auto itDisplay = val.obj.find("displayName");
-            if (itDisplay != val.obj.end() && itDisplay->second.isString()) {
-                propOut.displayName = itDisplay->second.str;
+            if (o.contains("displayName") && o["displayName"].isString()) {
+                propOut.displayName = o["displayName"].toString().toStdString();
             }
         }
     };
 
-    for (const auto& kv : root.obj) {
-        const std::string& key = kv.first;
-        const JsonValue& val = kv.second;
+    for (auto it = root.begin(); it != root.end(); ++it) {
+        QString key = it.key();
+        const QJsonValue& val = it.value();
 
         if (key == "properties" && val.isObject()) {
-            // 1. 全局属性
-            for (const auto& pkv : val.obj) {
+            QJsonObject pObj = val.toObject();
+            for (auto pit = pObj.begin(); pit != pObj.end(); ++pit) {
                 FgdPropertyOverride prop;
-                parsePropOverride(pkv.second, prop);
+                parsePropOverride(pit.value(), prop);
                 if (!prop.description.empty() || !prop.displayName.empty()) {
-                    outOverride.globalProperties[pkv.first] = std::move(prop);
+                    outOverride.globalProperties[pit.key().toStdString()] = std::move(prop);
                 }
             }
         } else if (key == "io" && val.isObject()) {
-            // 2. I/O
-            for (const auto& iokv : val.obj) {
-                if (iokv.second.isString()) {
-                    outOverride.ioOverrides[iokv.first] = iokv.second.str;
-                } else if (iokv.second.isObject()) {
-                    auto itDesc = iokv.second.obj.find("description");
-                    if (itDesc != iokv.second.obj.end() && itDesc->second.isString()) {
-                        outOverride.ioOverrides[iokv.first] = itDesc->second.str;
+            QJsonObject ioObj = val.toObject();
+            for (auto ioit = ioObj.begin(); ioit != ioObj.end(); ++ioit) {
+                if (ioit.value().isString()) {
+                    outOverride.ioOverrides[ioit.key().toStdString()] = ioit.value().toString().toStdString();
+                } else if (ioit.value().isObject()) {
+                    QJsonObject o = ioit.value().toObject();
+                    if (o.contains("description") && o["description"].isString()) {
+                        outOverride.ioOverrides[ioit.key().toStdString()] = o["description"].toString().toStdString();
                     }
                 }
             }
         } else if (key == "classes" && val.isObject()) {
-            // 3. 类说明与类作用域特定属性
-            for (const auto& ckv : val.obj) {
-                const std::string& clsName = ckv.first;
-                if (ckv.second.isString()) {
-                    outOverride.classDescriptions[clsName] = ckv.second.str;
-                } else if (ckv.second.isObject()) {
-                    auto itDesc = ckv.second.obj.find("description");
-                    if (itDesc != ckv.second.obj.end() && itDesc->second.isString()) {
-                        outOverride.classDescriptions[clsName] = itDesc->second.str;
+            QJsonObject cObj = val.toObject();
+            for (auto cit = cObj.begin(); cit != cObj.end(); ++cit) {
+                std::string clsName = cit.key().toStdString();
+                if (cit.value().isString()) {
+                    outOverride.classDescriptions[clsName] = cit.value().toString().toStdString();
+                } else if (cit.value().isObject()) {
+                    QJsonObject o = cit.value().toObject();
+                    if (o.contains("description") && o["description"].isString()) {
+                        outOverride.classDescriptions[clsName] = o["description"].toString().toStdString();
                     }
-                    auto itProps = ckv.second.obj.find("properties");
-                    if (itProps != ckv.second.obj.end() && itProps->second.isObject()) {
-                        for (const auto& pkv : itProps->second.obj) {
+                    if (o.contains("properties") && o["properties"].isObject()) {
+                        QJsonObject cpObj = o["properties"].toObject();
+                        for (auto cpit = cpObj.begin(); cpit != cpObj.end(); ++cpit) {
                             FgdPropertyOverride prop;
-                            parsePropOverride(pkv.second, prop);
+                            parsePropOverride(cpit.value(), prop);
                             if (!prop.description.empty() || !prop.displayName.empty()) {
-                                outOverride.classProperties[clsName][pkv.first] = std::move(prop);
+                                outOverride.classProperties[clsName][cpit.key().toStdString()] = std::move(prop);
                             }
                         }
                     }
                 }
             }
-        } else if (key.rfind("_", 0) != 0) {
-            // 4. 顶层平铺直接定义
+        } else if (!key.startsWith("_")) {
             if (val.isString()) {
                 FgdPropertyOverride prop;
-                prop.description = val.str;
-                outOverride.globalProperties[key] = std::move(prop);
+                prop.description = val.toString().toStdString();
+                outOverride.globalProperties[key.toStdString()] = std::move(prop);
             } else if (val.isObject()) {
-                if (val.obj.find("properties") != val.obj.end()) {
-                    // 作为类定义解析
-                    auto itDesc = val.obj.find("description");
-                    if (itDesc != val.obj.end() && itDesc->second.isString()) {
-                        outOverride.classDescriptions[key] = itDesc->second.str;
+                QJsonObject o = val.toObject();
+                if (o.contains("properties") && o["properties"].isObject()) {
+                    if (o.contains("description") && o["description"].isString()) {
+                        outOverride.classDescriptions[key.toStdString()] = o["description"].toString().toStdString();
                     }
-                    auto itProps = val.obj.find("properties");
-                    if (itProps != val.obj.end() && itProps->second.isObject()) {
-                        for (const auto& pkv : itProps->second.obj) {
-                            FgdPropertyOverride prop;
-                            parsePropOverride(pkv.second, prop);
-                            if (!prop.description.empty() || !prop.displayName.empty()) {
-                                outOverride.classProperties[key][pkv.first] = std::move(prop);
-                            }
+                    QJsonObject cpObj = o["properties"].toObject();
+                    for (auto cpit = cpObj.begin(); cpit != cpObj.end(); ++cpit) {
+                        FgdPropertyOverride prop;
+                        parsePropOverride(cpit.value(), prop);
+                        if (!prop.description.empty() || !prop.displayName.empty()) {
+                            outOverride.classProperties[key.toStdString()][cpit.key().toStdString()] = std::move(prop);
                         }
                     }
                 } else {
                     FgdPropertyOverride prop;
                     parsePropOverride(val, prop);
                     if (!prop.description.empty() || !prop.displayName.empty()) {
-                        outOverride.globalProperties[key] = std::move(prop);
+                        outOverride.globalProperties[key.toStdString()] = std::move(prop);
                     }
                 }
             }

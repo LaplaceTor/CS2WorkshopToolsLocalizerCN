@@ -1,61 +1,35 @@
 #include "backup_manager.h"
 #include "pe_patcher.h"
 #include <windows.h>
-#include <wincrypt.h>
 #include <winver.h>
 #include <filesystem>
 #include <fstream>
 #include <sstream>
-#include <iomanip>
 #include <thread>
 #include <chrono>
-#include <ctime>
 #include <system_error>
 #include <QJsonDocument>
 #include <QJsonObject>
 #include <QJsonParseError>
 #include <QFile>
+#include <QSaveFile>
+#include <QCryptographicHash>
+#include <QDateTime>
 #include <QByteArray>
 #include <QString>
 
 namespace fs = std::filesystem;
 
 std::string BackupManager::ComputeFileSha256(const std::wstring& filePath) {
-    HANDLE hFile = CreateFileW(filePath.c_str(), GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
-    if (hFile == INVALID_HANDLE_VALUE) return "";
-
-    HCRYPTPROV hProv = 0;
-    HCRYPTHASH hHash = 0;
-    std::string result;
-
-    if (CryptAcquireContext(&hProv, NULL, NULL, PROV_RSA_AES, CRYPT_VERIFYCONTEXT)) {
-        if (CryptCreateHash(hProv, CALG_SHA_256, 0, 0, &hHash)) {
-            BYTE buffer[16384];
-            DWORD bytesRead = 0;
-            BOOL success = TRUE;
-            while (ReadFile(hFile, buffer, sizeof(buffer), &bytesRead, NULL) && bytesRead > 0) {
-                if (!CryptHashData(hHash, buffer, bytesRead, 0)) {
-                    success = FALSE;
-                    break;
-                }
-            }
-            if (success) {
-                BYTE hashBytes[32];
-                DWORD hashLen = sizeof(hashBytes);
-                if (CryptGetHashParam(hHash, HP_HASHVAL, hashBytes, &hashLen, 0)) {
-                    std::ostringstream oss;
-                    for (DWORD i = 0; i < hashLen; ++i) {
-                        oss << std::hex << std::setw(2) << std::setfill('0') << (int)hashBytes[i];
-                    }
-                    result = oss.str();
-                }
-            }
-            CryptDestroyHash(hHash);
-        }
-        CryptReleaseContext(hProv, 0);
+    QFile file(QString::fromStdWString(filePath));
+    if (!file.open(QIODevice::ReadOnly)) {
+        return "";
     }
-    CloseHandle(hFile);
-    return result;
+    QCryptographicHash hash(QCryptographicHash::Sha256);
+    if (!hash.addData(&file)) {
+        return "";
+    }
+    return hash.result().toHex().toStdString();
 }
 
 std::string BackupManager::GetFileProductVersion(const std::wstring& filePath) {
@@ -206,15 +180,26 @@ bool BackupManager::WriteBackupManifest(const std::wstring& backupDir, const Gam
         root["qt5widgets_sha256"] = QString::fromStdString(sig.qt5WidgetsSha256);
 
         QJsonDocument doc(root);
-        QFile file(QString::fromStdWString(manifestPath.wstring()));
-        if (!file.open(QIODevice::WriteOnly | QIODevice::Truncate)) {
-            outError = L"无法创建并写入 backup_manifest.json: " + file.errorString().toStdWString();
+        QByteArray jsonBytes = doc.toJson(QJsonDocument::Indented);
+
+        // 使用 Qt QSaveFile 进行原生原子写入与事务提交
+        QSaveFile saveFile(QString::fromStdWString(manifestPath.wstring()));
+        if (!saveFile.open(QIODevice::WriteOnly)) {
+            outError = L"无法创建 backup_manifest.json: " + saveFile.errorString().toStdWString();
             return false;
         }
 
-        file.write(doc.toJson(QJsonDocument::Indented));
-        file.flush();
-        file.close();
+        if (saveFile.write(jsonBytes) != jsonBytes.size()) {
+            saveFile.cancelWriting();
+            outError = L"写入 backup_manifest.json 数据不完整";
+            return false;
+        }
+
+        if (!saveFile.commit()) {
+            outError = L"提交保存 backup_manifest.json 失败: " + saveFile.errorString().toStdWString();
+            return false;
+        }
+
         return true;
     } catch (const std::exception& e) {
         outError = L"写入备份元数据异常: " + std::wstring(e.what(), e.what() + strlen(e.what()));
@@ -224,9 +209,9 @@ bool BackupManager::WriteBackupManifest(const std::wstring& backupDir, const Gam
 
 BackupValidationResult BackupManager::BackupMatchesCurrentGame(const std::wstring& cs2Root, const std::wstring& backupDir) {
     BackupValidationResult res;
+    res.status = BackupMatchStatus::NoBackup;
 
     if (!HasBackup(backupDir)) {
-        res.status = BackupMatchStatus::NoBackup;
         res.reason = L"尚未创建任何原版备份。";
         return res;
     }
@@ -314,7 +299,8 @@ BackupValidationResult BackupManager::BackupMatchesCurrentGame(const std::wstrin
 }
 
 bool BackupManager::CreateOrUpdateBackup(const std::wstring& cs2Root, const std::wstring& backupDir, std::vector<std::wstring>& outBackedUpFiles, std::wstring& outError, bool forceRecreate) {
-    fs::path manifestPath = fs::path(backupDir) / L"backup_manifest.json";
+    fs::path targetBackupPath(backupDir);
+    fs::path manifestPath = targetBackupPath / L"backup_manifest.json";
 
     // 核心安全防线 1：如果不是显式 forceRecreate，且有效备份与 manifest 已存在，绝不重复更新 manifest！
     if (!forceRecreate && HasBackup(backupDir) && fs::exists(manifestPath)) {
@@ -325,53 +311,81 @@ bool BackupManager::CreateOrUpdateBackup(const std::wstring& cs2Root, const std:
         }
     }
 
-    if (forceRecreate) {
-        std::error_code ec;
-        fs::remove_all(backupDir, ec);
-    }
+    // 事务式重建：先在 staging 临时目录完成完整备份与校验，成功后再原子替换旧备份
+    fs::path stagingPath = targetBackupPath.parent_path() / (targetBackupPath.filename().wstring() + L".staging");
+    fs::path oldBackupPath = targetBackupPath.parent_path() / (targetBackupPath.filename().wstring() + L".old");
 
-    if (!BackupFgdFiles(cs2Root, backupDir, outBackedUpFiles, outError)) {
+    std::error_code ec;
+    fs::remove_all(stagingPath, ec);
+    fs::remove_all(oldBackupPath, ec);
+
+    std::vector<std::wstring> stagedFiles;
+    if (!BackupFgdFiles(cs2Root, stagingPath.wstring(), stagedFiles, outError)) {
+        fs::remove_all(stagingPath, ec);
         return false;
     }
 
-    if (!BackupQtCore(cs2Root, backupDir, outError)) {
+    if (!BackupQtCore(cs2Root, stagingPath.wstring(), outError)) {
+        fs::remove_all(stagingPath, ec);
         return false;
     }
 
-    fs::path backupQtCore = fs::path(backupDir) / L"game" / L"bin" / L"win64" / L"Qt5Core.dll";
+    fs::path backupQtCore = stagingPath / L"game" / L"bin" / L"win64" / L"Qt5Core.dll";
     if (!fs::exists(backupQtCore)) {
-        outError = L"备份目标目录未找到 Qt5Core.dll";
+        fs::remove_all(stagingPath, ec);
+        outError = L"备份临时目录未找到 Qt5Core.dll";
         return false;
     }
 
-    // 核心安全防线 2：严格验证备份目录中的 Qt5Core.dll 绝不能是 patched 的！
+    // 严格验证备份目录中的 Qt5Core.dll 绝不能是 patched 的！
     PatchInfo patchInfo;
     std::wstring pErr;
     if (PePatcher::GetPatchInfo(backupQtCore.wstring(), patchInfo, pErr) && patchInfo.isPatched) {
+        fs::remove_all(stagingPath, ec);
         outError = L"备份的 Qt5Core.dll 包含 LCLZ 补丁标记，严禁用 patched 文件生成 manifest！";
         return false;
     }
 
     GameVersionSignature sig;
     if (!GetCurrentGameSignature(cs2Root, sig, outError)) {
+        fs::remove_all(stagingPath, ec);
         return false;
     }
 
-    // 核心安全防线 3：必须使用备份中经由验证的纯净原版 Qt5Core.dll 的哈希写入清单，绝不用当前可能已被修补的游戏文件哈希！
     sig.qt5CoreSha256 = ComputeFileSha256(backupQtCore.wstring());
 
-    // 记录备份时间戳
-    auto now = std::chrono::system_clock::now();
-    std::time_t nowTime = std::chrono::system_clock::to_time_t(now);
-    sig.timestampEpoch = static_cast<int64_t>(nowTime);
+    // 使用 Qt QDateTime 进行标准 UTC 时间与时间戳生成
+    QDateTime now = QDateTime::currentDateTimeUtc();
+    sig.timestampEpoch = now.toSecsSinceEpoch();
+    sig.backupTimestamp = now.toString(Qt::ISODate).toStdString();
 
-    std::tm tmBuf;
-    gmtime_s(&tmBuf, &nowTime);
-    char timeStr[64];
-    std::strftime(timeStr, sizeof(timeStr), "%Y-%m-%dT%H:%M:%SZ", &tmBuf);
-    sig.backupTimestamp = timeStr;
+    if (!WriteBackupManifest(stagingPath.wstring(), sig, outError)) {
+        fs::remove_all(stagingPath, ec);
+        return false;
+    }
 
-    return WriteBackupManifest(backupDir, sig, outError);
+    // 事务提交：staging 备份完整成功，原子替换 old backup
+    if (fs::exists(targetBackupPath)) {
+        fs::rename(targetBackupPath, oldBackupPath, ec);
+        if (ec) {
+            fs::remove_all(targetBackupPath, ec);
+        }
+    }
+
+    fs::rename(stagingPath, targetBackupPath, ec);
+    if (ec) {
+        if (fs::exists(oldBackupPath)) {
+            fs::rename(oldBackupPath, targetBackupPath, ec);
+        }
+        fs::remove_all(stagingPath, ec);
+        outError = L"事务提交失败：无法将 staging 目录重命名为备份目录";
+        return false;
+    }
+
+    // 成功后清理 old 目录
+    fs::remove_all(oldBackupPath, ec);
+    outBackedUpFiles = stagedFiles;
+    return true;
 }
 
 bool BackupManager::BackupFgdFiles(const std::wstring& cs2Root, const std::wstring& backupDir, std::vector<std::wstring>& outBackedUpFiles, std::wstring& outError) {
