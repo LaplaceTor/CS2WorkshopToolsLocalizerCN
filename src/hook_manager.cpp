@@ -38,12 +38,13 @@ bool HookManager::InstallHook(void* pTarget, void* pDetour, void** ppOriginal, c
         return false;
     }
 
-    std::lock_guard<std::mutex> lock(m_mutex);
     if (!m_bInitialized.load()) {
         if (!Initialize(nullptr)) {
             return false;
         }
     }
+
+    std::lock_guard<std::mutex> lock(m_mutex);
 
     MH_STATUS createStatus = MH_CreateHook(pTarget, pDetour, ppOriginal);
     if (createStatus != MH_OK && createStatus != MH_ERROR_ALREADY_CREATED) {
@@ -52,6 +53,10 @@ bool HookManager::InstallHook(void* pTarget, void* pDetour, void** ppOriginal, c
 
     MH_STATUS enableStatus = MH_EnableHook(pTarget);
     if (enableStatus != MH_OK && enableStatus != MH_ERROR_ENABLED) {
+        MH_RemoveHook(pTarget);
+        if (ppOriginal) {
+            *ppOriginal = nullptr;
+        }
         return false;
     }
 

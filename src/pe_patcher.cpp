@@ -63,13 +63,15 @@ std::optional<size_t> PePatcher::RvaToFileOffset(
 
     for (WORD i = 0; i < numSections; ++i) {
         const auto& sec = sections[i];
-        DWORD secVa = sec.VirtualAddress;
-        DWORD secRawSize = sec.SizeOfRawData;
-        DWORD secVirtSize = sec.Misc.VirtualSize;
-        DWORD secSpan = (std::max)(secRawSize, secVirtSize);
+        uint64_t secBegin = sec.VirtualAddress;
+        uint64_t secRawSize = sec.SizeOfRawData;
+        uint64_t secVirtSize = sec.Misc.VirtualSize;
+        uint64_t secSpan = (std::max)(secRawSize, secVirtSize);
+        uint64_t secEnd = secBegin + secSpan;
+        uint64_t rva64 = rva;
 
-        if (rva >= secVa && rva < secVa + secSpan) {
-            DWORD offsetInSec = rva - secVa;
+        if (rva64 >= secBegin && rva64 < secEnd) {
+            uint64_t offsetInSec = rva64 - secBegin;
             // 确保请求的偏移与长度完整落在文件的物理 raw data 范围内
             if (offsetInSec >= secRawSize) {
                 return std::nullopt;
@@ -77,11 +79,11 @@ std::optional<size_t> PePatcher::RvaToFileOffset(
             if (requiredSize > secRawSize - offsetInSec) {
                 return std::nullopt;
             }
-            size_t fileOffset = static_cast<size_t>(sec.PointerToRawData) + offsetInSec;
+            uint64_t fileOffset = static_cast<uint64_t>(sec.PointerToRawData) + offsetInSec;
             if (fileOffset > fileSize || requiredSize > fileSize - fileOffset) {
                 return std::nullopt;
             }
-            return fileOffset;
+            return static_cast<size_t>(fileOffset);
         }
     }
 
@@ -125,7 +127,7 @@ bool PePatcher::PatchQtCore(const std::wstring& srcDllPath, const std::wstring& 
     }
 
     size_t ntHeaderOff = static_cast<size_t>(dosHeader->e_lfanew);
-    if (ntHeaderOff > buffer.size() - sizeof(IMAGE_NT_HEADERS64)) {
+    if (!reader.InBounds(ntHeaderOff, sizeof(IMAGE_NT_HEADERS64))) {
         outError = L"NT 头部偏移超出文件边界";
         return false;
     }
@@ -198,8 +200,14 @@ bool PePatcher::PatchQtCore(const std::wstring& srcDllPath, const std::wstring& 
 
     DWORD origEntryPointRva = ntHeadersConst->OptionalHeader.AddressOfEntryPoint;
 
-    // 4. Code Cave 起始 RVA 判定
-    DWORD caveRva = (textSec->VirtualAddress + textSec->Misc.VirtualSize + 15) & ~15;
+    // 4. Code Cave 起始 RVA 判定（使用 64 位整型运算防止溢出）
+    uint64_t textSecEndRva64 = static_cast<uint64_t>(textSec->VirtualAddress) + static_cast<uint64_t>(textSec->Misc.VirtualSize);
+    uint64_t caveRva64 = (textSecEndRva64 + 15) & ~15ULL;
+    if (caveRva64 > 0xFFFFFFFFULL) {
+        outError = L"Code Cave RVA 溢出 32 位地址空间";
+        return false;
+    }
+    DWORD caveRva = static_cast<DWORD>(caveRva64);
 
     // 优先通过明确的 LCLZ 补丁元数据头 (PatchHeader) 判定与恢复原始入口点（100% 确定性、零误判）
     bool bFoundLclzMagic = false;
@@ -207,8 +215,8 @@ bool PePatcher::PatchQtCore(const std::wstring& srcDllPath, const std::wstring& 
     if (optCaveHeaderOff) {
         const PatchHeader* pHeader = reader.ReadStruct<PatchHeader>(*optCaveHeaderOff);
         if (pHeader && std::memcmp(pHeader->magic, "LCLZ", 4) == 0 && pHeader->version == 1) {
-            if (pHeader->originalEntryRva >= textSec->VirtualAddress &&
-                pHeader->originalEntryRva < textSec->VirtualAddress + textSec->Misc.VirtualSize) {
+            uint64_t origEntry64 = pHeader->originalEntryRva;
+            if (origEntry64 >= textSec->VirtualAddress && origEntry64 < textSecEndRva64) {
                 origEntryPointRva = pHeader->originalEntryRva;
                 bFoundLclzMagic = true;
             }
@@ -217,17 +225,16 @@ bool PePatcher::PatchQtCore(const std::wstring& srcDllPath, const std::wstring& 
 
     // 兼容历史遗留旧补丁（未写入 LCLZ 头）：仅在入口点位于 .text 尾部且非 LCLZ 时作为兜底解析
     if (!bFoundLclzMagic) {
-        DWORD textSecEndRva = textSec->VirtualAddress + textSec->Misc.VirtualSize;
-        if (origEntryPointRva >= textSecEndRva - 0x1000) {
+        if (textSecEndRva64 >= 0x1000 && origEntryPointRva >= textSecEndRva64 - 0x1000 && origEntryPointRva < textSecEndRva64) {
             auto optEpOff = RvaToFileOffset(ntHeadersConst, origEntryPointRva, buffer.size(), 64);
             if (optEpOff) {
                 size_t epOff = *optEpOff;
                 for (size_t k = 0; k < 64; ++k) {
                     if (buffer[epOff + k] == 0xe9) {
                         int32_t jmpDisp = *reinterpret_cast<const int32_t*>(&buffer[epOff + k + 1]);
-                        DWORD targetRva = static_cast<DWORD>(origEntryPointRva + k + 5 + jmpDisp);
-                        if (targetRva < textSecEndRva && targetRva >= textSec->VirtualAddress) {
-                            origEntryPointRva = targetRva;
+                        int64_t targetRva64 = static_cast<int64_t>(origEntryPointRva) + k + 5 + jmpDisp;
+                        if (targetRva64 >= textSec->VirtualAddress && targetRva64 < static_cast<int64_t>(textSecEndRva64)) {
+                            origEntryPointRva = static_cast<DWORD>(targetRva64);
                             break;
                         }
                     }
@@ -452,7 +459,7 @@ bool PePatcher::GetPatchInfo(const std::wstring& dllPath, PatchInfo& outInfo, st
     }
 
     size_t ntHeaderOff = static_cast<size_t>(dosHeader->e_lfanew);
-    if (ntHeaderOff > buffer.size() - sizeof(IMAGE_NT_HEADERS64)) {
+    if (!reader.InBounds(ntHeaderOff, sizeof(IMAGE_NT_HEADERS64))) {
         outError = L"NT 头部超出文件边界";
         return false;
     }
@@ -492,18 +499,22 @@ bool PePatcher::GetPatchInfo(const std::wstring& dllPath, PatchInfo& outInfo, st
         return false;
     }
 
-    DWORD caveRva = (textSec->VirtualAddress + textSec->Misc.VirtualSize + 15) & ~15;
-    auto optCaveOff = RvaToFileOffset(ntHeaders, caveRva, buffer.size(), sizeof(PatchHeader));
+    uint64_t textSecEndRva64 = static_cast<uint64_t>(textSec->VirtualAddress) + static_cast<uint64_t>(textSec->Misc.VirtualSize);
+    uint64_t caveRva64 = (textSecEndRva64 + 15) & ~15ULL;
+    if (caveRva64 <= 0xFFFFFFFFULL) {
+        DWORD caveRva = static_cast<DWORD>(caveRva64);
+        auto optCaveOff = RvaToFileOffset(ntHeaders, caveRva, buffer.size(), sizeof(PatchHeader));
 
-    if (optCaveOff) {
-        const PatchHeader* pHeader = reader.ReadStruct<PatchHeader>(*optCaveOff);
-        if (pHeader && std::memcmp(pHeader->magic, "LCLZ", 4) == 0) {
-            outInfo.isPatched = true;
-            outInfo.version = pHeader->version;
-            outInfo.originalEntryRva = pHeader->originalEntryRva;
-            outInfo.patchedEntryRva = pHeader->patchedEntryRva;
-            outInfo.payloadSize = pHeader->payloadSize;
-            return true;
+        if (optCaveOff) {
+            const PatchHeader* pHeader = reader.ReadStruct<PatchHeader>(*optCaveOff);
+            if (pHeader && std::memcmp(pHeader->magic, "LCLZ", 4) == 0) {
+                outInfo.isPatched = true;
+                outInfo.version = pHeader->version;
+                outInfo.originalEntryRva = pHeader->originalEntryRva;
+                outInfo.patchedEntryRva = pHeader->patchedEntryRva;
+                outInfo.payloadSize = pHeader->payloadSize;
+                return true;
+            }
         }
     }
 
