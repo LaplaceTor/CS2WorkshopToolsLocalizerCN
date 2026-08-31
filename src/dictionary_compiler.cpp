@@ -220,6 +220,10 @@ private:
             } else {
                 outStr.push_back(c);
             }
+            if (outStr.size() > DictionaryCompiler::MAX_SINGLE_STRING_LENGTH) {
+                outError = L"单字符串长度超出 64KB 安全上限";
+                return false;
+            }
         }
         outError = L"字符串未正常闭合";
         return false;
@@ -246,6 +250,11 @@ private:
 bool DictionaryCompiler::CompileJsonStringToBinary(const std::string& jsonContent, std::vector<uint8_t>& outBinary, std::wstring& outError) {
     if (jsonContent.empty()) {
         outError = L"JSON 文本为空";
+        return false;
+    }
+
+    if (jsonContent.size() > MAX_JSON_FILE_SIZE) {
+        outError = L"JSON 文本大小超出 16MB 安全上限";
         return false;
     }
 
@@ -395,9 +404,9 @@ bool DictionaryCompiler::CompileJsonFileToLcld(const std::wstring& jsonPath, con
     fseek(fp, 0, SEEK_END);
     long fsize = ftell(fp);
     fseek(fp, 0, SEEK_SET);
-    if (fsize <= 0) {
+    if (fsize <= 0 || fsize > static_cast<long>(MAX_JSON_FILE_SIZE)) {
         fclose(fp);
-        outError = L"源 JSON 文件为空";
+        outError = L"源 JSON 文件为空或大小超出 16MB 安全上限";
         return false;
     }
     std::string jsonStr(static_cast<size_t>(fsize), '\0');
@@ -425,7 +434,7 @@ bool DictionaryCompiler::ParseLcldBinaryToMaps(
     std::unordered_map<std::string, std::string>& outCommon,
     std::unordered_map<std::wstring, std::unordered_map<std::string, std::string>>& outScoped) {
 
-    if (!data || size < sizeof(LcldHeader)) return false;
+    if (!data || size < sizeof(LcldHeader) || size > MAX_LCLD_FILE_SIZE) return false;
 
     const LcldHeader* hdr = reinterpret_cast<const LcldHeader*>(data);
     if (std::memcmp(hdr->magic, "LCLD", 4) != 0 || hdr->version != 1) {
@@ -433,7 +442,7 @@ bool DictionaryCompiler::ParseLcldBinaryToMaps(
     }
 
     // 检查合理的 section 和 entry 数量上限，防止畸形数据造成拒绝服务
-    if (hdr->totalSections > 10000 || hdr->totalEntries > 1000000) {
+    if (hdr->totalSections > MAX_TOTAL_SECTIONS || hdr->totalEntries > MAX_TOTAL_ENTRIES) {
         return false;
     }
 
@@ -441,7 +450,7 @@ bool DictionaryCompiler::ParseLcldBinaryToMaps(
     uint64_t stringTableStart = static_cast<uint64_t>(hdr->stringTableOffset);
     uint64_t stringTableSize = static_cast<uint64_t>(hdr->stringTableSize);
     uint64_t stringTableEnd = stringTableStart + stringTableSize;
-    if (stringTableEnd > size || stringTableEnd < stringTableStart) return false;
+    if (stringTableEnd > size || stringTableEnd < stringTableStart || stringTableSize > MAX_LCLD_FILE_SIZE) return false;
 
     const char* strTable = reinterpret_cast<const char*>(data + stringTableStart);
 
@@ -456,13 +465,16 @@ bool DictionaryCompiler::ParseLcldBinaryToMaps(
     outCommon.clear();
     outScoped.clear();
 
-    // 3. 安全提取以 '\0' 结尾的字符串，严格杜绝越界读取
+    // 3. 安全提取以 '\0' 结尾的字符串，严格杜绝越界读取与超长字符串
     auto getSafeString = [&](uint32_t offset) -> const char* {
         if (offset >= stringTableSize) return nullptr;
         size_t maxLen = static_cast<size_t>(stringTableSize - offset);
+        if (maxLen > MAX_SINGLE_STRING_LENGTH + 1) {
+            maxLen = MAX_SINGLE_STRING_LENGTH + 1;
+        }
         const char* p = strTable + offset;
         const char* nullPos = static_cast<const char*>(std::memchr(p, '\0', maxLen));
-        if (!nullPos) return nullptr; // 字符串在 stringTable 剩余范围内没有 '\0' 终结符
+        if (!nullPos) return nullptr; // 字符串在限制长度内未以 '\0' 终结
         return p;
     };
 

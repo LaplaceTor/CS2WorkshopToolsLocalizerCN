@@ -216,7 +216,45 @@ static bool AddModuleRange(HMODULE hMod, const std::wstring& overrideStem = L"")
     return false;
 }
 
+static bool RemoveModuleRangeByBase(uintptr_t base) {
+    std::lock_guard<std::mutex> lock(g_ScanModulesMutex);
+    size_t count = g_FastRangeCount.load(std::memory_order_relaxed);
+    for (size_t i = 0; i < count; ++i) {
+        if (g_FastRanges[i].base == base) {
+            for (size_t j = i; j + 1 < count; ++j) {
+                g_FastRanges[j] = g_FastRanges[j + 1];
+            }
+            g_FastRanges[count - 1] = CachedModuleRange{};
+            g_FastRangeCount.store(count - 1, std::memory_order_release);
+            return true;
+        }
+    }
+    return false;
+}
+
+static void InvalidateUnloadedModules() {
+    std::lock_guard<std::mutex> lock(g_ScanModulesMutex);
+    size_t count = g_FastRangeCount.load(std::memory_order_relaxed);
+    size_t writeIdx = 0;
+    for (size_t i = 0; i < count; ++i) {
+        HMODULE hCheck = reinterpret_cast<HMODULE>(g_FastRanges[i].base);
+        HMODULE hVerified = NULL;
+        if (GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, (LPCWSTR)hCheck, &hVerified) && hVerified == hCheck) {
+            if (writeIdx != i) {
+                g_FastRanges[writeIdx] = g_FastRanges[i];
+            }
+            writeIdx++;
+        }
+    }
+    for (size_t i = writeIdx; i < count; ++i) {
+        g_FastRanges[i] = CachedModuleRange{};
+    }
+    g_FastRangeCount.store(writeIdx, std::memory_order_release);
+}
+
 static void ScanKnownToolModules() {
+    InvalidateUnloadedModules();
+
     static const wchar_t* const s_KnownModules[] = {
         L"hammer.dll",
         L"modeldoc_editor.dll",
@@ -951,24 +989,53 @@ static std::atomic<bool> g_bGuiHooked{false};
 static HANDLE g_hToolsHookThread = NULL;
 static HANDLE g_hWakeHookEvent = NULL;
 
-static bool TryHookQtToolsModules() {
-    auto installHookSafe = [](void* pTarget, void* pDetour, void** ppOriginal, const char* name) -> bool {
-        if (!*ppOriginal) {
-            if (!pTarget) {
-                LogHook("[HOOK] %s symbol not found!", name);
-                return false;
-            }
-            LogHook("[HOOK] Calling InstallHook for %s (target=%p, detour=%p)...", name, pTarget, pDetour);
-            bool ok = HookManager::Instance().InstallHook(pTarget, pDetour, ppOriginal, name);
-            if (!ok) {
-                LogHook("[HOOK] %s InstallHook failed!", name);
-                return false;
-            }
-            LogHook("[HOOK] %s hooked successfully (orig=%p)", name, *ppOriginal);
-        }
-        return true;
-    };
+struct HookRequest {
+    void* pTarget;
+    void* pDetour;
+    void** ppOriginal;
+    const char* name;
+};
 
+static bool InstallHookBatch(const std::vector<HookRequest>& requests, const char* batchName) {
+    std::vector<size_t> installedIndices;
+    bool allOk = true;
+
+    for (size_t i = 0; i < requests.size(); ++i) {
+        const auto& req = requests[i];
+        if (!req.pTarget) {
+            LogHook("[HOOK] [%s] %s symbol not found!", batchName, req.name);
+            allOk = false;
+            break;
+        }
+        if (!*req.ppOriginal) {
+            LogHook("[HOOK] [%s] Calling InstallHook for %s (target=%p, detour=%p)...", batchName, req.name, req.pTarget, req.pDetour);
+            bool ok = HookManager::Instance().InstallHook(req.pTarget, req.pDetour, req.ppOriginal, req.name);
+            if (!ok) {
+                LogHook("[HOOK] [%s] %s InstallHook failed!", batchName, req.name);
+                allOk = false;
+                break;
+            }
+            installedIndices.push_back(i);
+            LogHook("[HOOK] [%s] %s hooked successfully (orig=%p)", batchName, req.name, *req.ppOriginal);
+        }
+    }
+
+    if (!allOk) {
+        LogHook("[HOOK] [%s] Batch hook installation failed! Rolling back %zu installed hooks...", batchName, installedIndices.size());
+        for (auto idx : installedIndices) {
+            const auto& req = requests[idx];
+            HookManager::Instance().UninstallHook(req.pTarget);
+            if (req.ppOriginal) {
+                *req.ppOriginal = nullptr;
+            }
+        }
+        return false;
+    }
+
+    return true;
+}
+
+static bool TryHookQtToolsModules() {
     if (!g_bWidgetsHooked.load()) {
         HMODULE hQtWidgets = GetModuleHandleW(L"Qt5Widgets.dll");
         if (hQtWidgets) {
@@ -986,20 +1053,21 @@ static bool TryHookQtToolsModules() {
             void* pListSetText     = (void*)GetProcAddress(hQtWidgets, "?setText@QListWidgetItem@@QEAAXAEBVQString@@@Z");
             void* pComboAddItem    = (void*)GetProcAddress(hQtWidgets, "?addItem@QComboBox@@QEAAXAEBVQString@@AEBVQVariant@@@Z");
 
-            bool success = true;
-            success &= installHookSafe(pActionSetText,   (void*)hk_QAction_setText,          (void**)&g_o_QAction_setText,          "QAction::setText");
-            success &= installHookSafe(pActionSetTip,    (void*)hk_QAction_setToolTip,       (void**)&g_o_QAction_setToolTip,       "QAction::setToolTip");
-            success &= installHookSafe(pActionSetStatus, (void*)hk_QAction_setStatusTip,     (void**)&g_o_QAction_setStatusTip,     "QAction::setStatusTip");
-            success &= installHookSafe(pActionSetWhats,  (void*)hk_QAction_setWhatsThis,     (void**)&g_o_QAction_setWhatsThis,     "QAction::setWhatsThis");
-            success &= installHookSafe(pButtonSetText,   (void*)hk_QAbstractButton_setText,  (void**)&g_o_QAbstractButton_setText,  "QAbstractButton::setText");
-            success &= installHookSafe(pLabelSetText,    (void*)hk_QLabel_setText,           (void**)&g_o_QLabel_setText,           "QLabel::setText");
-            success &= installHookSafe(pSetTitle,        (void*)hk_QWidget_setWindowTitle,   (void**)&g_o_QWidget_setWindowTitle,   "QWidget::setWindowTitle");
-            success &= installHookSafe(pTreeSetText,     (void*)hk_QTreeWidgetItem_setText,  (void**)&g_o_QTreeWidgetItem_setText,  "QTreeWidgetItem::setText");
-            success &= installHookSafe(pTableSetText,    (void*)hk_QTableWidgetItem_setText, (void**)&g_o_QTableWidgetItem_setText, "QTableWidgetItem::setText");
-            success &= installHookSafe(pListSetText,     (void*)hk_QListWidgetItem_setText,  (void**)&g_o_QListWidgetItem_setText,  "QListWidgetItem::setText");
-            success &= installHookSafe(pComboAddItem,    (void*)hk_QComboBox_addItem,       (void**)&g_o_QComboBox_addItem,       "QComboBox::addItem");
+            std::vector<HookRequest> widgetRequests = {
+                { pActionSetText,   (void*)hk_QAction_setText,          (void**)&g_o_QAction_setText,          "QAction::setText" },
+                { pActionSetTip,    (void*)hk_QAction_setToolTip,       (void**)&g_o_QAction_setToolTip,       "QAction::setToolTip" },
+                { pActionSetStatus, (void*)hk_QAction_setStatusTip,     (void**)&g_o_QAction_setStatusTip,     "QAction::setStatusTip" },
+                { pActionSetWhats,  (void*)hk_QAction_setWhatsThis,     (void**)&g_o_QAction_setWhatsThis,     "QAction::setWhatsThis" },
+                { pButtonSetText,   (void*)hk_QAbstractButton_setText,  (void**)&g_o_QAbstractButton_setText,  "QAbstractButton::setText" },
+                { pLabelSetText,    (void*)hk_QLabel_setText,           (void**)&g_o_QLabel_setText,           "QLabel::setText" },
+                { pSetTitle,        (void*)hk_QWidget_setWindowTitle,   (void**)&g_o_QWidget_setWindowTitle,   "QWidget::setWindowTitle" },
+                { pTreeSetText,     (void*)hk_QTreeWidgetItem_setText,  (void**)&g_o_QTreeWidgetItem_setText,  "QTreeWidgetItem::setText" },
+                { pTableSetText,    (void*)hk_QTableWidgetItem_setText, (void**)&g_o_QTableWidgetItem_setText, "QTableWidgetItem::setText" },
+                { pListSetText,     (void*)hk_QListWidgetItem_setText,  (void**)&g_o_QListWidgetItem_setText,  "QListWidgetItem::setText" },
+                { pComboAddItem,    (void*)hk_QComboBox_addItem,        (void**)&g_o_QComboBox_addItem,        "QComboBox::addItem" }
+            };
 
-            if (success) {
+            if (InstallHookBatch(widgetRequests, "Qt5Widgets")) {
                 g_bWidgetsHooked.store(true);
                 LogHook("[HOOK] Qt5Widgets hooks installed successfully (all 11/11 OK)");
             }
@@ -1014,12 +1082,13 @@ static bool TryHookQtToolsModules() {
             void* pDrawRectF  = (void*)GetProcAddress(hQtGui, "?drawText@QPainter@@QEAAXAEBVQRectF@@HAEBVQString@@PEAV2@@Z");
             void* pDrawPointF = (void*)GetProcAddress(hQtGui, "?drawText@QPainter@@QEAAXAEBVQPointF@@AEBVQString@@@Z");
 
-            bool success = true;
-            success &= installHookSafe(pDrawRect,   (void*)hk_QPainter_drawText_Rect,   (void**)&g_o_QPainter_drawText_Rect,   "QPainter::drawText(Rect)");
-            success &= installHookSafe(pDrawRectF,  (void*)hk_QPainter_drawText_RectF,  (void**)&g_o_QPainter_drawText_RectF,  "QPainter::drawText(RectF)");
-            success &= installHookSafe(pDrawPointF, (void*)hk_QPainter_drawText_PointF, (void**)&g_o_QPainter_drawText_PointF, "QPainter::drawText(PointF)");
+            std::vector<HookRequest> guiRequests = {
+                { pDrawRect,   (void*)hk_QPainter_drawText_Rect,   (void**)&g_o_QPainter_drawText_Rect,   "QPainter::drawText(Rect)" },
+                { pDrawRectF,  (void*)hk_QPainter_drawText_RectF,  (void**)&g_o_QPainter_drawText_RectF,  "QPainter::drawText(RectF)" },
+                { pDrawPointF, (void*)hk_QPainter_drawText_PointF, (void**)&g_o_QPainter_drawText_PointF, "QPainter::drawText(PointF)" }
+            };
 
-            if (success) {
+            if (InstallHookBatch(guiRequests, "Qt5Gui")) {
                 g_bGuiHooked.store(true);
                 LogHook("[HOOK] Qt5Gui hooks installed successfully (all 3/3 OK)");
             }
@@ -1030,7 +1099,7 @@ static bool TryHookQtToolsModules() {
 }
 
 static VOID CALLBACK OnDllNotification(ULONG NotificationReason, PLDR_DLL_NOTIFICATION_DATA NotificationData, PVOID Context) {
-    if (NotificationReason == LDR_DLL_NOTIFICATION_REASON_LOADED && g_hWakeHookEvent) {
+    if ((NotificationReason == LDR_DLL_NOTIFICATION_REASON_LOADED || NotificationReason == LDR_DLL_NOTIFICATION_REASON_UNLOADED) && g_hWakeHookEvent) {
         SetEvent(g_hWakeHookEvent);
     }
 }
@@ -1065,9 +1134,16 @@ struct CrashContextSnapshot {
 
 static CrashContextSnapshot g_CrashSnapshot;
 static HANDLE g_hCrashReportEvent = NULL;
+static std::atomic<bool> g_bCrashSnapshotConsumed{false};
 
 static void ProcessCrashReportAsync() {
     if (!g_CrashSnapshot.captured.load(std::memory_order_acquire)) {
+        return;
+    }
+
+    // 严格保证单消费者执行语义（Single-Consumer Semantics）
+    bool expected = false;
+    if (!g_bCrashSnapshotConsumed.compare_exchange_strong(expected, true, std::memory_order_acq_rel)) {
         return;
     }
 
@@ -1109,8 +1185,14 @@ static void ProcessCrashReportAsync() {
     }
     LogHook("====================================================================");
 
-    // 自动写入 MiniDump（在 Worker 线程上下文中安全调用）
-    HMODULE hDbgHelp = LoadLibraryA("dbghelp.dll");
+    // 自动写入 MiniDump（在 Worker 线程上下文中安全调用，明确从 System32 加载系统组件）
+    wchar_t szSysDir[MAX_PATH] = {0};
+    GetSystemDirectoryW(szSysDir, MAX_PATH);
+    std::wstring dbgHelpPath = std::wstring(szSysDir) + L"\\dbghelp.dll";
+    HMODULE hDbgHelp = LoadLibraryExW(dbgHelpPath.c_str(), NULL, LOAD_LIBRARY_SEARCH_SYSTEM32);
+    if (!hDbgHelp) {
+        hDbgHelp = LoadLibraryW(dbgHelpPath.c_str());
+    }
     if (hDbgHelp) {
         typedef BOOL(WINAPI* fnMiniDumpWriteDump)(HANDLE, DWORD, HANDLE, int, PVOID, PVOID, PVOID);
         fnMiniDumpWriteDump pDump = (fnMiniDumpWriteDump)GetProcAddress(hDbgHelp, "MiniDumpWriteDump");

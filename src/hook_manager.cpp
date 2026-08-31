@@ -98,6 +98,21 @@ typedef NTSTATUS (NTAPI *pfnLdrUnregisterDllNotification)(
     PVOID Cookie
 );
 
+bool HookManager::UninstallHook(void* pTarget) {
+    if (!pTarget) return false;
+    std::lock_guard<std::mutex> lock(m_mutex);
+    MH_DisableHook(pTarget);
+    MH_RemoveHook(pTarget);
+
+    for (auto it = m_hooks.begin(); it != m_hooks.end(); ++it) {
+        if (it->target == pTarget) {
+            m_hooks.erase(it);
+            break;
+        }
+    }
+    return true;
+}
+
 bool HookManager::RegisterDllNotification(PLDR_DLL_NOTIFICATION_FUNCTION pfnCallback, PVOID pContext) {
     if (!pfnCallback) return false;
     std::lock_guard<std::mutex> lock(m_mutex);

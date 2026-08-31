@@ -65,6 +65,9 @@ public:
     // 5. 安装并启用单个 Hook，统一记录到 m_hooks
     bool InstallHook(void* pTarget, void* pDetour, void** ppOriginal, const char* hookName = nullptr);
 
+    // 5.1 卸载并移除单个 Hook
+    bool UninstallHook(void* pTarget);
+
     // 6. 禁用并移除所有 Hook（保留 MinHook 上下文）
     void UninstallHooks();
 

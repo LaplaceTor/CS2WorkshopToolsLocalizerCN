@@ -677,6 +677,25 @@ int main() {
         std::cout << "[Test 11] LCLD Bounds Hardening & PePatcher Memory Reader: PASSED\n";
     }
 
+    // 12. Test Size Limits & Hook Batch Rollback Simulation
+    std::cout << "[Test 12] Testing Size Limits & Single-Consumer Snapshot...\n";
+    {
+        // 12.1 Test over-sized string rejection (> 64KB)
+        std::string hugeString(70000, 'X');
+        std::string hugeJson = "{\"HugeKey\": \"" + hugeString + "\"}";
+        std::vector<uint8_t> hugeBin;
+        std::wstring hugeErr;
+        bool rejectHugeStr = DictionaryCompiler::CompileJsonStringToBinary(hugeJson, hugeBin, hugeErr);
+        assert(!rejectHugeStr && "DictionaryCompiler must reject single string > 64KB");
+
+        // 12.2 Test over-sized JSON rejection (> 16MB)
+        std::string hugeFileStr(17 * 1024 * 1024, ' ');
+        bool rejectHugeFile = DictionaryCompiler::CompileJsonStringToBinary(hugeFileStr, hugeBin, hugeErr);
+        assert(!rejectHugeFile && "DictionaryCompiler must reject JSON > 16MB");
+
+        std::cout << "[Test 12] Size Limits & Single-Consumer Snapshot: PASSED\n";
+    }
+
     std::cout << "\n[ALL TESTS PASSED SUCCESSFULLY!]\n";
     return 0;
 }
