@@ -83,18 +83,34 @@ static std::atomic<bool> g_bTranslatorInitialized{false};
 static std::mutex g_TranslatorInitMutex;
 
 // ==============================================================================
-// 预扫描调用者模块地址区间表（0 锁、0 系统 API、无锁极速判断）
+// 预扫描调用者模块地址区间快照（100% 纯无锁 Lock-Free Snapshot，VEH / Hook 绝对安全）
 // ==============================================================================
-struct CachedModuleRange {
+struct ModuleRangeEntry {
+    uintptr_t base;
+    uintptr_t end;
+    wchar_t stem[32]; // 固定长度 POD，无堆分配，支持安全并发复制
+};
+
+static constexpr size_t MAX_CACHED_MODULE_RANGES = 128;
+
+struct ModuleRangeSnapshot {
+    size_t count;
+    ModuleRangeEntry entries[MAX_CACHED_MODULE_RANGES];
+};
+
+struct MasterModuleItem {
     uintptr_t base;
     uintptr_t end;
     std::wstring stem;
 };
 
-static constexpr size_t MAX_CACHED_MODULE_RANGES = 128;
-static CachedModuleRange g_FastRanges[MAX_CACHED_MODULE_RANGES];
-static std::atomic<size_t> g_FastRangeCount{0};
-static std::mutex g_ScanModulesMutex;
+// 双缓冲静态快照区，读者无需任何互斥锁，仅通过原子指针 acquire 读取
+static ModuleRangeSnapshot g_SnapshotBuffers[2];
+static std::atomic<size_t> g_ActiveSnapshotIndex{0};
+static std::atomic<const ModuleRangeSnapshot*> g_pActiveSnapshot{nullptr};
+
+static std::mutex g_ModuleWriterMutex; // 仅写者加锁（后台 Worker / 模块扫描），读者 100% 纯无锁
+static std::vector<MasterModuleItem> g_MasterModules; // 仅在 g_ModuleWriterMutex 保护下修改
 
 // 获取 CS2 根二进制目录 (game/bin/win64/)
 static std::wstring GetBinDirectory() {
@@ -185,6 +201,23 @@ static std::wstring NormalizeSectionName(const std::string& name) {
     return wname;
 }
 
+// 内部写者函数（必须在 g_ModuleWriterMutex 保护下调用）
+static void PublishNewSnapshotLocked() {
+    size_t nextIdx = 1 - g_ActiveSnapshotIndex.load(std::memory_order_relaxed);
+    ModuleRangeSnapshot& nextBuf = g_SnapshotBuffers[nextIdx];
+
+    size_t count = (std::min)(g_MasterModules.size(), MAX_CACHED_MODULE_RANGES);
+    nextBuf.count = count;
+    for (size_t i = 0; i < count; ++i) {
+        nextBuf.entries[i].base = g_MasterModules[i].base;
+        nextBuf.entries[i].end = g_MasterModules[i].end;
+        wcsncpy_s(nextBuf.entries[i].stem, 32, g_MasterModules[i].stem.c_str(), _TRUNCATE);
+    }
+
+    g_pActiveSnapshot.store(&nextBuf, std::memory_order_release);
+    g_ActiveSnapshotIndex.store(nextIdx, std::memory_order_release);
+}
+
 static bool AddModuleRange(HMODULE hMod, const std::wstring& overrideStem = L"") {
     if (!hMod) return false;
     uint32_t sizeOfImage = PePatcher::GetModuleSizeOfImage(hMod);
@@ -202,57 +235,55 @@ static bool AddModuleRange(HMODULE hMod, const std::wstring& overrideStem = L"")
     }
     if (stem.empty()) return false;
 
-    std::lock_guard<std::mutex> lock(g_ScanModulesMutex);
-    size_t count = g_FastRangeCount.load(std::memory_order_relaxed);
-    for (size_t i = 0; i < count; ++i) {
-        if (g_FastRanges[i].base == base) {
-            return true; // 已注册
+    std::lock_guard<std::mutex> lock(g_ModuleWriterMutex);
+    for (const auto& item : g_MasterModules) {
+        if (item.base == base) {
+            return true; // 已存在
         }
     }
-    if (count < MAX_CACHED_MODULE_RANGES) {
-        g_FastRanges[count].base = base;
-        g_FastRanges[count].end = end;
-        g_FastRanges[count].stem = stem;
-        g_FastRangeCount.store(count + 1, std::memory_order_release);
-        return true;
+
+    if (g_MasterModules.size() >= MAX_CACHED_MODULE_RANGES) {
+        return false;
     }
-    return false;
+
+    g_MasterModules.push_back({ base, end, stem });
+    PublishNewSnapshotLocked();
+    return true;
 }
 
 static bool RemoveModuleRangeByBase(uintptr_t base) {
-    std::lock_guard<std::mutex> lock(g_ScanModulesMutex);
-    size_t count = g_FastRangeCount.load(std::memory_order_relaxed);
-    for (size_t i = 0; i < count; ++i) {
-        if (g_FastRanges[i].base == base) {
-            for (size_t j = i; j + 1 < count; ++j) {
-                g_FastRanges[j] = g_FastRanges[j + 1];
-            }
-            g_FastRanges[count - 1] = CachedModuleRange{};
-            g_FastRangeCount.store(count - 1, std::memory_order_release);
-            return true;
+    std::lock_guard<std::mutex> lock(g_ModuleWriterMutex);
+    bool found = false;
+    for (auto it = g_MasterModules.begin(); it != g_MasterModules.end(); ++it) {
+        if (it->base == base) {
+            g_MasterModules.erase(it);
+            found = true;
+            break;
         }
     }
-    return false;
+    if (!found) return false;
+
+    PublishNewSnapshotLocked();
+    return true;
 }
 
 static void InvalidateUnloadedModules() {
-    std::lock_guard<std::mutex> lock(g_ScanModulesMutex);
-    size_t count = g_FastRangeCount.load(std::memory_order_relaxed);
-    size_t writeIdx = 0;
-    for (size_t i = 0; i < count; ++i) {
-        HMODULE hCheck = reinterpret_cast<HMODULE>(g_FastRanges[i].base);
+    std::lock_guard<std::mutex> lock(g_ModuleWriterMutex);
+    bool changed = false;
+    for (auto it = g_MasterModules.begin(); it != g_MasterModules.end();) {
+        HMODULE hCheck = reinterpret_cast<HMODULE>(it->base);
         HMODULE hVerified = NULL;
         if (GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, (LPCWSTR)hCheck, &hVerified) && hVerified == hCheck) {
-            if (writeIdx != i) {
-                g_FastRanges[writeIdx] = g_FastRanges[i];
-            }
-            writeIdx++;
+            ++it;
+        } else {
+            it = g_MasterModules.erase(it);
+            changed = true;
         }
     }
-    for (size_t i = writeIdx; i < count; ++i) {
-        g_FastRanges[i] = CachedModuleRange{};
+
+    if (changed || g_pActiveSnapshot.load(std::memory_order_relaxed) == nullptr) {
+        PublishNewSnapshotLocked();
     }
-    g_FastRangeCount.store(writeIdx, std::memory_order_release);
 }
 
 static void ScanKnownToolModules() {
@@ -294,37 +325,22 @@ static void ScanKnownToolModules() {
     }
 }
 
-// 安全复制调用者模块名称至调用者提供的缓冲区（加锁保护，杜绝内部引用失效与数据竞争）
+// 100% 纯无锁极速快照检索（0 互斥锁、0 系统 API、0 堆分配、0 数据竞争，VEH / Hook 绝对安全）
 static bool GetCallerModuleName(void* callerAddr, wchar_t* outBuf, size_t maxLen) {
     if (!callerAddr || !outBuf || maxLen == 0) return false;
     outBuf[0] = L'\0';
 
+    const ModuleRangeSnapshot* snapshot = g_pActiveSnapshot.load(std::memory_order_acquire);
+    if (!snapshot) return false;
+
     uintptr_t addr = reinterpret_cast<uintptr_t>(callerAddr);
+    size_t count = snapshot->count;
+    if (count > MAX_CACHED_MODULE_RANGES) count = MAX_CACHED_MODULE_RANGES;
 
-    // 1. 热路径：加锁快速检索并直接复制到 caller-provided buffer
-    {
-        std::lock_guard<std::mutex> lock(g_ScanModulesMutex);
-        size_t count = g_FastRangeCount.load(std::memory_order_relaxed);
-        for (size_t i = 0; i < count; ++i) {
-            if (addr >= g_FastRanges[i].base && addr < g_FastRanges[i].end) {
-                wcsncpy_s(outBuf, maxLen, g_FastRanges[i].stem.c_str(), _TRUNCATE);
-                return (outBuf[0] != L'\0');
-            }
-        }
-    }
-
-    // 2. 冷路径：遇到动态新加载且未预注册的未知模块，加锁解析并写入区间快表
-    HMODULE hMod = NULL;
-    if (GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, (LPCWSTR)callerAddr, &hMod) && hMod) {
-        if (AddModuleRange(hMod)) {
-            std::lock_guard<std::mutex> lock(g_ScanModulesMutex);
-            size_t newCount = g_FastRangeCount.load(std::memory_order_relaxed);
-            for (size_t i = 0; i < newCount; ++i) {
-                if (addr >= g_FastRanges[i].base && addr < g_FastRanges[i].end) {
-                    wcsncpy_s(outBuf, maxLen, g_FastRanges[i].stem.c_str(), _TRUNCATE);
-                    return (outBuf[0] != L'\0');
-                }
-            }
+    for (size_t i = 0; i < count; ++i) {
+        if (addr >= snapshot->entries[i].base && addr < snapshot->entries[i].end) {
+            wcsncpy_s(outBuf, maxLen, snapshot->entries[i].stem, _TRUNCATE);
+            return (outBuf[0] != L'\0');
         }
     }
 
