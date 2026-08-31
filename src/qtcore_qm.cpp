@@ -1071,6 +1071,9 @@ static void ProcessCrashReportAsync() {
         return;
     }
 
+    // 延迟在 Worker 线程上下文中安全停用所有 Hook（避免在 VEH 异常拦截上下文中调用 VirtualProtect 或争用内部锁）
+    HookManager::Instance().EmergencyDisableAllHooks();
+
     DWORD code = g_CrashSnapshot.exceptionCode;
     void* rip = g_CrashSnapshot.rip;
     std::wstring modName = GetCallerModuleName(rip);
@@ -1246,9 +1249,6 @@ static LONG WINAPI DiagnosticCrashLoggerVEH(PEXCEPTION_POINTERS pExceptionInfo) 
                 }
             }
             g_CrashSnapshot.stackDepth = depth;
-
-            // 紧急停用所有 Hook
-            HookManager::Instance().EmergencyDisableAllHooks();
 
             // 唤醒后台 Worker 线程进行复杂格式化与写盘
             if (g_hCrashReportEvent) {

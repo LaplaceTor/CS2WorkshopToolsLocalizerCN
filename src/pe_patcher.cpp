@@ -146,6 +146,7 @@ bool PePatcher::PatchQtCore(const std::wstring& srcDllPath, const std::wstring& 
 
     const IMAGE_SECTION_HEADER* sections = IMAGE_FIRST_SECTION(ntHeadersConst);
     const IMAGE_SECTION_HEADER* textSec = nullptr;
+    const IMAGE_SECTION_HEADER* dataSec = nullptr;
 
     for (WORD i = 0; i < numSections; ++i) {
         // 校验每个 section 的物理映射范围合法性
@@ -157,11 +158,18 @@ bool PePatcher::PatchQtCore(const std::wstring& srcDllPath, const std::wstring& 
         }
         if (std::memcmp(sections[i].Name, ".text", 5) == 0) {
             textSec = &sections[i];
+        } else if (std::memcmp(sections[i].Name, ".data", 5) == 0) {
+            dataSec = &sections[i];
         }
     }
 
     if (!textSec) {
         outError = L"未在 PE 文件中找到 .text 节";
+        return false;
+    }
+
+    if (!dataSec) {
+        outError = L"未在 PE 文件中找到 .data 节";
         return false;
     }
 
@@ -335,29 +343,56 @@ bool PePatcher::PatchQtCore(const std::wstring& srcDllPath, const std::wstring& 
         return false;
     }
 
-    // 7. Code Cave 内存布局计算：
-    // [0..sizeof(PatchHeader)] : PatchHeader ("LCLZ", 20 bytes)
-    // [..+1]                   : uint8_t g_bNeedsInit (0)
-    // [..+1]                   : uint8_t g_bTrHooked (0)
-    // [..+8]                   : uint64_t g_pfnDetourPtr (0)
-    // [..]                     : "qtcore_qm.dll\0"
-    // [..]                     : "tr\0"
-    // [紧凑对齐]               : epCodeStartRva (仅记录标志并 jump 原 EntryPoint，绝不调用任何 API)
-    // [紧凑对齐]               : trCodeStartRva (在真正脱离 Loader Lock 后的首次 Qt API 调用触发延迟引导)
+    // 7. 内存布局计算：
+    // [在 .text 节 (严格保持只读可执行 RX，绝不修改为可写)]:
+    // - PatchHeader ("LCLZ", 20 bytes)
+    // - "qtcore_qm.dll\0"
+    // - "tr\0"
+    // - epCodeStartRva (仅记录标志并 jump 原 EntryPoint，绝不调用任何 API)
+    // - trCodeStartRva (在真正脱离 Loader Lock 后的首次 Qt API 调用触发延迟引导)
+    //
+    // [在 .data 节 (原生可读写 RW，安全存放可变状态数据)]:
+    // - uint8_t  g_bNeedsInit (0)
+    // - uint8_t  g_bTrHooked (0)
+    // - uint64_t g_pfnDetourPtr (0)
+
     const std::string dllName = "qtcore_qm.dll";
     const std::string funcName = "tr";
     DWORD dllNameLen = static_cast<DWORD>(dllName.length() + 1);
     DWORD funcNameLen = static_cast<DWORD>(funcName.length() + 1);
 
+    // .text 只读数据与代码 RVA
     DWORD headerRva = caveRva;
-    DWORD initFlagRva = headerRva + sizeof(PatchHeader);
+    DWORD dllNameRva = headerRva + sizeof(PatchHeader);
+    DWORD funcNameRva = dllNameRva + dllNameLen;
+    DWORD totalTextConstLen = (funcNameRva + funcNameLen - caveRva);
+    DWORD epCodeStartRva = (caveRva + totalTextConstLen + 15) & ~15;
+
+    // .data 可写状态变量 RVA (位于 .data 节末尾可写空间)
+    uint64_t dataSecEndRva64 = static_cast<uint64_t>(dataSec->VirtualAddress) + static_cast<uint64_t>(dataSec->Misc.VirtualSize);
+    uint64_t dataCaveRva64 = (dataSecEndRva64 + 15) & ~15ULL;
+    if (dataCaveRva64 > 0xFFFFFFFFULL) {
+        outError = L".data 节变量 RVA 溢出 32 位整型范围";
+        return false;
+    }
+    DWORD initFlagRva = static_cast<DWORD>(dataCaveRva64);
     DWORD trHookedFlagRva = initFlagRva + 1;
     DWORD detourPtrRva = (trHookedFlagRva + 1 + 7) & ~7; // 8 字节对齐
-    DWORD dllNameRva = detourPtrRva + 8;
-    DWORD funcNameRva = dllNameRva + dllNameLen;
+    DWORD totalDataBytesNeeded = (detourPtrRva + 8 - initFlagRva);
 
-    DWORD totalDataLen = (funcNameRva + funcNameLen - caveRva);
-    DWORD epCodeStartRva = caveRva + totalDataLen;
+    auto optDataWriteOff = RvaToFileOffset(ntHeadersConst, initFlagRva, buffer.size(), totalDataBytesNeeded);
+    if (!optDataWriteOff) {
+        uint64_t dataRawEndRva64 = static_cast<uint64_t>(dataSec->VirtualAddress) + static_cast<uint64_t>(dataSec->SizeOfRawData);
+        if (dataRawEndRva64 >= static_cast<uint64_t>(dataSec->VirtualAddress) + 32) {
+            initFlagRva = static_cast<DWORD>((dataRawEndRva64 - 32) & ~7);
+            trHookedFlagRva = initFlagRva + 1;
+            detourPtrRva = (trHookedFlagRva + 1 + 7) & ~7;
+            optDataWriteOff = RvaToFileOffset(ntHeadersConst, initFlagRva, buffer.size(), 16);
+        }
+    }
+    if (optDataWriteOff) {
+        std::memset(buffer.data() + *optDataWriteOff, 0, 16);
+    }
 
     auto SafeComputeRel32 = [](uint64_t targetRva, uint64_t nextInstrRva, int32_t& outDisp, const wchar_t* ctx, std::wstring& err) -> bool {
         int64_t diff = static_cast<int64_t>(targetRva) - static_cast<int64_t>(nextInstrRva);
@@ -622,8 +657,8 @@ bool PePatcher::PatchQtCore(const std::wstring& srcDllPath, const std::wstring& 
     // 12. 更新 Export Address Table 中的 ?tr@QMetaObject 指向脱离 Loader Lock 后的延迟引导 Shellcode
     *reinterpret_cast<DWORD*>(buffer.data() + trEatFileOffset) = trCodeStartRva;
 
-    // 13. 为 .text 节赋予写权限 (IMAGE_SCN_MEM_WRITE)，确保 Code Cave 内部的原子标志位读写不触发 0xC0000005 访问违规
-    const_cast<IMAGE_SECTION_HEADER*>(textSec)->Characteristics |= IMAGE_SCN_MEM_WRITE;
+    // 13. 注意：.text 节严格保持原生 RX 属性 (IMAGE_SCN_MEM_EXECUTE | IMAGE_SCN_MEM_READ)，绝不赋予写权限！
+    // 所有可变状态（initFlag, trHookedFlag, detourPtr）均已安全安置于 .data 节区中。
 
     // 写入目标文件
     std::ofstream outFile(dstDllPath, std::ios::binary);
