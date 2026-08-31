@@ -383,16 +383,18 @@ bool PePatcher::PatchQtCore(const std::wstring& srcDllPath, const std::wstring& 
     auto optDataWriteOff = RvaToFileOffset(ntHeadersConst, initFlagRva, buffer.size(), totalDataBytesNeeded);
     if (!optDataWriteOff) {
         uint64_t dataRawEndRva64 = static_cast<uint64_t>(dataSec->VirtualAddress) + static_cast<uint64_t>(dataSec->SizeOfRawData);
-        if (dataRawEndRva64 >= static_cast<uint64_t>(dataSec->VirtualAddress) + 32) {
-            initFlagRva = static_cast<DWORD>((dataRawEndRva64 - 32) & ~7);
+        if (dataRawEndRva64 >= static_cast<uint64_t>(dataSec->VirtualAddress) + totalDataBytesNeeded) {
+            initFlagRva = static_cast<DWORD>((dataRawEndRva64 - totalDataBytesNeeded) & ~7);
             trHookedFlagRva = initFlagRva + 1;
             detourPtrRva = (trHookedFlagRva + 1 + 7) & ~7;
-            optDataWriteOff = RvaToFileOffset(ntHeadersConst, initFlagRva, buffer.size(), 16);
+            optDataWriteOff = RvaToFileOffset(ntHeadersConst, initFlagRva, buffer.size(), totalDataBytesNeeded);
         }
     }
-    if (optDataWriteOff) {
-        std::memset(buffer.data() + *optDataWriteOff, 0, 16);
+    if (!optDataWriteOff) {
+        outError = L"无法在 .data 节区中定位有效的物理可写空间以存放补丁状态变量";
+        return false;
     }
+    std::memset(buffer.data() + *optDataWriteOff, 0, totalDataBytesNeeded);
 
     auto SafeComputeRel32 = [](uint64_t targetRva, uint64_t nextInstrRva, int32_t& outDisp, const wchar_t* ctx, std::wstring& err) -> bool {
         int64_t diff = static_cast<int64_t>(targetRva) - static_cast<int64_t>(nextInstrRva);

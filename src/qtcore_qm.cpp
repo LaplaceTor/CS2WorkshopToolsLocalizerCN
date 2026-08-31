@@ -294,33 +294,41 @@ static void ScanKnownToolModules() {
     }
 }
 
-// 极速无锁调用者模块地址区间匹配（0 API 调用、0 互斥锁、微秒级响应）
-static const std::wstring& GetCallerModuleName(void* callerAddr) {
-    static const std::wstring s_EmptyStem = L"";
-    if (!callerAddr) return s_EmptyStem;
+// 安全复制调用者模块名称至调用者提供的缓冲区（加锁保护，杜绝内部引用失效与数据竞争）
+static bool GetCallerModuleName(void* callerAddr, wchar_t* outBuf, size_t maxLen) {
+    if (!callerAddr || !outBuf || maxLen == 0) return false;
+    outBuf[0] = L'\0';
 
     uintptr_t addr = reinterpret_cast<uintptr_t>(callerAddr);
-    size_t count = g_FastRangeCount.load(std::memory_order_acquire);
-    for (size_t i = 0; i < count; ++i) {
-        if (addr >= g_FastRanges[i].base && addr < g_FastRanges[i].end) {
-            return g_FastRanges[i].stem;
+
+    // 1. 热路径：加锁快速检索并直接复制到 caller-provided buffer
+    {
+        std::lock_guard<std::mutex> lock(g_ScanModulesMutex);
+        size_t count = g_FastRangeCount.load(std::memory_order_relaxed);
+        for (size_t i = 0; i < count; ++i) {
+            if (addr >= g_FastRanges[i].base && addr < g_FastRanges[i].end) {
+                wcsncpy_s(outBuf, maxLen, g_FastRanges[i].stem.c_str(), _TRUNCATE);
+                return (outBuf[0] != L'\0');
+            }
         }
     }
 
-    // 冷路径：遇到动态新加载且未预注册的未知模块，仅执行一次性安全解析并写入区间快表
+    // 2. 冷路径：遇到动态新加载且未预注册的未知模块，加锁解析并写入区间快表
     HMODULE hMod = NULL;
     if (GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, (LPCWSTR)callerAddr, &hMod) && hMod) {
         if (AddModuleRange(hMod)) {
-            size_t newCount = g_FastRangeCount.load(std::memory_order_acquire);
+            std::lock_guard<std::mutex> lock(g_ScanModulesMutex);
+            size_t newCount = g_FastRangeCount.load(std::memory_order_relaxed);
             for (size_t i = 0; i < newCount; ++i) {
                 if (addr >= g_FastRanges[i].base && addr < g_FastRanges[i].end) {
-                    return g_FastRanges[i].stem;
+                    wcsncpy_s(outBuf, maxLen, g_FastRanges[i].stem.c_str(), _TRUNCATE);
+                    return (outBuf[0] != L'\0');
                 }
             }
         }
     }
 
-    return s_EmptyStem;
+    return false;
 }
 
 // ==============================================================================
@@ -596,10 +604,11 @@ static bool FindTranslationScoped(void* callerAddr, const char* text, std::strin
 
     // 1. 优先根据 callerAddr 判定发起调用的模块
     if (callerAddr != nullptr) {
-        std::wstring callerStem = GetCallerModuleName(callerAddr);
+        wchar_t callerStemBuf[64] = {0};
+        if (GetCallerModuleName(callerAddr, callerStemBuf, 64)) {
+            std::wstring callerStem(callerStemBuf);
 
-        // 如果命中了特定模块的专属子块，优先在其独立字典中查找
-        if (!callerStem.empty()) {
+            // 如果命中了特定模块的专属子块，优先在其独立字典中查找
             std::lock_guard<std::mutex> lock(g_DictMutex);
             auto itSec = g_ScopedDicts.find(callerStem);
             if (itSec != g_ScopedDicts.end()) {
@@ -1165,14 +1174,15 @@ static void ProcessCrashReportAsync() {
 
     DWORD code = g_CrashSnapshot.exceptionCode;
     void* rip = g_CrashSnapshot.rip;
-    std::wstring modName = GetCallerModuleName(rip);
+    wchar_t modNameBuf[MAX_PATH] = {0};
+    GetCallerModuleName(rip, modNameBuf, MAX_PATH);
     int accessType = g_CrashSnapshot.accessType;
     ULONG_PTR faultAddr = g_CrashSnapshot.faultAddr;
 
     LogHook("================ [CRASH EXCEPTION CAPTURED (WORKER)] ================");
     LogHook("Thread ID      : %u (0x%X)", g_CrashSnapshot.threadId, g_CrashSnapshot.threadId);
     LogHook("Exception Code : 0x%08X", code);
-    LogHook("Faulting RIP   : %p (Module: %ls)", rip, modName.c_str());
+    LogHook("Faulting RIP   : %p (Module: %ls)", rip, modNameBuf);
     if (code == EXCEPTION_ACCESS_VIOLATION) {
         LogHook("Access Violation: Attempt to %s memory at address %p",
             accessType == 0 ? "READ" : (accessType == 1 ? "WRITE" : "EXECUTE"), (void*)faultAddr);
@@ -1188,9 +1198,9 @@ static void ProcessCrashReportAsync() {
     for (size_t i = 0; i < g_CrashSnapshot.stackDepth; ++i) {
         void* frame = g_CrashSnapshot.stackSnapshot[i];
         if (frame) {
-            std::wstring m = GetCallerModuleName(frame);
-            if (!m.empty()) {
-                LogHook("  [RSP+0x%02zX] %p (%ls)", i * 8, frame, m.c_str());
+            wchar_t mBuf[MAX_PATH] = {0};
+            if (GetCallerModuleName(frame, mBuf, MAX_PATH)) {
+                LogHook("  [RSP+0x%02zX] %p (%ls)", i * 8, frame, mBuf);
             } else {
                 LogHook("  [RSP+0x%02zX] %p", i * 8, frame);
             }
@@ -1284,15 +1294,15 @@ static DWORD WINAPI ToolsHookThread(LPVOID lpParam) {
     return 0;
 }
 
-// 基于调用者地址判断是否属于 Valve Workshop Tools/Hammer 工具链模块（无锁极速区间判断）
+// 基于调用者地址判断是否属于 Valve Workshop Tools/Hammer 工具链模块（安全加锁拷贝）
 static bool IsToolAddress(void* rip) {
     if (!rip) return false;
-    const std::wstring& stem = GetCallerModuleName(rip);
-    if (!stem.empty()) {
-        if (stem == L"hammer" || stem == L"modeldoc_editor" || stem == L"pet" ||
-            stem == L"met" || stem == L"sfm" || stem == L"postprocessing" ||
-            stem == L"smartprops_editor" || stem == L"pulse_editor" ||
-            stem.find(L"subtool") != std::wstring::npos) {
+    wchar_t stem[64] = {0};
+    if (GetCallerModuleName(rip, stem, 64)) {
+        if (wcscmp(stem, L"hammer") == 0 || wcscmp(stem, L"modeldoc_editor") == 0 || wcscmp(stem, L"pet") == 0 ||
+            wcscmp(stem, L"met") == 0 || wcscmp(stem, L"sfm") == 0 || wcscmp(stem, L"postprocessing") == 0 ||
+            wcscmp(stem, L"smartprops_editor") == 0 || wcscmp(stem, L"pulse_editor") == 0 ||
+            wcsstr(stem, L"subtool") != nullptr) {
             return true;
         }
     }
