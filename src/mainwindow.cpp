@@ -3,6 +3,7 @@
 #include "fgd_translator.h"
 #include "pe_patcher.h"
 #include "backup_manager.h"
+#include "dictionary_compiler.h"
 
 #include <windows.h>
 #include <psapi.h>
@@ -447,6 +448,15 @@ void MainWindow::onLaunchClicked() {
 
         fs::copy_file(qtDictPath, destQtJson, fs::copy_options::overwrite_existing);
         fs::copy_file(qmDllSrc, destQmDll, fs::copy_options::overwrite_existing);
+
+        // 预编译纯 C 二进制字典 qt_translations.lcld (LCLD 格式，0 Qt ABI 依赖)
+        fs::path destQtLcld = cs2Bin / L"qt_translations.lcld";
+        std::wstring compileErr;
+        if (DictionaryCompiler::CompileJsonFileToLcld(qtDictPath.wstring(), destQtLcld.wstring(), compileErr)) {
+            appendLog("[+] 成功编译并部署纯二进制字典 qt_translations.lcld (LCLD v1)", "#a6e22e");
+        } else {
+            appendLog(QString("[!] 二进制字典编译提示: %1 (将回退至纯文本 JSON 模式)").arg(QString::fromStdWString(compileErr)), "#fd971f");
+        }
 
         // 修补 Qt5Core.dll (源文件读取自 backup 中的原版)
         fs::path backupQtCore = backupDir / L"game" / L"bin" / L"win64" / L"Qt5Core.dll";

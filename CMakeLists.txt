@@ -32,6 +32,9 @@ add_library(qtcore_qm SHARED
     src/qtcore_qm.cpp
     src/hook_manager.h
     src/hook_manager.cpp
+    src/lcld_format.h
+    src/dictionary_compiler.h
+    src/dictionary_compiler.cpp
     third_party/minhook/include/MinHook.h
     third_party/minhook/src/buffer.h
     third_party/minhook/src/buffer.c
@@ -68,6 +71,9 @@ add_executable(CS2WorkshopToolsLocalizerCN WIN32
     src/fgd_translator.cpp
     src/backup_manager.h
     src/backup_manager.cpp
+    src/lcld_format.h
+    src/dictionary_compiler.h
+    src/dictionary_compiler.cpp
 )
 
 target_link_libraries(CS2WorkshopToolsLocalizerCN PRIVATE
@@ -110,6 +116,9 @@ add_executable(test_components
     src/backup_manager.cpp
     src/hook_manager.h
     src/hook_manager.cpp
+    src/lcld_format.h
+    src/dictionary_compiler.h
+    src/dictionary_compiler.cpp
     third_party/minhook/include/MinHook.h
     third_party/minhook/src/buffer.h
     third_party/minhook/src/buffer.c

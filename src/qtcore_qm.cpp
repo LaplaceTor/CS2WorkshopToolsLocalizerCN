@@ -12,6 +12,7 @@
 #include <stdio.h>
 #include "hook_manager.h"
 #include "pe_patcher.h"
+#include "dictionary_compiler.h"
 #include "hde/hde64.h"
 
 #pragma intrinsic(_ReturnAddress)
@@ -75,10 +76,22 @@ static std::unordered_map<std::string, std::string> g_CommonDict;
 static std::unordered_map<std::string, std::string> g_CommonCache;
 static std::unordered_map<std::wstring, std::unordered_map<std::string, std::string>> g_ScopedDicts;
 static std::unordered_map<std::wstring, std::unordered_map<std::string, std::string>> g_ScopedCaches;
-static std::unordered_map<HMODULE, std::wstring> g_ModuleStemCache;
 static std::mutex g_DictMutex;
-static std::mutex g_StemCacheMutex;
 static std::once_flag g_dictInitFlag;
+
+// ==============================================================================
+// 预扫描调用者模块地址区间表（0 锁、0 系统 API、无锁极速判断）
+// ==============================================================================
+struct CachedModuleRange {
+    uintptr_t base;
+    uintptr_t end;
+    std::wstring stem;
+};
+
+static constexpr size_t MAX_CACHED_MODULE_RANGES = 128;
+static CachedModuleRange g_FastRanges[MAX_CACHED_MODULE_RANGES];
+static std::atomic<size_t> g_FastRangeCount{0};
+static std::mutex g_ScanModulesMutex;
 
 // 获取 CS2 根二进制目录 (game/bin/win64/)
 static std::wstring GetBinDirectory() {
@@ -169,307 +182,180 @@ static std::wstring NormalizeSectionName(const std::string& name) {
     return wname;
 }
 
-// 基于调用者指令地址安全获取所在模块的短名称 (Stem)
-static std::wstring GetCallerModuleName(void* callerAddr) {
-    if (!callerAddr) return L"";
-    HMODULE hMod = NULL;
-    if (GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, (LPCWSTR)callerAddr, &hMod) && hMod) {
-        {
-            std::lock_guard<std::mutex> lock(g_StemCacheMutex);
-            auto it = g_ModuleStemCache.find(hMod);
-            if (it != g_ModuleStemCache.end()) {
-                return it->second;
-            }
-        }
+static bool AddModuleRange(HMODULE hMod, const std::wstring& overrideStem = L"") {
+    if (!hMod) return false;
+    MODULEINFO mi = {0};
+    if (!GetModuleInformation(GetCurrentProcess(), hMod, &mi, sizeof(mi))) {
+        return false;
+    }
+    uintptr_t base = reinterpret_cast<uintptr_t>(mi.lpBaseOfDll);
+    uintptr_t end = base + mi.SizeOfImage;
+    if (base == 0 || mi.SizeOfImage == 0) return false;
+
+    std::wstring stem = overrideStem;
+    if (stem.empty()) {
         wchar_t szPath[MAX_PATH] = {0};
         if (GetModuleFileNameW(hMod, szPath, MAX_PATH)) {
-            std::wstring stem = ExtractStem(szPath);
-            std::lock_guard<std::mutex> lock(g_StemCacheMutex);
-            g_ModuleStemCache[hMod] = stem;
-            return stem;
+            stem = ExtractStem(szPath);
         }
     }
-    return L"";
+    if (stem.empty()) return false;
+
+    std::lock_guard<std::mutex> lock(g_ScanModulesMutex);
+    size_t count = g_FastRangeCount.load(std::memory_order_relaxed);
+    for (size_t i = 0; i < count; ++i) {
+        if (g_FastRanges[i].base == base) {
+            return true; // 已注册
+        }
+    }
+    if (count < MAX_CACHED_MODULE_RANGES) {
+        g_FastRanges[count].base = base;
+        g_FastRanges[count].end = end;
+        g_FastRanges[count].stem = stem;
+        g_FastRangeCount.store(count + 1, std::memory_order_release);
+        return true;
+    }
+    return false;
+}
+
+static void ScanKnownToolModules() {
+    static const wchar_t* const s_KnownModules[] = {
+        L"hammer.dll",
+        L"modeldoc_editor.dll",
+        L"pet.dll",
+        L"met.dll",
+        L"sfm.dll",
+        L"postprocessing.dll",
+        L"smartprops_editor.dll",
+        L"pulse_editor.dll",
+        L"subtool_modeldoc.dll",
+        L"subtool_worldeditor.dll",
+        L"subtool_particle.dll",
+        L"worldeditor.dll",
+        L"assetbrowser.dll",
+        L"vconsole2.dll",
+        L"particles.dll",
+        L"worldrenderer.dll",
+        L"soundsystem.dll",
+        L"schemasystem.dll",
+        L"vscript.dll",
+        L"engine2.dll",
+        L"client.dll",
+        L"server.dll",
+        L"qt5widgets.dll",
+        L"qt5gui.dll",
+        L"qt5core.dll"
+    };
+
+    for (const wchar_t* modName : s_KnownModules) {
+        HMODULE hMod = GetModuleHandleW(modName);
+        if (hMod) {
+            AddModuleRange(hMod);
+        }
+    }
+}
+
+// 极速无锁调用者模块地址区间匹配（0 API 调用、0 互斥锁、微秒级响应）
+static const std::wstring& GetCallerModuleName(void* callerAddr) {
+    static const std::wstring s_EmptyStem = L"";
+    if (!callerAddr) return s_EmptyStem;
+
+    uintptr_t addr = reinterpret_cast<uintptr_t>(callerAddr);
+    size_t count = g_FastRangeCount.load(std::memory_order_acquire);
+    for (size_t i = 0; i < count; ++i) {
+        if (addr >= g_FastRanges[i].base && addr < g_FastRanges[i].end) {
+            return g_FastRanges[i].stem;
+        }
+    }
+
+    // 冷路径：遇到动态新加载且未预注册的未知模块，仅执行一次性安全解析并写入区间快表
+    HMODULE hMod = NULL;
+    if (GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, (LPCWSTR)callerAddr, &hMod) && hMod) {
+        if (AddModuleRange(hMod)) {
+            size_t newCount = g_FastRangeCount.load(std::memory_order_acquire);
+            for (size_t i = 0; i < newCount; ++i) {
+                if (addr >= g_FastRanges[i].base && addr < g_FastRanges[i].end) {
+                    return g_FastRanges[i].stem;
+                }
+            }
+        }
+    }
+
+    return s_EmptyStem;
 }
 
 // ==============================================================================
-// 3. Qt 原生 QJsonDocument / QJsonParseError 字典解析器
+// 3. 零 ABI 依赖纯 C 二进制字典 (LCLD) 与标准 C++ 解析引擎
 // ==============================================================================
-struct QJsonParseError {
-    int offset;
-    int error;
-};
-
-typedef void* (__fastcall *fnQByteArray_ctor)(void* pThis, const char* str, int size);
-typedef void (__fastcall *fnQByteArray_dtor)(void* pThis);
-
-typedef void* (__fastcall *fnQJsonDocument_fromJson)(void* pOutDoc, const void* pByteArray, QJsonParseError* pError);
-typedef void (__fastcall *fnQJsonDocument_dtor)(void* pThis);
-typedef bool (__fastcall *fnQJsonDocument_isObject)(const void* pThis);
-typedef void* (__fastcall *fnQJsonDocument_object)(const void* pThis, void* pOutObject);
-typedef void (__fastcall *fnQJsonObject_dtor)(void* pThis);
-typedef void* (__fastcall *fnQJsonObject_keys)(const void* pThis, void* pOutStringList);
-typedef void (__fastcall *fnQStringList_dtor)(void* pThis);
-
-typedef void* (__fastcall *fnQJsonObject_value)(const void* pThis, void* pOutValue, const void* pKeyQString);
-typedef void (__fastcall *fnQJsonValue_dtor)(void* pThis);
-typedef bool (__fastcall *fnQJsonValue_isObject)(const void* pThis);
-typedef bool (__fastcall *fnQJsonValue_isString)(const void* pThis);
-typedef void* (__fastcall *fnQJsonValue_toObject)(const void* pThis, void* pOutObject);
-typedef void* (__fastcall *fnQJsonValue_toString)(const void* pThis, void* pOutQString);
-
-// QList<QString> 64-bit 内存布局
-struct QListData_Qt5 {
-    int ref;
-    int alloc;
-    int begin;
-    int end;
-    void* array[1];
-};
-
-static std::string WStringToUtf8(const wchar_t* wstr) {
-    if (!wstr || !*wstr) return "";
-    int sizeNeeded = WideCharToMultiByte(CP_UTF8, 0, wstr, -1, NULL, 0, NULL, NULL);
-    if (sizeNeeded <= 1) return "";
-    std::string str(static_cast<size_t>(sizeNeeded), '\0');
-    int written = WideCharToMultiByte(CP_UTF8, 0, wstr, -1, str.data(), sizeNeeded, NULL, NULL);
-    if (written > 0) {
-        str.resize(static_cast<size_t>(written - 1));
-    } else {
-        str.clear();
-    }
-    return str;
-}
-
-static std::string StripJsonComments(const char* p, size_t length) {
-    std::string out;
-    out.reserve(length);
-    const char* end = p + length;
-    bool inQuote = false;
-    bool escape = false;
-
-    while (p < end) {
-        if (inQuote) {
-            char c = *p++;
-            out.push_back(c);
-            if (escape) {
-                escape = false;
-            } else if (c == '\\') {
-                escape = true;
-            } else if (c == '"') {
-                inQuote = false;
-            }
-        } else {
-            if (*p == '"') {
-                inQuote = true;
-                out.push_back(*p++);
-            } else if (*p == '/' && (p + 1 < end)) {
-                if (*(p + 1) == '/') {
-                    p += 2;
-                    while (p < end && *p != '\n' && *p != '\r') p++;
-                } else if (*(p + 1) == '*') {
-                    p += 2;
-                    while (p + 1 < end && !(*p == '*' && *(p + 1) == '/')) p++;
-                    if (p + 1 < end) p += 2;
-                    else p = end;
-                } else {
-                    out.push_back(*p++);
-                }
-            } else {
-                out.push_back(*p++);
-            }
-        }
-    }
-    return out;
-}
-
-// 基于 Qt 原生 QJsonDocument / QJsonParseError 的高性能字典解析器
-static bool ParseSectionedJson(const char* jsonContent, size_t length) {
-    g_CommonDict.clear();
-    g_CommonCache.clear();
-    g_ScopedDicts.clear();
-    g_ScopedCaches.clear();
-
-    if (!jsonContent || length == 0) return false;
-
-    // 跳过 UTF-8 BOM
-    if (length >= 3 && (unsigned char)jsonContent[0] == 0xEF && (unsigned char)jsonContent[1] == 0xBB && (unsigned char)jsonContent[2] == 0xBF) {
-        jsonContent += 3;
-        length -= 3;
-    }
-
-    HMODULE hQtCore = GetModuleHandleW(L"Qt5Core.dll");
-    if (!hQtCore) {
-        LogHook("[JSON] Qt5Core.dll not found in process!");
-        return false;
-    }
-
-    auto pfnQByteArray_ctor = (fnQByteArray_ctor)GetProcAddress(hQtCore, "??0QByteArray@@QEAA@PEBDH@Z");
-    auto pfnQByteArray_dtor = (fnQByteArray_dtor)GetProcAddress(hQtCore, "??1QByteArray@@QEAA@XZ");
-    auto pfnQJsonDoc_fromJson = (fnQJsonDocument_fromJson)GetProcAddress(hQtCore, "?fromJson@QJsonDocument@@SA?AV1@AEBVQByteArray@@PEAUQJsonParseError@@@Z");
-    auto pfnQJsonDoc_dtor = (fnQJsonDocument_dtor)GetProcAddress(hQtCore, "??1QJsonDocument@@QEAA@XZ");
-    auto pfnQJsonDoc_isObject = (fnQJsonDocument_isObject)GetProcAddress(hQtCore, "?isObject@QJsonDocument@@QEBA_NXZ");
-    auto pfnQJsonDoc_object = (fnQJsonDocument_object)GetProcAddress(hQtCore, "?object@QJsonDocument@@QEBA?AVQJsonObject@@XZ");
-    auto pfnQJsonObject_dtor = (fnQJsonObject_dtor)GetProcAddress(hQtCore, "??1QJsonObject@@QEAA@XZ");
-    auto pfnQJsonObject_keys = (fnQJsonObject_keys)GetProcAddress(hQtCore, "?keys@QJsonObject@@QEBA?AVQStringList@@XZ");
-    auto pfnQStringList_dtor = (fnQStringList_dtor)GetProcAddress(hQtCore, "??1QStringList@@QEAA@XZ");
-    if (!pfnQStringList_dtor) pfnQStringList_dtor = (fnQStringList_dtor)GetProcAddress(hQtCore, "??1?$QList@VQString@@@@QEAA@XZ");
-    auto pfnQListData_dispose = (void(__fastcall*)(void*))GetProcAddress(hQtCore, "?dispose@QListData@@QEAAXXZ");
-
-    auto pfnQString_dtor = (fnQString_dtor)GetProcAddress(hQtCore, "??1QString@@QEAA@XZ");
-    auto pfnQString_utf16 = (fnQString_utf16)GetProcAddress(hQtCore, "?utf16@QString@@QEBAPEBGXZ");
-
-    auto pfnQJsonObject_value = (fnQJsonObject_value)GetProcAddress(hQtCore, "?value@QJsonObject@@QEBA?AVQJsonValue@@AEBVQString@@@Z");
-    auto pfnQJsonValue_dtor = (fnQJsonValue_dtor)GetProcAddress(hQtCore, "??1QJsonValue@@QEAA@XZ");
-    auto pfnQJsonValue_isObject = (fnQJsonValue_isObject)GetProcAddress(hQtCore, "?isObject@QJsonValue@@QEBA_NXZ");
-    auto pfnQJsonValue_isString = (fnQJsonValue_isString)GetProcAddress(hQtCore, "?isString@QJsonValue@@QEBA_NXZ");
-    auto pfnQJsonValue_toObject = (fnQJsonValue_toObject)GetProcAddress(hQtCore, "?toObject@QJsonValue@@QEBA?AVQJsonObject@@XZ");
-    auto pfnQJsonValue_toString = (fnQJsonValue_toString)GetProcAddress(hQtCore, "?toString@QJsonValue@@QEBA?AVQString@@XZ");
-
-    if (!pfnQByteArray_ctor || !pfnQByteArray_dtor || !pfnQJsonDoc_fromJson || !pfnQJsonDoc_dtor ||
-        !pfnQJsonDoc_isObject || !pfnQJsonDoc_object || !pfnQJsonObject_dtor || !pfnQJsonObject_keys ||
-        !pfnQJsonObject_value || !pfnQJsonValue_dtor || !pfnQJsonValue_isObject || !pfnQJsonValue_isString ||
-        !pfnQJsonValue_toObject || !pfnQJsonValue_toString || !pfnQString_dtor || !pfnQString_utf16) {
-        LogHook("[JSON] Failed to resolve Qt5Core QJson symbols!");
-        return false;
-    }
-
-    std::string cleanJson = StripJsonComments(jsonContent, length);
-
-    // 1. 构建 QByteArray 并调用 QJsonDocument::fromJson
-    char byteArrBuf[32] = {0};
-    pfnQByteArray_ctor(byteArrBuf, cleanJson.c_str(), (int)cleanJson.size());
-
-    char docBuf[32] = {0};
-    QJsonParseError parseError = {0, 0};
-    pfnQJsonDoc_fromJson(docBuf, byteArrBuf, &parseError);
-    pfnQByteArray_dtor(byteArrBuf);
-
-    if (parseError.error != 0) {
-        LogHook("[JSON] QJsonDocument::fromJson failed! error code=%d at offset=%d", parseError.error, parseError.offset);
-        pfnQJsonDoc_dtor(docBuf);
-        return false;
-    }
-
-    if (!pfnQJsonDoc_isObject(docBuf)) {
-        LogHook("[JSON] QJsonDocument root is not an object!");
-        pfnQJsonDoc_dtor(docBuf);
-        return false;
-    }
-
-    // 2. 提取根 QJsonObject
-    char rootObjBuf[32] = {0};
-    pfnQJsonDoc_object(docBuf, rootObjBuf);
-
-    char rootListBuf[32] = {0};
-    pfnQJsonObject_keys(rootObjBuf, rootListBuf);
-    void** pRootListData = (void**)rootListBuf;
-    QListData_Qt5* pRootD = (QListData_Qt5*)pRootListData[0];
-
-    if (pRootD && pRootD->end > pRootD->begin) {
-        int secCount = pRootD->end - pRootD->begin;
-        for (int i = 0; i < secCount; ++i) {
-            void* pSecKeyStr = &pRootD->array[pRootD->begin + i];
-            std::string secNameUtf8 = WStringToUtf8(pfnQString_utf16(pSecKeyStr));
-            std::wstring sectionName = NormalizeSectionName(secNameUtf8);
-
-            char secValBuf[32] = {0};
-            pfnQJsonObject_value(rootObjBuf, secValBuf, pSecKeyStr);
-
-            if (pfnQJsonValue_isObject(secValBuf)) {
-                // 子块对象 (Scoped Section)
-                auto& targetMap = (sectionName == L"common" || sectionName == L"general") 
-                                  ? g_CommonDict : g_ScopedDicts[sectionName];
-
-                char subObjBuf[32] = {0};
-                pfnQJsonValue_toObject(secValBuf, subObjBuf);
-
-                char subListBuf[32] = {0};
-                pfnQJsonObject_keys(subObjBuf, subListBuf);
-                void** pSubListData = (void**)subListBuf;
-                QListData_Qt5* pSubD = (QListData_Qt5*)pSubListData[0];
-
-                if (pSubD && pSubD->end > pSubD->begin) {
-                    int kvCount = pSubD->end - pSubD->begin;
-                    for (int j = 0; j < kvCount; ++j) {
-                        void* pSubKeyStr = &pSubD->array[pSubD->begin + j];
-                        std::string keyUtf8 = WStringToUtf8(pfnQString_utf16(pSubKeyStr));
-
-                        char itemValBuf[32] = {0};
-                        pfnQJsonObject_value(subObjBuf, itemValBuf, pSubKeyStr);
-                        if (pfnQJsonValue_isString(itemValBuf)) {
-                            char transStrBuf[32] = {0};
-                            pfnQJsonValue_toString(itemValBuf, transStrBuf);
-                            std::string valUtf8 = WStringToUtf8(pfnQString_utf16(transStrBuf));
-                            if (!keyUtf8.empty() && !valUtf8.empty()) {
-                                targetMap[keyUtf8] = valUtf8;
-                            }
-                            pfnQString_dtor(transStrBuf);
-                        }
-                        pfnQJsonValue_dtor(itemValBuf);
-                    }
-                }
-
-                if (pfnQStringList_dtor) pfnQStringList_dtor(subListBuf);
-                else if (pfnQListData_dispose) pfnQListData_dispose(subListBuf);
-                pfnQJsonObject_dtor(subObjBuf);
-            } else if (pfnQJsonValue_isString(secValBuf)) {
-                // 扁平根级键值对
-                char transStrBuf[32] = {0};
-                pfnQJsonValue_toString(secValBuf, transStrBuf);
-                std::string valUtf8 = WStringToUtf8(pfnQString_utf16(transStrBuf));
-                if (!secNameUtf8.empty() && !valUtf8.empty()) {
-                    g_CommonDict[secNameUtf8] = valUtf8;
-                }
-                pfnQString_dtor(transStrBuf);
-            }
-            pfnQJsonValue_dtor(secValBuf);
-        }
-    }
-
-    if (pfnQStringList_dtor) pfnQStringList_dtor(rootListBuf);
-    else if (pfnQListData_dispose) pfnQListData_dispose(rootListBuf);
-    pfnQJsonObject_dtor(rootObjBuf);
-    pfnQJsonDoc_dtor(docBuf);
-
-    LogHook("[JSON] QJsonDocument parsed successfully: %zu common entries, %zu scoped modules",
-        g_CommonDict.size(), g_ScopedDicts.size());
-
-    return (!g_CommonDict.empty() || !g_ScopedDicts.empty());
-}
-
 static void LoadMasterTranslations() {
     std::wstring binDir = GetBinDirectory();
-    std::wstring mainPath = binDir + L"qt_translations.json";
-    std::wstring backupPath = binDir + L"translations_cache.json";
+    std::wstring binaryPath = binDir + L"qt_translations.lcld";
+    std::wstring jsonPath = binDir + L"qt_translations.json";
+    std::wstring backupJsonPath = binDir + L"translations_cache.json";
 
-    auto tryLoadFile = [](const std::wstring& path) -> bool {
+    // 1. 优先加载由 Launcher 预编译的纯 C 二进制字典 .lcld（0 ABI 依赖，< 50μs 极速纯内存解析）
+    auto tryLoadLcld = [](const std::wstring& path) -> bool {
         FILE* fp = _wfopen(path.c_str(), L"rb");
         if (!fp) return false;
-
         fseek(fp, 0, SEEK_END);
         long fsize = ftell(fp);
         fseek(fp, 0, SEEK_SET);
-
         if (fsize <= 0) {
             fclose(fp);
             return false;
         }
-
-        std::vector<char> buffer(fsize + 1, 0);
+        std::vector<uint8_t> buffer(static_cast<size_t>(fsize));
         fread(buffer.data(), 1, fsize, fp);
         fclose(fp);
-
-        return ParseSectionedJson(buffer.data(), fsize);
+        return DictionaryCompiler::ParseLcldBinaryToMaps(buffer.data(), fsize, g_CommonDict, g_ScopedDicts);
     };
 
-    if (!tryLoadFile(mainPath)) {
-        tryLoadFile(backupPath);
+    if (tryLoadLcld(binaryPath)) {
+        LogHook("[DICT] Loaded compiled binary dictionary (LCLD): %zu common, %zu scoped modules",
+            g_CommonDict.size(), g_ScopedDicts.size());
+        return;
+    }
+
+    // 2. 回退：直接使用纯 C++ 零依赖标准 JSON 编译器与解析器加载文本字典
+    auto tryLoadJson = [](const std::wstring& path) -> bool {
+        FILE* fp = _wfopen(path.c_str(), L"rb");
+        if (!fp) return false;
+        fseek(fp, 0, SEEK_END);
+        long fsize = ftell(fp);
+        fseek(fp, 0, SEEK_SET);
+        if (fsize <= 0) {
+            fclose(fp);
+            return false;
+        }
+        std::string jsonStr(static_cast<size_t>(fsize), '\0');
+        fread(jsonStr.data(), 1, fsize, fp);
+        fclose(fp);
+
+        std::vector<uint8_t> binary;
+        std::wstring err;
+        if (!DictionaryCompiler::CompileJsonStringToBinary(jsonStr, binary, err)) {
+            LogHook("[DICT] CompileJsonStringToBinary failed: %ls", err.c_str());
+            return false;
+        }
+        return DictionaryCompiler::ParseLcldBinaryToMaps(binary.data(), binary.size(), g_CommonDict, g_ScopedDicts);
+    };
+
+    if (tryLoadJson(jsonPath)) {
+        LogHook("[DICT] Loaded JSON dictionary via pure C++ parser fallback: %zu common, %zu scoped modules",
+            g_CommonDict.size(), g_ScopedDicts.size());
+        return;
+    }
+
+    if (tryLoadJson(backupJsonPath)) {
+        LogHook("[DICT] Loaded backup JSON dictionary via pure C++ parser fallback: %zu common, %zu scoped modules",
+            g_CommonDict.size(), g_ScopedDicts.size());
+        return;
     }
 }
 
 static void EnsureDictionaryLoaded() {
     std::call_once(g_dictInitFlag, [] {
+        ScanKnownToolModules();
         LoadMasterTranslations();
     });
 }
@@ -723,6 +609,20 @@ static bool FindTranslationScoped(void* callerAddr, const char* text, std::strin
     }
 
     return false;
+}
+
+static std::string WStringToUtf8(const wchar_t* wstr) {
+    if (!wstr || !*wstr) return "";
+    int sizeNeeded = WideCharToMultiByte(CP_UTF8, 0, wstr, -1, NULL, 0, NULL, NULL);
+    if (sizeNeeded <= 1) return "";
+    std::string str(static_cast<size_t>(sizeNeeded), '\0');
+    int written = WideCharToMultiByte(CP_UTF8, 0, wstr, -1, str.data(), sizeNeeded, NULL, NULL);
+    if (written > 0) {
+        str.resize(static_cast<size_t>(written - 1));
+    } else {
+        str.clear();
+    }
+    return str;
 }
 
 static bool FindTranslationScopedW(void* callerAddr, const wchar_t* wstr, std::string& outResult) {
@@ -1133,6 +1033,9 @@ static bool TryHookQtToolsModules() {
 
 static VOID CALLBACK OnDllNotification(ULONG NotificationReason, PLDR_DLL_NOTIFICATION_DATA NotificationData, PVOID Context) {
     if (NotificationReason == LDR_DLL_NOTIFICATION_REASON_LOADED && NotificationData && NotificationData->Loaded.BaseDllName) {
+        if (NotificationData->Loaded.DllBase) {
+            AddModuleRange((HMODULE)NotificationData->Loaded.DllBase);
+        }
         const UNICODE_STRING* baseName = NotificationData->Loaded.BaseDllName;
         if (baseName->Buffer && baseName->Length > 0) {
             std::wstring dllName(baseName->Buffer, baseName->Length / sizeof(wchar_t));
@@ -1258,8 +1161,9 @@ static void ProcessCrashReportAsync() {
 static DWORD WINAPI ToolsHookThread(LPVOID lpParam) {
     LogHook("[THREAD] ToolsHookThread started");
 
-    // 在后台独立线程中预加载字典，确保不阻塞主线程/DllMain
+    // 在后台独立线程中预加载字典与扫描工具模块
     EnsureDictionaryLoaded();
+    ScanKnownToolModules();
 
     HANDLE waitHandles[2] = { g_hWakeHookEvent, g_hCrashReportEvent };
 
@@ -1291,22 +1195,16 @@ static DWORD WINAPI ToolsHookThread(LPVOID lpParam) {
     return 0;
 }
 
-// 基于调用者地址判断是否属于 Valve Workshop Tools/Hammer 工具链模块（安全判断）
+// 基于调用者地址判断是否属于 Valve Workshop Tools/Hammer 工具链模块（无锁极速区间判断）
 static bool IsToolAddress(void* rip) {
     if (!rip) return false;
-    HMODULE hMod = NULL;
-    if (GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, (LPCWSTR)rip, &hMod) && hMod) {
-        wchar_t szPath[MAX_PATH] = {0};
-        if (GetModuleFileNameW(hMod, szPath, MAX_PATH)) {
-            for (int i = 0; szPath[i]; ++i) {
-                if (szPath[i] >= L'A' && szPath[i] <= L'Z') szPath[i] += 32;
-            }
-            if (wcsstr(szPath, L"\\tools\\") || wcsstr(szPath, L"hammer") ||
-                wcsstr(szPath, L"pet.") || wcsstr(szPath, L"modeldoc") ||
-                wcsstr(szPath, L"met.") || wcsstr(szPath, L"sfm.") ||
-                wcsstr(szPath, L"postprocessing") || wcsstr(szPath, L"_subtool")) {
-                return true;
-            }
+    const std::wstring& stem = GetCallerModuleName(rip);
+    if (!stem.empty()) {
+        if (stem == L"hammer" || stem == L"modeldoc_editor" || stem == L"pet" ||
+            stem == L"met" || stem == L"sfm" || stem == L"postprocessing" ||
+            stem == L"smartprops_editor" || stem == L"pulse_editor" ||
+            stem.find(L"subtool") != std::wstring::npos) {
+            return true;
         }
     }
     return false;

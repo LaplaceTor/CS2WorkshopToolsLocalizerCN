@@ -10,6 +10,7 @@
 #include "../src/fgd_translator.h"
 #include "../src/backup_manager.h"
 #include "../src/hook_manager.h"
+#include "../src/dictionary_compiler.h"
 
 namespace fs = std::filesystem;
 
@@ -585,6 +586,49 @@ int main() {
             t.join();
         }
         std::cout << "[Test 9] HookManager GetHookCount Concurrent Locking: PASSED\n";
+    }
+
+    // 10. Test DictionaryCompiler JSON to LCLD Binary Compilation & Parsing
+    std::cout << "[Test 10] Testing DictionaryCompiler LCLD Binary Compilation & Parsing...\n";
+    {
+        std::string sampleJson = R"({
+            // Comment test
+            "File": "文件",
+            "Save As...": "另存为...",
+            "hammer": {
+                "Selection Mode": "选择模式",
+                "Entity Tool": "实体工具"
+            },
+            "modeldoc_editor": {
+                "Compile Model": "编译模型"
+            }
+        })";
+
+        std::vector<uint8_t> binary;
+        std::wstring compileErr;
+        bool ok = DictionaryCompiler::CompileJsonStringToBinary(sampleJson, binary, compileErr);
+        assert(ok && "CompileJsonStringToBinary must succeed");
+
+        std::unordered_map<std::string, std::string> commonDict;
+        std::unordered_map<std::wstring, std::unordered_map<std::string, std::string>> scopedDicts;
+
+        bool parseOk = DictionaryCompiler::ParseLcldBinaryToMaps(binary.data(), binary.size(), commonDict, scopedDicts);
+        assert(parseOk && "ParseLcldBinaryToMaps must succeed");
+        assert(commonDict["File"] == "文件");
+        assert(commonDict["Save As..."] == "另存为...");
+        assert(scopedDicts[L"hammer"]["Selection Mode"] == "选择模式");
+        assert(scopedDicts[L"modeldoc_editor"]["Compile Model"] == "编译模型");
+
+        // Test file compilation with real qt_translations.json
+        fs::path realJson = fs::current_path() / L"qt_translations.json";
+        fs::path tempLcld = fs::current_path() / L"test_compiled.lcld";
+        if (fs::exists(realJson)) {
+            bool fileOk = DictionaryCompiler::CompileJsonFileToLcld(realJson.wstring(), tempLcld.wstring(), compileErr);
+            assert(fileOk && "CompileJsonFileToLcld on real qt_translations.json must succeed");
+            assert(fs::exists(tempLcld) && fs::file_size(tempLcld) > 0);
+            fs::remove(tempLcld);
+        }
+        std::cout << "[Test 10] DictionaryCompiler LCLD Binary Compilation & Zero-ABI Parsing: PASSED\n";
     }
 
     std::cout << "\n[ALL TESTS PASSED SUCCESSFULLY!]\n";
