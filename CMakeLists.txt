@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.20)
-project(CS2WorkshopToolsLocalizerCN LANGUAGES CXX)
+project(CS2WorkshopToolsLocalizerCN LANGUAGES C CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -25,12 +25,31 @@ endif()
 
 find_package(Qt6 REQUIRED COMPONENTS Core Gui Widgets Network)
 
+set(CMAKE_BUILD_TYPE Release CACHE STRING "Build type" FORCE)
+
 # 1. 编译注入 DLL qtcore_qm.dll
 add_library(qtcore_qm SHARED
     src/qtcore_qm.cpp
+    src/hook_manager.h
+    src/hook_manager.cpp
+    third_party/minhook/include/MinHook.h
+    third_party/minhook/src/buffer.h
+    third_party/minhook/src/buffer.c
+    third_party/minhook/src/hook.c
+    third_party/minhook/src/trampoline.h
+    third_party/minhook/src/trampoline.c
+    third_party/minhook/src/hde/hde64.h
+    third_party/minhook/src/hde/hde64.c
+    third_party/minhook/src/hde/pstdint.h
+    third_party/minhook/src/hde/table64.h
+)
+target_include_directories(qtcore_qm PRIVATE
+    third_party/minhook/include
+    third_party/minhook/src
 )
 target_link_libraries(qtcore_qm PRIVATE user32)
 set_target_properties(qtcore_qm PROPERTIES
+    MSVC_RUNTIME_LIBRARY "MultiThreaded"
     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}"
     RUNTIME_OUTPUT_DIRECTORY_RELEASE "${CMAKE_CURRENT_BINARY_DIR}"
     RUNTIME_OUTPUT_DIRECTORY_DEBUG "${CMAKE_CURRENT_BINARY_DIR}"

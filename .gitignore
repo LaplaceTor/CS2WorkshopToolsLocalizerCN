@@ -48,6 +48,7 @@ platforms/
 styles/
 tls/
 qml/
+scratch/
 opengl32sw.dll
 d3dcompiler_*.dll
 dxcompiler.dll
