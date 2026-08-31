@@ -1355,13 +1355,19 @@ extern "C" __declspec(dllexport) void ShutdownTranslator() {
 
     LogHook("[SHUTDOWN] ShutdownTranslator invoked");
 
-    // 1. 通知并等待后台 Hook 线程优雅退出
-    g_bStopHookThread.store(true);
+    // 1. Stop: 发出停止信号并唤醒后台 Worker 线程
+    g_bStopHookThread.store(true, std::memory_order_release);
     if (g_hWakeHookEvent) {
         SetEvent(g_hWakeHookEvent);
     }
+
+    // 2. Worker 真正退出：严谨等待直到 WAIT_OBJECT_0，绝对不能超时后继续卸载
     if (g_hToolsHookThread) {
-        WaitForSingleObject(g_hToolsHookThread, 2000);
+        DWORD waitRes = WaitForSingleObject(g_hToolsHookThread, INFINITE);
+        if (waitRes != WAIT_OBJECT_0) {
+            LogHook("[SHUTDOWN] FATAL: Background worker thread wait failed (code=0x%08X), aborting unhook to prevent memory corruption!", waitRes);
+            return;
+        }
         CloseHandle(g_hToolsHookThread);
         g_hToolsHookThread = NULL;
     }
@@ -1370,8 +1376,8 @@ extern "C" __declspec(dllexport) void ShutdownTranslator() {
         g_hWakeHookEvent = NULL;
     }
 
-    // 2. 统一执行完整生命周期退出：
-    //    disable -> remove -> free trampoline -> unregister VEH -> uninitialize MinHook
+    // 3. 统一执行完整生命周期退出：
+    //    Unregister callback -> Disable Hook -> Remove Hook -> Remove VEH -> MinHook Uninitialize
     HookManager::Instance().Shutdown();
     LogHook("[SHUTDOWN] ShutdownTranslator completed cleanly");
 }
@@ -1380,23 +1386,10 @@ extern "C" __declspec(dllexport) void InitQtCoreQmTranslator() {
     InitializeTranslator();
 }
 
-static DWORD WINAPI BootstrapThread(LPVOID lpParam) {
-    InitializeTranslator();
-    return 0;
-}
-
 BOOL APIENTRY DllMain(HMODULE hModule, DWORD ul_reason_for_call, LPVOID lpReserved) {
     if (ul_reason_for_call == DLL_PROCESS_ATTACH) {
         DisableThreadLibraryCalls(hModule);
         g_hModule = hModule;
-        HANDLE hBootstrap = CreateThread(NULL, 0, BootstrapThread, NULL, 0, NULL);
-        if (hBootstrap) {
-            CloseHandle(hBootstrap);
-        }
-    } else if (ul_reason_for_call == DLL_PROCESS_DETACH) {
-        if (lpReserved == NULL) {
-            ShutdownTranslator();
-        }
     }
     return TRUE;
 }

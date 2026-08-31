@@ -150,7 +150,7 @@ void HookManager::Shutdown() {
         return;
     }
 
-    // 1. 注销 DLL 加载通知回调
+    // 1. 注销 DLL 加载通知回调 (Unregister callback)
     if (m_pDllNotificationCookie != nullptr) {
         HMODULE hNtdll = GetModuleHandleW(L"ntdll.dll");
         if (hNtdll) {
@@ -163,18 +163,22 @@ void HookManager::Shutdown() {
         m_pDllNotificationCookie = nullptr;
     }
 
-    // 2. 禁用并移除每一个已注册 Hook
+    // 2. 禁用所有 Hook (Disable Hook)
     for (auto& hook : m_hooks) {
         if (hook.enabled && hook.target) {
             MH_DisableHook(hook.target);
-            MH_RemoveHook(hook.target);
             hook.enabled = false;
         }
     }
-    m_hooks.clear();
-
-    // 3. 全局保底禁用所有 Hook
     MH_DisableHook(MH_ALL_HOOKS);
+
+    // 3. 移除所有 Hook (Remove Hook)
+    for (auto& hook : m_hooks) {
+        if (hook.target) {
+            MH_RemoveHook(hook.target);
+        }
+    }
+    m_hooks.clear();
 
     // 4. 注销全局 VEH 异常过滤器
     if (m_pVehHandle != nullptr) {
@@ -182,7 +186,7 @@ void HookManager::Shutdown() {
         m_pVehHandle = nullptr;
     }
 
-    // 5. 卸载 MinHook 并释放所有蹦床（trampoline）内存空间
+    // 5. 卸载 MinHook 并释放所有蹦床（trampoline）内存空间 (MinHook Uninitialize)
     MH_Uninitialize();
 
     m_bInitialized.store(false);
@@ -197,16 +201,20 @@ size_t HookManager::GetHookCount() const {
 }
 
 void HookManager::EmergencyDisableAllHooks() {
-    bool locked = m_mutex.try_lock();
+    // 1. 全局原子禁用所有 Hook（MinHook 内部自带原子临界区保护，完全不依赖 m_hooks）
+    MH_DisableHook(MH_ALL_HOOKS);
+
+    // 2. 尝试获取互斥锁；若 try_lock 失败则绝对不访问 m_hooks 容器以避免数据竞争
+    if (!m_mutex.try_lock()) {
+        return;
+    }
+
     for (auto& hook : m_hooks) {
         if (hook.enabled && hook.target) {
-            MH_DisableHook(hook.target);
             hook.enabled = false;
         }
     }
-    if (locked) {
-        m_mutex.unlock();
-    }
+    m_mutex.unlock();
 }
 
 bool HookManager::IsHookAddress(void* addr) {
