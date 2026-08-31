@@ -1,5 +1,8 @@
 name: Release Build
 
+permissions:
+  contents: write
+
 on:
   workflow_dispatch:
     inputs:
@@ -54,9 +57,19 @@ jobs:
           if (Test-Path "fgd_override.json") { Copy-Item "fgd_override.json" "package\" }
           if (Test-Path "README.md") { Copy-Item "README.md" "package\" }
           if (Test-Path "LICENSE") { Copy-Item "LICENSE" "package\" }
-
+          
+          $qtBin = Split-Path (Get-Command qmake.exe).Source
+          $windeployqt = Join-Path $qtBin "windeployqt.exe"
+          
+          Write-Host "Qt bin: $qtBin"
+          Write-Host "windeployqt: $windeployqt"
+          
+          if (!(Test-Path $windeployqt)) {
+              Write-Error "windeployqt.exe not found at $windeployqt"
+              exit 1
+          }
           # 运行 windeployqt 收集 Qt 运行时依赖（排除不需要的组件以精简体积）
-          & "$env:Qt6_DIR\bin\windeployqt.exe" --release --no-translations --no-opengl-sw --no-system-dxc-compiler --no-compiler-runtime "package\CS2WorkshopToolsLocalizerCN.exe"
+          & $windeployqt --release --no-translations --no-opengl-sw --no-system-dxc-compiler --no-compiler-runtime "package\CS2WorkshopToolsLocalizerCN.exe"
 
           # 移除不必要的 Qt 插件和 DLL（本程序无图片/图标/SVG/3D 渲染需求）
           Remove-Item -Recurse -Force "package\imageformats" -ErrorAction SilentlyContinue
