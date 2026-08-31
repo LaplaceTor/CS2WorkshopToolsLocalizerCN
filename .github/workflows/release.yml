@@ -53,8 +53,20 @@ jobs:
           if (Test-Path "README.md") { Copy-Item "README.md" "package\" }
           if (Test-Path "LICENSE") { Copy-Item "LICENSE" "package\" }
 
-          # 运行 windeployqt 收集 Qt 运行时依赖
-          & "$env:Qt6_DIR\bin\windeployqt.exe" --release --no-translations "package\CS2WorkshopToolsLocalizerCN.exe"
+          # 运行 windeployqt 收集 Qt 运行时依赖（排除不需要的组件以精简体积）
+          & "$env:Qt6_DIR\bin\windeployqt.exe" --release --no-translations --no-opengl-sw --no-system-dxc-compiler --no-compiler-runtime "package\CS2WorkshopToolsLocalizerCN.exe"
+
+          # 移除不必要的 Qt 插件和 DLL（本程序无图片/图标/SVG/3D 渲染需求）
+          Remove-Item -Recurse -Force "package\imageformats" -ErrorAction SilentlyContinue
+          Remove-Item -Recurse -Force "package\iconengines" -ErrorAction SilentlyContinue
+          Remove-Item -Recurse -Force "package\generic" -ErrorAction SilentlyContinue
+          Remove-Item -Recurse -Force "package\styles" -ErrorAction SilentlyContinue
+          Remove-Item -Force "package\Qt6Svg.dll" -ErrorAction SilentlyContinue
+          Remove-Item -Force "package\d3dcompiler_47.dll" -ErrorAction SilentlyContinue
+          Remove-Item -Force "package\dxcompiler.dll" -ErrorAction SilentlyContinue
+          Remove-Item -Force "package\dxil.dll" -ErrorAction SilentlyContinue
+          Remove-Item -Force "package\opengl32sw.dll" -ErrorAction SilentlyContinue
+          Remove-Item -Force "package\vc_redist.x64.exe" -ErrorAction SilentlyContinue
 
       - name: Create ZIP Package
         run: |
