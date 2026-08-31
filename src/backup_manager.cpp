@@ -366,16 +366,24 @@ bool BackupManager::CreateOrUpdateBackup(const std::wstring& cs2Root, const std:
 
     // 事务提交：staging 备份完整成功，原子替换 old backup
     if (fs::exists(targetBackupPath)) {
+        if (fs::exists(oldBackupPath)) {
+            fs::remove_all(oldBackupPath, ec);
+        }
         fs::rename(targetBackupPath, oldBackupPath, ec);
         if (ec) {
-            fs::remove_all(targetBackupPath, ec);
+            // 重命名现有备份失败：保留原旧 backup，删除 staging，返回失败
+            fs::remove_all(stagingPath, ec);
+            outError = L"无法重命名现有备份目录（可能被占用或受保护）";
+            return false;
         }
     }
 
     fs::rename(stagingPath, targetBackupPath, ec);
     if (ec) {
+        // staging 重命名到 target 失败，尝试回滚将 oldBackupPath 恢复为 targetBackupPath
         if (fs::exists(oldBackupPath)) {
-            fs::rename(oldBackupPath, targetBackupPath, ec);
+            std::error_code rollEc;
+            fs::rename(oldBackupPath, targetBackupPath, rollEc);
         }
         fs::remove_all(stagingPath, ec);
         outError = L"事务提交失败：无法将 staging 目录重命名为备份目录";
