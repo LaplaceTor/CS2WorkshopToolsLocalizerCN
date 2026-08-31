@@ -11,6 +11,7 @@
 #include <atomic>
 #include <stdio.h>
 #include "hook_manager.h"
+#include "pe_patcher.h"
 #include "hde/hde64.h"
 
 #pragma intrinsic(_ReturnAddress)
@@ -738,285 +739,309 @@ static bool FindTranslationScopedW(void* callerAddr, const wchar_t* wstr, std::s
     return false;
 }
 
-// 检查 QString 内部指针合法性，防止空指针与野指针解引用导致 0xC0000005
-static inline bool IsValidQString(const void* pQString) {
-    if (!pQString) return false;
-    const void* d = *(const void* const*)pQString;
-    if (!d || (uintptr_t)d < 0x10000) return false;
-    return true;
+// ==============================================================================
+// 4. Qt 核心与界面钩子（全部传递 _ReturnAddress()，使用 SEH 安全守卫防护异常）
+// ==============================================================================
+
+static inline bool SafeGetUtf16(fnQString_utf16 pfn, const void* pQString, const wchar_t*& outWstr) {
+    if (!pfn || !pQString || (uintptr_t)pQString < 0x10000) return false;
+    __try {
+        const void* d = *(const void* const*)pQString;
+        if (!d || (uintptr_t)d < 0x10000) return false;
+        outWstr = pfn(pQString);
+        return (outWstr != nullptr && outWstr[0] != L'\0');
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        outWstr = nullptr;
+        return false;
+    }
 }
 
-// ==============================================================================
-// 4. Qt 核心与界面钩子（全部传递 _ReturnAddress()）
-// ==============================================================================
+static inline bool SafeCreateQString(fnQString_fromUtf8 pfn, void* pOutQString, const char* utf8, int size) {
+    if (!pfn || !pOutQString || !utf8 || size <= 0) return false;
+    __try {
+        pfn(pOutQString, utf8, size);
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+}
 
-// 1. QMetaObject::tr
-static void* __fastcall hk_QMetaObject_tr(const void* pMetaObject, void* pOutQString, const char* sourceText, const char* disambiguation, int n) {
+static inline void SafeDestroyQString(fnQString_dtor pfn, void* pQString) {
+    if (!pfn || !pQString) return;
+    __try {
+        pfn(pQString);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+    }
+}
+
+extern "C" __declspec(dllexport) bool InitializeTranslator();
+static inline void EnsureInitialized() {
+    InitializeTranslator();
+}
+
+// 1. QMetaObject::tr (导出作为 EAT 延迟引导入口)
+extern "C" __declspec(dllexport) void* __fastcall hk_QMetaObject_tr(const void* pMetaObject, void* pOutQString, const char* sourceText, const char* disambiguation, int n) {
     void* caller = _ReturnAddress();
-    if (sourceText && g_pfn_fromUtf8) {
+    EnsureInitialized();
+    if (sourceText && g_pfn_fromUtf8 && pOutQString) {
         std::string trans;
         if (FindTranslationScoped(caller, sourceText, trans)) {
             LogVerboseTr("[TR] '%s' -> '%s'", sourceText, trans.c_str());
-            return g_pfn_fromUtf8(pOutQString, trans.c_str(), (int)trans.length());
+            if (SafeCreateQString(g_pfn_fromUtf8, pOutQString, trans.c_str(), (int)trans.length())) {
+                return pOutQString;
+            }
         }
     }
-    return g_o_QMetaObject_tr(pMetaObject, pOutQString, sourceText, disambiguation, n);
+    if (g_o_QMetaObject_tr) {
+        return g_o_QMetaObject_tr(pMetaObject, pOutQString, sourceText, disambiguation, n);
+    }
+    return nullptr;
+}
+
+extern "C" __declspec(dllexport) void* __fastcall tr(const void* pMetaObject, void* pOutQString, const char* sourceText, const char* disambiguation, int n) {
+    return hk_QMetaObject_tr(pMetaObject, pOutQString, sourceText, disambiguation, n);
 }
 
 // 2. QPainter::drawText (全面覆盖 PropertyEditor 属性面板与树形表格渲染)
 static void __fastcall hk_QPainter_drawText_Rect(void* pPainter, const void* pRect, int flags, const void* pQString, void* pBoundingRect) {
     void* caller = _ReturnAddress();
-    if (IsValidQString(pQString) && g_pfn_utf16 && g_pfn_fromUtf8) {
-        const wchar_t* wstr = g_pfn_utf16(pQString);
-        if (wstr && wstr[0] != L'\0') {
-            std::string trans;
-            if (FindTranslationScopedW(caller, wstr, trans)) {
-                void* qstr[1] = {0};
-                g_pfn_fromUtf8(qstr, trans.c_str(), (int)trans.length());
-                g_o_QPainter_drawText_Rect(pPainter, pRect, flags, qstr, pBoundingRect);
-                if (g_pfn_QString_dtor) g_pfn_QString_dtor(qstr);
+    const wchar_t* wstr = nullptr;
+    if (SafeGetUtf16(g_pfn_utf16, pQString, wstr)) {
+        std::string trans;
+        if (FindTranslationScopedW(caller, wstr, trans)) {
+            void* qstr[1] = {0};
+            if (SafeCreateQString(g_pfn_fromUtf8, qstr, trans.c_str(), (int)trans.length())) {
+                if (g_o_QPainter_drawText_Rect) g_o_QPainter_drawText_Rect(pPainter, pRect, flags, qstr, pBoundingRect);
+                SafeDestroyQString(g_pfn_QString_dtor, qstr);
                 return;
             }
         }
     }
-    g_o_QPainter_drawText_Rect(pPainter, pRect, flags, pQString, pBoundingRect);
+    if (g_o_QPainter_drawText_Rect) g_o_QPainter_drawText_Rect(pPainter, pRect, flags, pQString, pBoundingRect);
 }
 
 static void __fastcall hk_QPainter_drawText_RectF(void* pPainter, const void* pRectF, int flags, const void* pQString, void* pBoundingRect) {
     void* caller = _ReturnAddress();
-    if (IsValidQString(pQString) && g_pfn_utf16 && g_pfn_fromUtf8) {
-        const wchar_t* wstr = g_pfn_utf16(pQString);
-        if (wstr && wstr[0] != L'\0') {
-            std::string trans;
-            if (FindTranslationScopedW(caller, wstr, trans)) {
-                void* qstr[1] = {0};
-                g_pfn_fromUtf8(qstr, trans.c_str(), (int)trans.length());
-                g_o_QPainter_drawText_RectF(pPainter, pRectF, flags, qstr, pBoundingRect);
-                if (g_pfn_QString_dtor) g_pfn_QString_dtor(qstr);
+    const wchar_t* wstr = nullptr;
+    if (SafeGetUtf16(g_pfn_utf16, pQString, wstr)) {
+        std::string trans;
+        if (FindTranslationScopedW(caller, wstr, trans)) {
+            void* qstr[1] = {0};
+            if (SafeCreateQString(g_pfn_fromUtf8, qstr, trans.c_str(), (int)trans.length())) {
+                if (g_o_QPainter_drawText_RectF) g_o_QPainter_drawText_RectF(pPainter, pRectF, flags, qstr, pBoundingRect);
+                SafeDestroyQString(g_pfn_QString_dtor, qstr);
                 return;
             }
         }
     }
-    g_o_QPainter_drawText_RectF(pPainter, pRectF, flags, pQString, pBoundingRect);
+    if (g_o_QPainter_drawText_RectF) g_o_QPainter_drawText_RectF(pPainter, pRectF, flags, pQString, pBoundingRect);
 }
 
 static void __fastcall hk_QPainter_drawText_PointF(void* pPainter, const void* pPointF, const void* pQString) {
     void* caller = _ReturnAddress();
-    if (IsValidQString(pQString) && g_pfn_utf16 && g_pfn_fromUtf8) {
-        const wchar_t* wstr = g_pfn_utf16(pQString);
-        if (wstr && wstr[0] != L'\0') {
-            std::string trans;
-            if (FindTranslationScopedW(caller, wstr, trans)) {
-                void* qstr[1] = {0};
-                g_pfn_fromUtf8(qstr, trans.c_str(), (int)trans.length());
-                g_o_QPainter_drawText_PointF(pPainter, pPointF, qstr);
-                if (g_pfn_QString_dtor) g_pfn_QString_dtor(qstr);
+    const wchar_t* wstr = nullptr;
+    if (SafeGetUtf16(g_pfn_utf16, pQString, wstr)) {
+        std::string trans;
+        if (FindTranslationScopedW(caller, wstr, trans)) {
+            void* qstr[1] = {0};
+            if (SafeCreateQString(g_pfn_fromUtf8, qstr, trans.c_str(), (int)trans.length())) {
+                if (g_o_QPainter_drawText_PointF) g_o_QPainter_drawText_PointF(pPainter, pPointF, qstr);
+                SafeDestroyQString(g_pfn_QString_dtor, qstr);
                 return;
             }
         }
     }
-    g_o_QPainter_drawText_PointF(pPainter, pPointF, pQString);
+    if (g_o_QPainter_drawText_PointF) g_o_QPainter_drawText_PointF(pPainter, pPointF, pQString);
 }
 
 // 3. QAction
 static void __fastcall hk_QAction_setText(void* pAction, const void* pQString) {
     void* caller = _ReturnAddress();
-    if (IsValidQString(pQString) && g_pfn_utf16 && g_pfn_fromUtf8) {
-        const wchar_t* wstr = g_pfn_utf16(pQString);
-        if (wstr && wstr[0] != L'\0') {
-            std::string trans;
-            if (FindTranslationScopedW(caller, wstr, trans)) {
-                void* qstr[1] = {0};
-                g_pfn_fromUtf8(qstr, trans.c_str(), (int)trans.length());
-                g_o_QAction_setText(pAction, qstr);
-                if (g_pfn_QString_dtor) g_pfn_QString_dtor(qstr);
+    const wchar_t* wstr = nullptr;
+    if (SafeGetUtf16(g_pfn_utf16, pQString, wstr)) {
+        std::string trans;
+        if (FindTranslationScopedW(caller, wstr, trans)) {
+            void* qstr[1] = {0};
+            if (SafeCreateQString(g_pfn_fromUtf8, qstr, trans.c_str(), (int)trans.length())) {
+                if (g_o_QAction_setText) g_o_QAction_setText(pAction, qstr);
+                SafeDestroyQString(g_pfn_QString_dtor, qstr);
                 return;
             }
         }
     }
-    g_o_QAction_setText(pAction, pQString);
+    if (g_o_QAction_setText) g_o_QAction_setText(pAction, pQString);
 }
 
 static void __fastcall hk_QAction_setToolTip(void* pAction, const void* pQString) {
     void* caller = _ReturnAddress();
-    if (IsValidQString(pQString) && g_pfn_utf16 && g_pfn_fromUtf8) {
-        const wchar_t* wstr = g_pfn_utf16(pQString);
-        if (wstr && wstr[0] != L'\0') {
-            std::string trans;
-            if (FindTranslationScopedW(caller, wstr, trans)) {
-                void* qstr[1] = {0};
-                g_pfn_fromUtf8(qstr, trans.c_str(), (int)trans.length());
-                g_o_QAction_setToolTip(pAction, qstr);
-                if (g_pfn_QString_dtor) g_pfn_QString_dtor(qstr);
+    const wchar_t* wstr = nullptr;
+    if (SafeGetUtf16(g_pfn_utf16, pQString, wstr)) {
+        std::string trans;
+        if (FindTranslationScopedW(caller, wstr, trans)) {
+            void* qstr[1] = {0};
+            if (SafeCreateQString(g_pfn_fromUtf8, qstr, trans.c_str(), (int)trans.length())) {
+                if (g_o_QAction_setToolTip) g_o_QAction_setToolTip(pAction, qstr);
+                SafeDestroyQString(g_pfn_QString_dtor, qstr);
                 return;
             }
         }
     }
-    g_o_QAction_setToolTip(pAction, pQString);
+    if (g_o_QAction_setToolTip) g_o_QAction_setToolTip(pAction, pQString);
 }
 
 static void __fastcall hk_QAction_setStatusTip(void* pAction, const void* pQString) {
     void* caller = _ReturnAddress();
-    if (IsValidQString(pQString) && g_pfn_utf16 && g_pfn_fromUtf8) {
-        const wchar_t* wstr = g_pfn_utf16(pQString);
-        if (wstr && wstr[0] != L'\0') {
-            std::string trans;
-            if (FindTranslationScopedW(caller, wstr, trans)) {
-                void* qstr[1] = {0};
-                g_pfn_fromUtf8(qstr, trans.c_str(), (int)trans.length());
-                g_o_QAction_setStatusTip(pAction, qstr);
-                if (g_pfn_QString_dtor) g_pfn_QString_dtor(qstr);
+    const wchar_t* wstr = nullptr;
+    if (SafeGetUtf16(g_pfn_utf16, pQString, wstr)) {
+        std::string trans;
+        if (FindTranslationScopedW(caller, wstr, trans)) {
+            void* qstr[1] = {0};
+            if (SafeCreateQString(g_pfn_fromUtf8, qstr, trans.c_str(), (int)trans.length())) {
+                if (g_o_QAction_setStatusTip) g_o_QAction_setStatusTip(pAction, qstr);
+                SafeDestroyQString(g_pfn_QString_dtor, qstr);
                 return;
             }
         }
     }
-    g_o_QAction_setStatusTip(pAction, pQString);
+    if (g_o_QAction_setStatusTip) g_o_QAction_setStatusTip(pAction, pQString);
 }
 
 static void __fastcall hk_QAction_setWhatsThis(void* pAction, const void* pQString) {
     void* caller = _ReturnAddress();
-    if (IsValidQString(pQString) && g_pfn_utf16 && g_pfn_fromUtf8) {
-        const wchar_t* wstr = g_pfn_utf16(pQString);
-        if (wstr && wstr[0] != L'\0') {
-            std::string trans;
-            if (FindTranslationScopedW(caller, wstr, trans)) {
-                void* qstr[1] = {0};
-                g_pfn_fromUtf8(qstr, trans.c_str(), (int)trans.length());
-                g_o_QAction_setWhatsThis(pAction, qstr);
-                if (g_pfn_QString_dtor) g_pfn_QString_dtor(qstr);
+    const wchar_t* wstr = nullptr;
+    if (SafeGetUtf16(g_pfn_utf16, pQString, wstr)) {
+        std::string trans;
+        if (FindTranslationScopedW(caller, wstr, trans)) {
+            void* qstr[1] = {0};
+            if (SafeCreateQString(g_pfn_fromUtf8, qstr, trans.c_str(), (int)trans.length())) {
+                if (g_o_QAction_setWhatsThis) g_o_QAction_setWhatsThis(pAction, qstr);
+                SafeDestroyQString(g_pfn_QString_dtor, qstr);
                 return;
             }
         }
     }
-    g_o_QAction_setWhatsThis(pAction, pQString);
+    if (g_o_QAction_setWhatsThis) g_o_QAction_setWhatsThis(pAction, pQString);
 }
 
 // 4. 按钮/标签/窗口标题
 static void __fastcall hk_QAbstractButton_setText(void* pButton, const void* pQString) {
     void* caller = _ReturnAddress();
-    if (IsValidQString(pQString) && g_pfn_utf16 && g_pfn_fromUtf8) {
-        const wchar_t* wstr = g_pfn_utf16(pQString);
-        if (wstr && wstr[0] != L'\0') {
-            std::string trans;
-            if (FindTranslationScopedW(caller, wstr, trans)) {
-                void* qstr[1] = {0};
-                g_pfn_fromUtf8(qstr, trans.c_str(), (int)trans.length());
-                g_o_QAbstractButton_setText(pButton, qstr);
-                if (g_pfn_QString_dtor) g_pfn_QString_dtor(qstr);
+    const wchar_t* wstr = nullptr;
+    if (SafeGetUtf16(g_pfn_utf16, pQString, wstr)) {
+        std::string trans;
+        if (FindTranslationScopedW(caller, wstr, trans)) {
+            void* qstr[1] = {0};
+            if (SafeCreateQString(g_pfn_fromUtf8, qstr, trans.c_str(), (int)trans.length())) {
+                if (g_o_QAbstractButton_setText) g_o_QAbstractButton_setText(pButton, qstr);
+                SafeDestroyQString(g_pfn_QString_dtor, qstr);
                 return;
             }
         }
     }
-    g_o_QAbstractButton_setText(pButton, pQString);
+    if (g_o_QAbstractButton_setText) g_o_QAbstractButton_setText(pButton, pQString);
 }
 
 static void __fastcall hk_QLabel_setText(void* pLabel, const void* pQString) {
     void* caller = _ReturnAddress();
-    if (IsValidQString(pQString) && g_pfn_utf16 && g_pfn_fromUtf8) {
-        const wchar_t* wstr = g_pfn_utf16(pQString);
-        if (wstr && wstr[0] != L'\0') {
-            std::string trans;
-            if (FindTranslationScopedW(caller, wstr, trans)) {
-                void* qstr[1] = {0};
-                g_pfn_fromUtf8(qstr, trans.c_str(), (int)trans.length());
-                g_o_QLabel_setText(pLabel, qstr);
-                if (g_pfn_QString_dtor) g_pfn_QString_dtor(qstr);
+    const wchar_t* wstr = nullptr;
+    if (SafeGetUtf16(g_pfn_utf16, pQString, wstr)) {
+        std::string trans;
+        if (FindTranslationScopedW(caller, wstr, trans)) {
+            void* qstr[1] = {0};
+            if (SafeCreateQString(g_pfn_fromUtf8, qstr, trans.c_str(), (int)trans.length())) {
+                if (g_o_QLabel_setText) g_o_QLabel_setText(pLabel, qstr);
+                SafeDestroyQString(g_pfn_QString_dtor, qstr);
                 return;
             }
         }
     }
-    g_o_QLabel_setText(pLabel, pQString);
+    if (g_o_QLabel_setText) g_o_QLabel_setText(pLabel, pQString);
 }
 
 static void __fastcall hk_QWidget_setWindowTitle(void* pWidget, const void* pQString) {
     void* caller = _ReturnAddress();
-    if (IsValidQString(pQString) && g_pfn_utf16 && g_pfn_fromUtf8) {
-        const wchar_t* wstr = g_pfn_utf16(pQString);
-        if (wstr && wstr[0] != L'\0') {
-            std::string trans;
-            if (FindTranslationScopedW(caller, wstr, trans)) {
-                void* qstr[1] = {0};
-                g_pfn_fromUtf8(qstr, trans.c_str(), (int)trans.length());
-                g_o_QWidget_setWindowTitle(pWidget, qstr);
-                if (g_pfn_QString_dtor) g_pfn_QString_dtor(qstr);
+    const wchar_t* wstr = nullptr;
+    if (SafeGetUtf16(g_pfn_utf16, pQString, wstr)) {
+        std::string trans;
+        if (FindTranslationScopedW(caller, wstr, trans)) {
+            void* qstr[1] = {0};
+            if (SafeCreateQString(g_pfn_fromUtf8, qstr, trans.c_str(), (int)trans.length())) {
+                if (g_o_QWidget_setWindowTitle) g_o_QWidget_setWindowTitle(pWidget, qstr);
+                SafeDestroyQString(g_pfn_QString_dtor, qstr);
                 return;
             }
         }
     }
-    g_o_QWidget_setWindowTitle(pWidget, pQString);
+    if (g_o_QWidget_setWindowTitle) g_o_QWidget_setWindowTitle(pWidget, pQString);
 }
 
 // 5. Item 控件
 static void __fastcall hk_QTreeWidgetItem_setText(void* pItem, int column, const void* pQString) {
     void* caller = _ReturnAddress();
-    if (IsValidQString(pQString) && g_pfn_utf16 && g_pfn_fromUtf8) {
-        const wchar_t* wstr = g_pfn_utf16(pQString);
-        if (wstr && wstr[0] != L'\0') {
-            std::string trans;
-            if (FindTranslationScopedW(caller, wstr, trans)) {
-                void* qstr[1] = {0};
-                g_pfn_fromUtf8(qstr, trans.c_str(), (int)trans.length());
-                g_o_QTreeWidgetItem_setText(pItem, column, qstr);
-                if (g_pfn_QString_dtor) g_pfn_QString_dtor(qstr);
+    const wchar_t* wstr = nullptr;
+    if (SafeGetUtf16(g_pfn_utf16, pQString, wstr)) {
+        std::string trans;
+        if (FindTranslationScopedW(caller, wstr, trans)) {
+            void* qstr[1] = {0};
+            if (SafeCreateQString(g_pfn_fromUtf8, qstr, trans.c_str(), (int)trans.length())) {
+                if (g_o_QTreeWidgetItem_setText) g_o_QTreeWidgetItem_setText(pItem, column, qstr);
+                SafeDestroyQString(g_pfn_QString_dtor, qstr);
                 return;
             }
         }
     }
-    g_o_QTreeWidgetItem_setText(pItem, column, pQString);
+    if (g_o_QTreeWidgetItem_setText) g_o_QTreeWidgetItem_setText(pItem, column, pQString);
 }
 
 static void __fastcall hk_QTableWidgetItem_setText(void* pItem, const void* pQString) {
     void* caller = _ReturnAddress();
-    if (IsValidQString(pQString) && g_pfn_utf16 && g_pfn_fromUtf8) {
-        const wchar_t* wstr = g_pfn_utf16(pQString);
-        if (wstr && wstr[0] != L'\0') {
-            std::string trans;
-            if (FindTranslationScopedW(caller, wstr, trans)) {
-                void* qstr[1] = {0};
-                g_pfn_fromUtf8(qstr, trans.c_str(), (int)trans.length());
-                g_o_QTableWidgetItem_setText(pItem, qstr);
-                if (g_pfn_QString_dtor) g_pfn_QString_dtor(qstr);
+    const wchar_t* wstr = nullptr;
+    if (SafeGetUtf16(g_pfn_utf16, pQString, wstr)) {
+        std::string trans;
+        if (FindTranslationScopedW(caller, wstr, trans)) {
+            void* qstr[1] = {0};
+            if (SafeCreateQString(g_pfn_fromUtf8, qstr, trans.c_str(), (int)trans.length())) {
+                if (g_o_QTableWidgetItem_setText) g_o_QTableWidgetItem_setText(pItem, qstr);
+                SafeDestroyQString(g_pfn_QString_dtor, qstr);
                 return;
             }
         }
     }
-    g_o_QTableWidgetItem_setText(pItem, pQString);
+    if (g_o_QTableWidgetItem_setText) g_o_QTableWidgetItem_setText(pItem, pQString);
 }
 
 static void __fastcall hk_QListWidgetItem_setText(void* pItem, const void* pQString) {
     void* caller = _ReturnAddress();
-    if (IsValidQString(pQString) && g_pfn_utf16 && g_pfn_fromUtf8) {
-        const wchar_t* wstr = g_pfn_utf16(pQString);
-        if (wstr && wstr[0] != L'\0') {
-            std::string trans;
-            if (FindTranslationScopedW(caller, wstr, trans)) {
-                void* qstr[1] = {0};
-                g_pfn_fromUtf8(qstr, trans.c_str(), (int)trans.length());
-                g_o_QListWidgetItem_setText(pItem, qstr);
-                if (g_pfn_QString_dtor) g_pfn_QString_dtor(qstr);
+    const wchar_t* wstr = nullptr;
+    if (SafeGetUtf16(g_pfn_utf16, pQString, wstr)) {
+        std::string trans;
+        if (FindTranslationScopedW(caller, wstr, trans)) {
+            void* qstr[1] = {0};
+            if (SafeCreateQString(g_pfn_fromUtf8, qstr, trans.c_str(), (int)trans.length())) {
+                if (g_o_QListWidgetItem_setText) g_o_QListWidgetItem_setText(pItem, qstr);
+                SafeDestroyQString(g_pfn_QString_dtor, qstr);
                 return;
             }
         }
     }
-    g_o_QListWidgetItem_setText(pItem, pQString);
+    if (g_o_QListWidgetItem_setText) g_o_QListWidgetItem_setText(pItem, pQString);
 }
 
 static void __fastcall hk_QComboBox_addItem(void* pBox, const void* pQString, const void* pUserData) {
     void* caller = _ReturnAddress();
-    if (IsValidQString(pQString) && g_pfn_utf16 && g_pfn_fromUtf8) {
-        const wchar_t* wstr = g_pfn_utf16(pQString);
-        if (wstr && wstr[0] != L'\0') {
-            std::string trans;
-            if (FindTranslationScopedW(caller, wstr, trans)) {
-                void* qstr[1] = {0};
-                g_pfn_fromUtf8(qstr, trans.c_str(), (int)trans.length());
-                g_o_QComboBox_addItem(pBox, qstr, pUserData);
-                if (g_pfn_QString_dtor) g_pfn_QString_dtor(qstr);
+    const wchar_t* wstr = nullptr;
+    if (SafeGetUtf16(g_pfn_utf16, pQString, wstr)) {
+        std::string trans;
+        if (FindTranslationScopedW(caller, wstr, trans)) {
+            void* qstr[1] = {0};
+            if (SafeCreateQString(g_pfn_fromUtf8, qstr, trans.c_str(), (int)trans.length())) {
+                if (g_o_QComboBox_addItem) g_o_QComboBox_addItem(pBox, qstr, pUserData);
+                SafeDestroyQString(g_pfn_QString_dtor, qstr);
                 return;
             }
         }
     }
-    g_o_QComboBox_addItem(pBox, pQString, pUserData);
+    if (g_o_QComboBox_addItem) g_o_QComboBox_addItem(pBox, pQString, pUserData);
 }
 
 // ==============================================================================
@@ -1035,6 +1060,7 @@ static bool TryHookQtToolsModules() {
                 LogHook("[HOOK] %s symbol not found!", name);
                 return false;
             }
+            LogHook("[HOOK] Calling InstallHook for %s (target=%p, detour=%p)...", name, pTarget, pDetour);
             bool ok = HookManager::Instance().InstallHook(pTarget, pDetour, ppOriginal, name);
             if (!ok) {
                 LogHook("[HOOK] %s InstallHook failed!", name);
@@ -1224,19 +1250,16 @@ static LONG WINAPI DiagnosticCrashLoggerVEH(PEXCEPTION_POINTERS pExceptionInfo) 
     // 2. 诊断严重异常与 Hook 自身异常熔断
     if (code == EXCEPTION_ACCESS_VIOLATION || code == EXCEPTION_ILLEGAL_INSTRUCTION || code == EXCEPTION_DATATYPE_MISALIGNMENT) {
         void* rip = (void*)pExceptionInfo->ContextRecord->Rip;
+        std::wstring modName = GetCallerModuleName(rip);
+        ULONG_PTR faultAddr = 0;
+        int accessType = 0;
+        if (code == EXCEPTION_ACCESS_VIOLATION && pExceptionInfo->ExceptionRecord->NumberParameters >= 2) {
+            accessType = (int)pExceptionInfo->ExceptionRecord->ExceptionInformation[0];
+            faultAddr = pExceptionInfo->ExceptionRecord->ExceptionInformation[1];
+        }
 
-        // 若异常发生在汉化插件自身代码或已安装的 Hook Detour 范围内，记录现场并紧急熔断全部 Hook
-        if (IsOurCodeAddress(rip)) {
-            std::wstring modName = GetCallerModuleName(rip);
-            ULONG_PTR faultAddr = 0;
-            int accessType = 0;
-            if (code == EXCEPTION_ACCESS_VIOLATION && pExceptionInfo->ExceptionRecord->NumberParameters >= 2) {
-                accessType = (int)pExceptionInfo->ExceptionRecord->ExceptionInformation[0];
-                faultAddr = pExceptionInfo->ExceptionRecord->ExceptionInformation[1];
-            }
-
-            LogHook("================ [HOOK EXCEPTION CAPTURED] ================");
-            LogHook("Exception Code : 0x%08X", code);
+        LogHook("================ [CRASH EXCEPTION CAPTURED] ================");
+        LogHook("Exception Code : 0x%08X", code);
             LogHook("Faulting RIP   : %p (Module: %ls)", rip, modName.c_str());
             if (code == EXCEPTION_ACCESS_VIOLATION) {
                 LogHook("Access Violation: Attempt to %s memory at address %p",
@@ -1294,9 +1317,8 @@ static LONG WINAPI DiagnosticCrashLoggerVEH(PEXCEPTION_POINTERS pExceptionInfo) 
                 }
             }
 
-            // 紧急禁用所有 Hook，防止死锁与循环崩溃
-            HookManager::Instance().EmergencyDisableAllHooks();
-        }
+        // 紧急禁用所有 Hook，防止死锁与循环崩溃
+        HookManager::Instance().EmergencyDisableAllHooks();
     }
 
     // 允许异常在宿主进程中继续正常传播
@@ -1327,14 +1349,38 @@ extern "C" __declspec(dllexport) bool InitializeTranslator() {
     g_pfn_fromUtf8 = (fnQString_fromUtf8)GetProcAddress(hQtCore, "?fromUtf8@QString@@SA?AV1@PEBDH@Z");
     g_pfn_utf16 = (fnQString_utf16)GetProcAddress(hQtCore, "?utf16@QString@@QEBAPEBGXZ");
     g_pfn_QString_dtor = (fnQString_dtor)GetProcAddress(hQtCore, "??1QString@@QEAA@XZ");
-    void* pTr = (void*)GetProcAddress(hQtCore, "?tr@QMetaObject@@QEBA?AVQString@@PEBD0H@Z");
 
-    LogHook("[INIT] Qt5Core=%p, fromUtf8=%p, utf16=%p, dtor=%p, tr=%p", hQtCore, g_pfn_fromUtf8, g_pfn_utf16, g_pfn_QString_dtor, pTr);
-
-    if (pTr && g_pfn_fromUtf8 && !g_o_QMetaObject_tr) {
-        bool ok = HookManager::Instance().InstallHook(pTr, (void*)hk_QMetaObject_tr, (void**)&g_o_QMetaObject_tr, "QMetaObject::tr");
-        LogHook("[INIT] Hooked QMetaObject::tr, result=%d, orig=%p", ok, g_o_QMetaObject_tr);
+    // 优先从 LCLZ 补丁元数据头直接读取原始真实 QMetaObject::tr 地址（杜绝 EAT 重定向环境下的自死锁/死循环）
+    const PatchHeader* pHeader = nullptr;
+    PIMAGE_DOS_HEADER dos = (PIMAGE_DOS_HEADER)hQtCore;
+    if (dos->e_magic == IMAGE_DOS_SIGNATURE) {
+        PIMAGE_NT_HEADERS nt = (PIMAGE_NT_HEADERS)((uint8_t*)hQtCore + dos->e_lfanew);
+        PIMAGE_SECTION_HEADER sec = IMAGE_FIRST_SECTION(nt);
+        for (WORD i = 0; i < nt->FileHeader.NumberOfSections; ++i) {
+            if (memcmp(sec[i].Name, ".text", 5) == 0) {
+                uint32_t textEndRva = sec[i].VirtualAddress + sec[i].Misc.VirtualSize;
+                uint32_t caveRva = (textEndRva + 15) & ~15;
+                const PatchHeader* pH = (const PatchHeader*)((uint8_t*)hQtCore + caveRva);
+                if (memcmp(pH->magic, "LCLZ", 4) == 0 && pH->origTrRva != 0) {
+                    pHeader = pH;
+                }
+                break;
+            }
+        }
     }
+
+    if (pHeader && pHeader->origTrRva != 0) {
+        g_o_QMetaObject_tr = (fnQMetaObject_tr)((uint8_t*)hQtCore + pHeader->origTrRva);
+        LogHook("[INIT] EAT Redirect: real QMetaObject::tr resolved from LCLZ header at %p", g_o_QMetaObject_tr);
+    } else {
+        void* pTr = (void*)GetProcAddress(hQtCore, "?tr@QMetaObject@@QEBA?AVQString@@PEBD0H@Z");
+        if (pTr && g_pfn_fromUtf8 && !g_o_QMetaObject_tr) {
+            bool ok = HookManager::Instance().InstallHook(pTr, (void*)hk_QMetaObject_tr, (void**)&g_o_QMetaObject_tr, "QMetaObject::tr");
+            LogHook("[INIT] Hooked QMetaObject::tr via MinHook, result=%d, orig=%p", ok, g_o_QMetaObject_tr);
+        }
+    }
+
+    LogHook("[INIT] Qt5Core=%p, fromUtf8=%p, utf16=%p, dtor=%p, orig_tr=%p", hQtCore, g_pfn_fromUtf8, g_pfn_utf16, g_pfn_QString_dtor, g_o_QMetaObject_tr);
 
     // 2. 创建异步唤醒事件并注册 DLL 通知
     g_hWakeHookEvent = CreateEventW(NULL, FALSE, FALSE, NULL);

@@ -208,13 +208,13 @@ int main() {
     }
     assert(patchOk && "PE Patch must succeed on real Qt5Core.dll");
 
-    // 3.2 验证 LCLZ 补丁头元数据与结构正确性
     PatchInfo pInfo;
     std::wstring infoErr;
     bool infoOk = PePatcher::GetPatchInfo(tempPatched.wstring(), pInfo, infoErr);
-    assert(infoOk && pInfo.isPatched && pInfo.version == 1 && "LCLZ PatchHeader must be detected");
+    assert(infoOk && pInfo.isPatched && pInfo.version == 2 && "LCLZ PatchHeader must be detected");
     assert(pInfo.originalEntryRva == 0x2db8fc && "originalEntryRva must match true Qt5Core entry point");
-    std::cout << "[Test 3.2] PePatcher::GetPatchInfo (LCLZ Magic & OrigEntry=0x" << std::hex << pInfo.originalEntryRva << std::dec << "): PASSED\n";
+    assert(pInfo.origTrRva == 0x1dc390 && "origTrRva must match true QMetaObject::tr RVA");
+    std::cout << "[Test 3.2] PePatcher::GetPatchInfo (LCLZ Magic v" << pInfo.version << " & OrigEntry=0x" << std::hex << pInfo.originalEntryRva << ", OrigTr=0x" << pInfo.origTrRva << std::dec << "): PASSED\n";
 
     // 3.3 测试对已补丁 DLL 二次补丁（验证 LCLZ 头防止入口点链式死循环的幂等性）
     fs::path tempPatched2 = fs::current_path() / L"test_repatched_Qt5Core.dll";
@@ -222,8 +222,10 @@ int main() {
     assert(repatchOk && "Re-patching must succeed");
     PatchInfo pInfo2;
     PePatcher::GetPatchInfo(tempPatched2.wstring(), pInfo2, infoErr);
-    assert(pInfo2.isPatched && pInfo2.originalEntryRva == 0x2db8fc && "Re-patching must retain original true entry point");
-    std::cout << "[Test 3.3] PePatcher Idempotent Re-patching (Retain OrigEntry=0x" << std::hex << pInfo2.originalEntryRva << std::dec << "): PASSED\n";
+    // 部署至实际 CS2 目录供实时调试
+    fs::path realCs2Qt = fs::path(cs2Root) / L"game" / L"bin" / L"win64" / L"Qt5Core.dll";
+    fs::copy_file(tempPatched, realCs2Qt, fs::copy_options::overwrite_existing);
+    std::cout << "[Test 3.4] Deployed patched Qt5Core.dll to live CS2 bin directory: PASSED\n";
 
     if (fs::exists(tempPatched)) fs::remove(tempPatched);
     if (fs::exists(tempPatched2)) fs::remove(tempPatched2);

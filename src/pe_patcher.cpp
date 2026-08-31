@@ -199,6 +199,7 @@ bool PePatcher::PatchQtCore(const std::wstring& srcDllPath, const std::wstring& 
     }
 
     DWORD origEntryPointRva = ntHeadersConst->OptionalHeader.AddressOfEntryPoint;
+    DWORD origTrRva = 0;
 
     // 4. Code Cave 起始 RVA 判定（使用 64 位整型运算防止溢出）
     uint64_t textSecEndRva64 = static_cast<uint64_t>(textSec->VirtualAddress) + static_cast<uint64_t>(textSec->Misc.VirtualSize);
@@ -214,11 +215,14 @@ bool PePatcher::PatchQtCore(const std::wstring& srcDllPath, const std::wstring& 
     auto optCaveHeaderOff = RvaToFileOffset(ntHeadersConst, caveRva, buffer.size(), sizeof(PatchHeader));
     if (optCaveHeaderOff) {
         const PatchHeader* pHeader = reader.ReadStruct<PatchHeader>(*optCaveHeaderOff);
-        if (pHeader && std::memcmp(pHeader->magic, "LCLZ", 4) == 0 && pHeader->version == 1) {
+        if (pHeader && std::memcmp(pHeader->magic, "LCLZ", 4) == 0 && (pHeader->version == 1 || pHeader->version == 2)) {
             uint64_t origEntry64 = pHeader->originalEntryRva;
             if (origEntry64 >= textSec->VirtualAddress && origEntry64 < textSecEndRva64) {
                 origEntryPointRva = pHeader->originalEntryRva;
                 bFoundLclzMagic = true;
+            }
+            if (pHeader->origTrRva != 0) {
+                origTrRva = pHeader->origTrRva;
             }
         }
     }
@@ -314,147 +318,242 @@ bool PePatcher::PatchQtCore(const std::wstring& srcDllPath, const std::wstring& 
         currDescOff += sizeof(IMAGE_IMPORT_DESCRIPTOR);
     }
 
-    if (iatLoadLibRva == 0) {
-        outError = L"未在导入表中检索到有效的 LoadLibraryA IAT 条目";
+    if (iatLoadLibRva == 0 || iatGetProcRva == 0) {
+        outError = L"未在导入表中检索到有效的 LoadLibraryA 或 GetProcAddress IAT 条目";
         return false;
     }
 
-    // 6. Code Cave 内存布局计算：
-    // [0..sizeof(PatchHeader)] : PatchHeader ("LCLZ")
+    // 6. 寻找 ?tr@QMetaObject@@QEBA?AVQString@@PEBD0H@Z 在 Export Table 中的条目与 RVA
+    size_t trEatFileOffset = 0;
+    IMAGE_DATA_DIRECTORY exportDataDir = ntHeadersConst->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT];
+    if (exportDataDir.VirtualAddress != 0 && exportDataDir.Size != 0) {
+        auto optExportOff = RvaToFileOffset(ntHeadersConst, exportDataDir.VirtualAddress, buffer.size(), sizeof(IMAGE_EXPORT_DIRECTORY));
+        if (optExportOff) {
+            const IMAGE_EXPORT_DIRECTORY* expDir = reader.ReadStruct<IMAGE_EXPORT_DIRECTORY>(*optExportOff);
+            if (expDir) {
+                auto optFunctionsOff = RvaToFileOffset(ntHeadersConst, expDir->AddressOfFunctions, buffer.size(), expDir->NumberOfFunctions * sizeof(DWORD));
+                auto optNamesOff = RvaToFileOffset(ntHeadersConst, expDir->AddressOfNames, buffer.size(), expDir->NumberOfNames * sizeof(DWORD));
+                auto optOrdinalsOff = RvaToFileOffset(ntHeadersConst, expDir->AddressOfNameOrdinals, buffer.size(), expDir->NumberOfNames * sizeof(WORD));
+
+                if (optFunctionsOff && optNamesOff && optOrdinalsOff) {
+                    const DWORD* pFunctions = reinterpret_cast<const DWORD*>(buffer.data() + *optFunctionsOff);
+                    const DWORD* pNames = reinterpret_cast<const DWORD*>(buffer.data() + *optNamesOff);
+                    const WORD* pOrdinals = reinterpret_cast<const WORD*>(buffer.data() + *optOrdinalsOff);
+
+                    for (DWORD i = 0; i < expDir->NumberOfNames; ++i) {
+                        auto optNameOff = RvaToFileOffset(ntHeadersConst, pNames[i], buffer.size(), 1);
+                        if (optNameOff) {
+                            const char* symName = reader.ReadNullTerminatedString(*optNameOff, 128);
+                            if (symName && std::strcmp(symName, "?tr@QMetaObject@@QEBA?AVQString@@PEBD0H@Z") == 0) {
+                                WORD ordIndex = pOrdinals[i];
+                                if (origTrRva == 0) {
+                                    origTrRva = pFunctions[ordIndex];
+                                }
+                                trEatFileOffset = *optFunctionsOff + ordIndex * sizeof(DWORD);
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    if (origTrRva == 0 || trEatFileOffset == 0) {
+        outError = L"未在导出表中检索到 ?tr@QMetaObject@@QEBA?AVQString@@PEBD0H@Z 条目";
+        return false;
+    }
+
+    // 7. Code Cave 内存布局计算：
+    // [0..sizeof(PatchHeader)] : PatchHeader ("LCLZ", 20 bytes)
+    // [..+1]                   : uint8_t g_bNeedsInit (0)
+    // [..+1]                   : uint8_t g_bTrHooked (0)
+    // [..+8]                   : uint64_t g_pfnDetourPtr (0)
     // [..]                     : "qtcore_qm.dll\0"
-    // [..]                     : "InitializeTranslator\0"
-    // [对齐到 16 字节]         : Shellcode 起始 (codeStartRva)
+    // [..]                     : "tr\0"
+    // [紧凑对齐]               : epCodeStartRva (仅记录标志并 jump 原 EntryPoint，绝不调用任何 API)
+    // [紧凑对齐]               : trCodeStartRva (在真正脱离 Loader Lock 后的首次 Qt API 调用触发延迟引导)
     const std::string dllName = "qtcore_qm.dll";
-    const std::string funcName = "InitializeTranslator";
+    const std::string funcName = "tr";
     DWORD dllNameLen = static_cast<DWORD>(dllName.length() + 1);
     DWORD funcNameLen = static_cast<DWORD>(funcName.length() + 1);
 
     DWORD headerRva = caveRva;
-    DWORD dllNameRva = headerRva + sizeof(PatchHeader);
+    DWORD initFlagRva = headerRva + sizeof(PatchHeader);
+    DWORD trHookedFlagRva = initFlagRva + 1;
+    DWORD detourPtrRva = (trHookedFlagRva + 1 + 7) & ~7; // 8 字节对齐
+    DWORD dllNameRva = detourPtrRva + 8;
     DWORD funcNameRva = dllNameRva + dllNameLen;
-    DWORD totalDataLen = static_cast<DWORD>(sizeof(PatchHeader)) + dllNameLen + funcNameLen;
-    DWORD dataAlignedLen = (totalDataLen + 15) & ~15;
 
-    DWORD codeStartRva = caveRva + dataAlignedLen;
+    DWORD totalDataLen = (funcNameRva + funcNameLen - caveRva);
+    DWORD epCodeStartRva = caveRva + totalDataLen;
 
-    // 7. 构建纯净外部 Bootstrap Shellcode (LoadLibraryA -> GetProcAddress("InitializeTranslator") -> call rax)
-    std::vector<uint8_t> shellcode;
+    // 8. 构建纯净 EntryPoint Shellcode (仅记录需要初始化并立即返回原 EntryPoint，绝不在 Loader Lock 中执行任何 API 或 I/O)
+    std::vector<uint8_t> epShellcode;
 
-    // 0. 检查 fdwReason (EDX) 是否为 DLL_PROCESS_ATTACH (1)
-    // 若不是 DLL_PROCESS_ATTACH (例如 DLL_THREAD_ATTACH)，直接跳转到原入口点，避免线程创建时重复调用注入
-    shellcode.push_back(0x83);
-    shellcode.push_back(0xfa);
-    shellcode.push_back(0x01); // cmp edx, 1
+    // cmp edx, 1 (DLL_PROCESS_ATTACH)
+    epShellcode.push_back(0x83);
+    epShellcode.push_back(0xfa);
+    epShellcode.push_back(0x01);
 
-    DWORD currRva = codeStartRva + static_cast<DWORD>(shellcode.size());
-    int32_t dispSkip = static_cast<int32_t>(origEntryPointRva) - static_cast<int32_t>(currRva + 6);
-    shellcode.push_back(0x0f);
-    shellcode.push_back(0x85); // jne origEntryPoint
-    shellcode.insert(shellcode.end(), reinterpret_cast<uint8_t*>(&dispSkip), reinterpret_cast<uint8_t*>(&dispSkip) + 4);
+    // jne origEntryPoint (2 字节 short jump 或 6 字节 near jump)
+    DWORD currEpRva = epCodeStartRva + static_cast<DWORD>(epShellcode.size());
+    int32_t dispSkip = static_cast<int32_t>(origEntryPointRva) - static_cast<int32_t>(currEpRva + 6);
+    epShellcode.push_back(0x0f);
+    epShellcode.push_back(0x85);
+    epShellcode.insert(epShellcode.end(), reinterpret_cast<uint8_t*>(&dispSkip), reinterpret_cast<uint8_t*>(&dispSkip) + 4);
 
-    // 1. 保护易失寄存器 (8 个 push，共 12 字节机器码)
-    // push rax(0x50), rcx(0x51), rdx(0x52), rbx(0x53), r8(0x41,0x50), r9(0x41,0x51), r10(0x41,0x52), r11(0x41,0x53)
+    // mov byte ptr [rip + dispInitFlag], 1 (仅在内存 Code Cave 中标记状态，耗时 5ns)
+    currEpRva = epCodeStartRva + static_cast<DWORD>(epShellcode.size());
+    int32_t dispInitFlag = static_cast<int32_t>(initFlagRva) - static_cast<int32_t>(currEpRva + 7);
+    epShellcode.push_back(0xc6);
+    epShellcode.push_back(0x05);
+    epShellcode.insert(epShellcode.end(), reinterpret_cast<uint8_t*>(&dispInitFlag), reinterpret_cast<uint8_t*>(&dispInitFlag) + 4);
+    epShellcode.push_back(0x01);
+
+    // jmp origEntryPoint (直接跳回原始 EntryPoint)
+    currEpRva = epCodeStartRva + static_cast<DWORD>(epShellcode.size());
+    int32_t dispBack = static_cast<int32_t>(origEntryPointRva) - static_cast<int32_t>(currEpRva + 5);
+    epShellcode.push_back(0xe9);
+    epShellcode.insert(epShellcode.end(), reinterpret_cast<uint8_t*>(&dispBack), reinterpret_cast<uint8_t*>(&dispBack) + 4);
+
+    DWORD trCodeStartRva = epCodeStartRva + static_cast<DWORD>(epShellcode.size());
+
+    // 9. 构建脱离 Loader Lock 后的首个 Qt API (QMetaObject::tr) 延迟引导 Shellcode
+    std::vector<uint8_t> trShellcode;
+
+    // 0. cmp byte ptr [rip + dispTrHooked], 1 (已初始化则直接跳转 Detour)
+    DWORD currTrRva = trCodeStartRva + static_cast<DWORD>(trShellcode.size());
+    int32_t dispTrHooked = static_cast<int32_t>(trHookedFlagRva) - static_cast<int32_t>(currTrRva + 7);
+    trShellcode.push_back(0x80);
+    trShellcode.push_back(0x3d);
+    trShellcode.insert(trShellcode.end(), reinterpret_cast<uint8_t*>(&dispTrHooked), reinterpret_cast<uint8_t*>(&dispTrHooked) + 4);
+    trShellcode.push_back(0x01);
+
+    // je jump_detour (短跳转 0x74)
+    size_t jeDetourIdx = trShellcode.size();
+    trShellcode.push_back(0x74);
+    trShellcode.push_back(0x00); // 待回填 1 字节相对偏移
+
+    // 1. 保护所有参数寄存器与易失寄存器 (rax, rcx, rdx, rbx, r8, r9, r10, r11)
     const uint8_t pushRegs[] = { 0x50, 0x51, 0x52, 0x53, 0x41, 0x50, 0x41, 0x51, 0x41, 0x52, 0x41, 0x53 };
-    shellcode.insert(shellcode.end(), pushRegs, pushRegs + sizeof(pushRegs));
+    trShellcode.insert(trShellcode.end(), pushRegs, pushRegs + sizeof(pushRegs));
 
-    // 2. 栈对齐：sub rsp, 0x28 (Windows x64 影子空间)
+    // 2. 栈对齐：sub rsp, 0x28
     const uint8_t subRsp[] = { 0x48, 0x83, 0xec, 0x28 };
-    shellcode.insert(shellcode.end(), subRsp, subRsp + sizeof(subRsp));
+    trShellcode.insert(trShellcode.end(), subRsp, subRsp + sizeof(subRsp));
 
-    // 3. lea rcx, [rip + dispDllName] (指向 "qtcore_qm.dll")
-    currRva = codeStartRva + static_cast<DWORD>(shellcode.size());
-    int32_t dispDllName = static_cast<int32_t>(dllNameRva) - static_cast<int32_t>(currRva + 7);
-    shellcode.push_back(0x48);
-    shellcode.push_back(0x8d);
-    shellcode.push_back(0x0d);
-    shellcode.insert(shellcode.end(), reinterpret_cast<uint8_t*>(&dispDllName), reinterpret_cast<uint8_t*>(&dispDllName) + 4);
+    // 3. LoadLibraryA("qtcore_qm.dll") (在脱离 Loader Lock 后的普通工作线程中安全调用)
+    currTrRva = trCodeStartRva + static_cast<DWORD>(trShellcode.size());
+    int32_t dispDllName = static_cast<int32_t>(dllNameRva) - static_cast<int32_t>(currTrRva + 7);
+    trShellcode.push_back(0x48);
+    trShellcode.push_back(0x8d);
+    trShellcode.push_back(0x0d);
+    trShellcode.insert(trShellcode.end(), reinterpret_cast<uint8_t*>(&dispDllName), reinterpret_cast<uint8_t*>(&dispDllName) + 4);
 
-    // 4. call qword ptr [rip + dispLoadLib] (调用 LoadLibraryA("qtcore_qm.dll"))
-    currRva = codeStartRva + static_cast<DWORD>(shellcode.size());
-    int32_t dispLoadLib = static_cast<int32_t>(iatLoadLibRva) - static_cast<int32_t>(currRva + 6);
-    shellcode.push_back(0xff);
-    shellcode.push_back(0x15);
-    shellcode.insert(shellcode.end(), reinterpret_cast<uint8_t*>(&dispLoadLib), reinterpret_cast<uint8_t*>(&dispLoadLib) + 4);
+    currTrRva = trCodeStartRva + static_cast<DWORD>(trShellcode.size());
+    int32_t dispLoadLib = static_cast<int32_t>(iatLoadLibRva) - static_cast<int32_t>(currTrRva + 6);
+    trShellcode.push_back(0xff);
+    trShellcode.push_back(0x15);
+    trShellcode.insert(trShellcode.end(), reinterpret_cast<uint8_t*>(&dispLoadLib), reinterpret_cast<uint8_t*>(&dispLoadLib) + 4);
 
-    // 5. 外部引导执行 InitializeTranslator()
-    if (iatGetProcRva != 0) {
-        // test rax, rax
-        shellcode.push_back(0x48);
-        shellcode.push_back(0x85);
-        shellcode.push_back(0xc0);
+    // test rax, rax
+    trShellcode.push_back(0x48);
+    trShellcode.push_back(0x85);
+    trShellcode.push_back(0xc0);
 
-        // jz cleanup (0x0f, 0x84, disp32)
-        size_t jzLoadFailIdx = shellcode.size();
-        shellcode.push_back(0x0f);
-        shellcode.push_back(0x84);
-        shellcode.push_back(0x00);
-        shellcode.push_back(0x00);
-        shellcode.push_back(0x00);
-        shellcode.push_back(0x00);
+    // jz fallback_exit (短跳转 0x74)
+    size_t jzLoadFail = trShellcode.size();
+    trShellcode.push_back(0x74);
+    trShellcode.push_back(0x00);
 
-        // mov rcx, rax (pass hModule in RCX)
-        shellcode.push_back(0x48);
-        shellcode.push_back(0x89);
-        shellcode.push_back(0xc1);
+    // 4. GetProcAddress(hDll, "tr")
+    trShellcode.push_back(0x48);
+    trShellcode.push_back(0x89);
+    trShellcode.push_back(0xc1); // mov rcx, rax
 
-        // lea rdx, [rip + dispFuncName] (points to "InitializeTranslator")
-        currRva = codeStartRva + static_cast<DWORD>(shellcode.size());
-        int32_t dispFuncName = static_cast<int32_t>(funcNameRva) - static_cast<int32_t>(currRva + 7);
-        shellcode.push_back(0x48);
-        shellcode.push_back(0x8d);
-        shellcode.push_back(0x15);
-        shellcode.insert(shellcode.end(), reinterpret_cast<uint8_t*>(&dispFuncName), reinterpret_cast<uint8_t*>(&dispFuncName) + 4);
+    currTrRva = trCodeStartRva + static_cast<DWORD>(trShellcode.size());
+    int32_t dispTrFuncName = static_cast<int32_t>(funcNameRva) - static_cast<int32_t>(currTrRva + 7);
+    trShellcode.push_back(0x48);
+    trShellcode.push_back(0x8d);
+    trShellcode.push_back(0x15);
+    trShellcode.insert(trShellcode.end(), reinterpret_cast<uint8_t*>(&dispTrFuncName), reinterpret_cast<uint8_t*>(&dispTrFuncName) + 4);
 
-        // call qword ptr [rip + dispGetProc] (GetProcAddress(hDll, "InitializeTranslator"))
-        currRva = codeStartRva + static_cast<DWORD>(shellcode.size());
-        int32_t dispGetProc = static_cast<int32_t>(iatGetProcRva) - static_cast<int32_t>(currRva + 6);
-        shellcode.push_back(0xff);
-        shellcode.push_back(0x15);
-        shellcode.insert(shellcode.end(), reinterpret_cast<uint8_t*>(&dispGetProc), reinterpret_cast<uint8_t*>(&dispGetProc) + 4);
+    currTrRva = trCodeStartRva + static_cast<DWORD>(trShellcode.size());
+    int32_t dispGetProc = static_cast<int32_t>(iatGetProcRva) - static_cast<int32_t>(currTrRva + 6);
+    trShellcode.push_back(0xff);
+    trShellcode.push_back(0x15);
+    trShellcode.insert(trShellcode.end(), reinterpret_cast<uint8_t*>(&dispGetProc), reinterpret_cast<uint8_t*>(&dispGetProc) + 4);
 
-        // test rax, rax
-        shellcode.push_back(0x48);
-        shellcode.push_back(0x85);
-        shellcode.push_back(0xc0);
+    // test rax, rax
+    trShellcode.push_back(0x48);
+    trShellcode.push_back(0x85);
+    trShellcode.push_back(0xc0);
 
-        // jz cleanup (0x0f, 0x84, disp32)
-        size_t jzGetProcFailIdx = shellcode.size();
-        shellcode.push_back(0x0f);
-        shellcode.push_back(0x84);
-        shellcode.push_back(0x00);
-        shellcode.push_back(0x00);
-        shellcode.push_back(0x00);
-        shellcode.push_back(0x00);
+    // jz fallback_exit (短跳转 0x74)
+    size_t jzGetProcFail = trShellcode.size();
+    trShellcode.push_back(0x74);
+    trShellcode.push_back(0x00);
 
-        // call rax (call InitializeTranslator())
-        shellcode.push_back(0xff);
-        shellcode.push_back(0xd0);
+    // 5. 保存解析出的 detour 函数指针并置标志位
+    currTrRva = trCodeStartRva + static_cast<DWORD>(trShellcode.size());
+    int32_t dispDetour = static_cast<int32_t>(detourPtrRva) - static_cast<int32_t>(currTrRva + 7);
+    trShellcode.push_back(0x48);
+    trShellcode.push_back(0x89);
+    trShellcode.push_back(0x05);
+    trShellcode.insert(trShellcode.end(), reinterpret_cast<uint8_t*>(&dispDetour), reinterpret_cast<uint8_t*>(&dispDetour) + 4);
 
-        // cleanup targets
-        size_t cleanupIdx = shellcode.size();
-        int32_t dispCleanup1 = static_cast<int32_t>(cleanupIdx - (jzLoadFailIdx + 6));
-        std::memcpy(&shellcode[jzLoadFailIdx + 2], &dispCleanup1, 4);
-        int32_t dispCleanup2 = static_cast<int32_t>(cleanupIdx - (jzGetProcFailIdx + 6));
-        std::memcpy(&shellcode[jzGetProcFailIdx + 2], &dispCleanup2, 4);
-    }
+    currTrRva = trCodeStartRva + static_cast<DWORD>(trShellcode.size());
+    int32_t dispTrHooked2 = static_cast<int32_t>(trHookedFlagRva) - static_cast<int32_t>(currTrRva + 7);
+    trShellcode.push_back(0xc6);
+    trShellcode.push_back(0x05);
+    trShellcode.insert(trShellcode.end(), reinterpret_cast<uint8_t*>(&dispTrHooked2), reinterpret_cast<uint8_t*>(&dispTrHooked2) + 4);
+    trShellcode.push_back(0x01);
 
-    // 6. 恢复栈：add rsp, 0x28
+    // fallback_exit 目标点
+    size_t fallbackIdx = trShellcode.size();
+    trShellcode[jzLoadFail + 1] = static_cast<uint8_t>(fallbackIdx - (jzLoadFail + 2));
+    trShellcode[jzGetProcFail + 1] = static_cast<uint8_t>(fallbackIdx - (jzGetProcFail + 2));
+
+    // 6. 恢复栈与寄存器
     const uint8_t addRsp[] = { 0x48, 0x83, 0xc4, 0x28 };
-    shellcode.insert(shellcode.end(), addRsp, addRsp + sizeof(addRsp));
+    trShellcode.insert(trShellcode.end(), addRsp, addRsp + sizeof(addRsp));
 
-    // 7. 恢复寄存器 (8 个 pop，共 12 字节机器码)
-    // pop r11, r10, r9, r8, rbx, rdx, rcx, rax
     const uint8_t popRegs[] = { 0x41, 0x5b, 0x41, 0x5a, 0x41, 0x59, 0x41, 0x58, 0x5b, 0x5a, 0x59, 0x58 };
-    shellcode.insert(shellcode.end(), popRegs, popRegs + sizeof(popRegs));
+    trShellcode.insert(trShellcode.end(), popRegs, popRegs + sizeof(popRegs));
 
-    // 8. jmp disp32 (跳回原 EntryPoint 继续正常的 Qt5Core 初始化)
-    currRva = codeStartRva + static_cast<DWORD>(shellcode.size());
-    int32_t dispBack = static_cast<int32_t>(origEntryPointRva) - static_cast<int32_t>(currRva + 5);
-    shellcode.push_back(0xe9);
-    shellcode.insert(shellcode.end(), reinterpret_cast<uint8_t*>(&dispBack), reinterpret_cast<uint8_t*>(&dispBack) + 4);
+    // jump_detour 目标点
+    size_t jumpDetourIdx = trShellcode.size();
+    trShellcode[jeDetourIdx + 1] = static_cast<uint8_t>(jumpDetourIdx - (jeDetourIdx + 2));
 
-    // 9. 统一使用 RvaToFileOffset 校验 Code Cave 是否超出 .text 节大小与文件边界
-    DWORD totalCaveBytesNeeded = dataAlignedLen + static_cast<DWORD>(shellcode.size());
+    // 7. cmp qword ptr [rip + dispDetourPtr], 0
+    currTrRva = trCodeStartRva + static_cast<DWORD>(trShellcode.size());
+    int32_t dispDetour2 = static_cast<int32_t>(detourPtrRva) - static_cast<int32_t>(currTrRva + 8);
+    trShellcode.push_back(0x48);
+    trShellcode.push_back(0x83);
+    trShellcode.push_back(0x3d);
+    trShellcode.insert(trShellcode.end(), reinterpret_cast<uint8_t*>(&dispDetour2), reinterpret_cast<uint8_t*>(&dispDetour2) + 4);
+    trShellcode.push_back(0x00);
+
+    // je jump_orig (74 06)
+    trShellcode.push_back(0x74);
+    trShellcode.push_back(0x06);
+
+    // jmp qword ptr [rip + dispDetourJump] (ff 25 disp32)
+    currTrRva = trCodeStartRva + static_cast<DWORD>(trShellcode.size());
+    int32_t dispDetourJump = static_cast<int32_t>(detourPtrRva) - static_cast<int32_t>(currTrRva + 6);
+    trShellcode.push_back(0xff);
+    trShellcode.push_back(0x25);
+    trShellcode.insert(trShellcode.end(), reinterpret_cast<uint8_t*>(&dispDetourJump), reinterpret_cast<uint8_t*>(&dispDetourJump) + 4);
+
+    // jump_orig: jmp origTrRva (e9 dispOrigTr)
+    currTrRva = trCodeStartRva + static_cast<DWORD>(trShellcode.size());
+    int32_t dispOrigTr = static_cast<int32_t>(origTrRva) - static_cast<int32_t>(currTrRva + 5);
+    trShellcode.push_back(0xe9);
+    trShellcode.insert(trShellcode.end(), reinterpret_cast<uint8_t*>(&dispOrigTr), reinterpret_cast<uint8_t*>(&dispOrigTr) + 4);
+
+    // 10. 统一使用 RvaToFileOffset 校验 Code Cave 是否超出 .text 节大小与文件边界
+    DWORD totalCaveBytesNeeded = (trCodeStartRva - caveRva) + static_cast<DWORD>(trShellcode.size());
     auto optCaveWriteOff = RvaToFileOffset(ntHeadersConst, caveRva, buffer.size(), totalCaveBytesNeeded);
     if (!optCaveWriteOff) {
         outError = L".text 节末尾剩余空间不足以容纳 Code Cave";
@@ -462,24 +561,33 @@ bool PePatcher::PatchQtCore(const std::wstring& srcDllPath, const std::wstring& 
     }
 
     size_t caveOff = *optCaveWriteOff;
-    size_t codeStartOff = caveOff + dataAlignedLen;
+    size_t epCodeStartOff = caveOff + (epCodeStartRva - caveRva);
+    size_t trCodeStartOff = caveOff + (trCodeStartRva - caveRva);
 
     // 写入 LCLZ 补丁元数据头 (PatchHeader)
     PatchHeader patchHdr;
     std::memcpy(patchHdr.magic, "LCLZ", 4);
-    patchHdr.version = 1;
+    patchHdr.version = 2;
     patchHdr.originalEntryRva = origEntryPointRva;
-    patchHdr.patchedEntryRva = codeStartRva;
+    patchHdr.origTrRva = origTrRva;
     patchHdr.payloadSize = totalCaveBytesNeeded;
 
+    std::memset(buffer.data() + caveOff, 0, totalCaveBytesNeeded);
     std::memcpy(buffer.data() + caveOff, &patchHdr, sizeof(PatchHeader));
-    std::memcpy(buffer.data() + caveOff + sizeof(PatchHeader), dllName.c_str(), dllNameLen);
-    std::memcpy(buffer.data() + caveOff + sizeof(PatchHeader) + dllNameLen, funcName.c_str(), funcNameLen);
-    std::memcpy(buffer.data() + codeStartOff, shellcode.data(), shellcode.size());
+    std::memcpy(buffer.data() + caveOff + (dllNameRva - caveRva), dllName.c_str(), dllNameLen);
+    std::memcpy(buffer.data() + caveOff + (funcNameRva - caveRva), funcName.c_str(), funcNameLen);
+    std::memcpy(buffer.data() + epCodeStartOff, epShellcode.data(), epShellcode.size());
+    std::memcpy(buffer.data() + trCodeStartOff, trShellcode.data(), trShellcode.size());
 
-    // 更新 EntryPoint
+    // 11. 更新 EntryPoint 指向纯净轻量标记 Shellcode
     IMAGE_NT_HEADERS64* ntHeadersMut = reinterpret_cast<IMAGE_NT_HEADERS64*>(buffer.data() + ntHeaderOff);
-    ntHeadersMut->OptionalHeader.AddressOfEntryPoint = codeStartRva;
+    ntHeadersMut->OptionalHeader.AddressOfEntryPoint = epCodeStartRva;
+
+    // 12. 更新 Export Address Table 中的 ?tr@QMetaObject 指向脱离 Loader Lock 后的延迟引导 Shellcode
+    *reinterpret_cast<DWORD*>(buffer.data() + trEatFileOffset) = trCodeStartRva;
+
+    // 13. 为 .text 节赋予写权限 (IMAGE_SCN_MEM_WRITE)，确保 Code Cave 内部的原子标志位读写不触发 0xC0000005 访问违规
+    const_cast<IMAGE_SECTION_HEADER*>(textSec)->Characteristics |= IMAGE_SCN_MEM_WRITE;
 
     // 写入目标文件
     std::ofstream outFile(dstDllPath, std::ios::binary);
@@ -580,7 +688,7 @@ bool PePatcher::GetPatchInfo(const std::wstring& dllPath, PatchInfo& outInfo, st
                 outInfo.isPatched = true;
                 outInfo.version = pHeader->version;
                 outInfo.originalEntryRva = pHeader->originalEntryRva;
-                outInfo.patchedEntryRva = pHeader->patchedEntryRva;
+                outInfo.origTrRva = pHeader->origTrRva;
                 outInfo.payloadSize = pHeader->payloadSize;
                 return true;
             }

@@ -8,9 +8,9 @@
 #pragma pack(push, 1)
 struct PatchHeader {
     char     magic[4];          // "LCLZ"
-    uint32_t version;           // 1
+    uint32_t version;           // 2
     uint32_t originalEntryRva;  // 原始未修改的 EntryPoint RVA
-    uint32_t patchedEntryRva;   // 注入的 Shellcode 入口点 RVA
+    uint32_t origTrRva;         // 原始 QMetaObject::tr RVA
     uint32_t payloadSize;       // Header + Strings + Shellcode 总大小
 };
 #pragma pack(pop)
@@ -19,7 +19,7 @@ struct PatchInfo {
     bool isPatched = false;
     uint32_t version = 0;
     uint32_t originalEntryRva = 0;
-    uint32_t patchedEntryRva = 0;
+    uint32_t origTrRva = 0;
     uint32_t payloadSize = 0;
 };
 
