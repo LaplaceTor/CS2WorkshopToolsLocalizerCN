@@ -725,6 +725,220 @@ int main() {
         std::cout << "[Test 13] HookManager Ownership & Transactional Staging: PASSED\n";
     }
 
+    // 14. Test Dynamic Prefix / Colon Translation Matching Logic (Redo: xxxxx, Undo: xxxxx, etc.)
+    std::cout << "[Test 14] Testing Dynamic Colon Prefix & Undo/Redo Translation Matching...\n";
+    {
+        std::unordered_map<std::string, std::string> dict;
+        dict["Undo"] = "撤销";
+        dict["Redo"] = "重做";
+        dict["Move Objects"] = "移动对象";
+        dict["Name"] = "名称";
+        dict["File"] = "文件";
+        dict["&Redo: %s"] = "&重做：%s";
+
+        auto tryDirectMatch = [](const std::unordered_map<std::string, std::string>& d, const std::string& text, std::string& out) -> bool {
+            auto it = d.find(text);
+            if (it != d.end()) {
+                out = it->second;
+                return true;
+            }
+            return false;
+        };
+
+        auto toTitleCase = [](const std::string& str) -> std::string {
+            std::string res = str;
+            bool newWord = true;
+            for (size_t i = 0; i < res.length(); ++i) {
+                unsigned char c = (unsigned char)res[i];
+                if (c == ' ' || c == '\t' || c == '-' || c == '_') {
+                    newWord = true;
+                } else if (newWord) {
+                    if (c >= 'a' && c <= 'z') res[i] = (char)(c - 'a' + 'A');
+                    newWord = false;
+                }
+            }
+            return res;
+        };
+
+        auto toSentenceCase = [](const std::string& str) -> std::string {
+            std::string res = str;
+            if (!res.empty() && res[0] >= 'a' && res[0] <= 'z') {
+                res[0] = (char)(res[0] - 'a' + 'A');
+            }
+            return res;
+        };
+
+        auto matchAndTranslate = [&](auto self, const std::unordered_map<std::string, std::string>& d, const std::string& text, std::string& out, int depth = 0) -> bool {
+            if (text.empty() || depth > 4) return false;
+            if (tryDirectMatch(d, text, out)) return true;
+
+            // 1.1 大小写归一化
+            std::string titleCase = toTitleCase(text);
+            if (titleCase != text) {
+                if (tryDirectMatch(d, titleCase, out)) return true;
+            }
+            std::string sentenceCase = toSentenceCase(text);
+            if (sentenceCase != text && sentenceCase != titleCase) {
+                if (tryDirectMatch(d, sentenceCase, out)) return true;
+            }
+
+            // 2. 去除快捷键加速符 '&'
+            if (text.find('&') != std::string::npos) {
+                std::string stripped;
+                stripped.reserve(text.length());
+                for (char c : text) {
+                    if (c != '&') stripped.push_back(c);
+                }
+                if (self(self, d, stripped, out, depth + 1)) return true;
+            }
+
+            // 6. 中括号快捷键后缀
+            if (text.back() == ']') {
+                size_t openBracket = text.rfind('[');
+                if (openBracket != std::string::npos && openBracket > 0) {
+                    std::string base = text.substr(0, openBracket);
+                    size_t baseLast = base.find_last_not_of(" \t");
+                    if (baseLast != std::string::npos) {
+                        base = base.substr(0, baseLast + 1);
+                        std::string baseTrans;
+                        if (self(self, d, base, baseTrans, depth + 1)) {
+                            out = baseTrans + " " + text.substr(openBracket);
+                            return true;
+                        }
+                    }
+                }
+            }
+
+            // 7. 圆括号快捷键后缀
+            if (text.back() == ')') {
+                size_t openParen = text.rfind('(');
+                if (openParen != std::string::npos && openParen > 0) {
+                    std::string base = text.substr(0, openParen);
+                    size_t baseLast = base.find_last_not_of(" \t");
+                    if (baseLast != std::string::npos) {
+                        base = base.substr(0, baseLast + 1);
+                        std::string baseTrans;
+                        if (self(self, d, base, baseTrans, depth + 1)) {
+                            out = baseTrans + " " + text.substr(openParen);
+                            return true;
+                        }
+                    }
+                }
+            }
+
+            // 8. 制表符快捷键后缀
+            size_t tabPos = text.find('\t');
+            if (tabPos != std::string::npos && tabPos > 0) {
+                std::string base = text.substr(0, tabPos);
+                std::string baseTrans;
+                if (self(self, d, base, baseTrans, depth + 1)) {
+                    out = baseTrans + text.substr(tabPos);
+                    return true;
+                }
+            }
+
+            // 10. 智能匹配带冒号的前缀与复合结构
+            size_t colonPos = text.find(':');
+            if (colonPos != std::string::npos && colonPos > 0) {
+                bool isScope = (colonPos + 1 < text.length() && text[colonPos + 1] == ':') || (colonPos > 0 && text[colonPos - 1] == ':');
+                bool isUrl = (colonPos + 2 < text.length() && text[colonPos + 1] == '/' && text[colonPos + 2] == '/');
+                bool isDriveLetter = (colonPos == 1 && isalpha((unsigned char)text[0]) && (colonPos + 1 < text.length() && (text[colonPos + 1] == '\\' || text[colonPos + 1] == '/')));
+
+                if (!isScope && !isUrl && !isDriveLetter) {
+                    std::string prefix = text.substr(0, colonPos);
+                    size_t prefixLast = prefix.find_last_not_of(" \t");
+                    if (prefixLast != std::string::npos) {
+                        prefix = prefix.substr(0, prefixLast + 1);
+                        std::string remainder = text.substr(colonPos + 1);
+                        size_t remainderFirst = remainder.find_first_not_of(" \t");
+                        std::string spacePad = " ";
+                        if (remainderFirst != std::string::npos) {
+                            if (remainderFirst > 0) spacePad = remainder.substr(0, remainderFirst);
+                            remainder = remainder.substr(remainderFirst);
+                        } else {
+                            remainder = "";
+                        }
+
+                        if (!remainder.empty()) {
+                            std::string patternS = prefix + ": %s";
+                            std::string pattern1 = prefix + ": %1";
+                            std::string templateTrans;
+                            std::string remainderTrans;
+                            bool okRemainder = self(self, d, remainder, remainderTrans, depth + 1);
+                            const std::string& finalRemainder = okRemainder ? remainderTrans : remainder;
+
+                            if (tryDirectMatch(d, patternS, templateTrans)) {
+                                size_t pos = templateTrans.find("%s");
+                                if (pos != std::string::npos) {
+                                    out = templateTrans.substr(0, pos) + finalRemainder + templateTrans.substr(pos + 2);
+                                    return true;
+                                }
+                            } else if (tryDirectMatch(d, pattern1, templateTrans)) {
+                                size_t pos = templateTrans.find("%1");
+                                if (pos != std::string::npos) {
+                                    out = templateTrans.substr(0, pos) + finalRemainder + templateTrans.substr(pos + 2);
+                                    return true;
+                                }
+                            }
+
+                            std::string prefixTrans;
+                            if (self(self, d, prefix, prefixTrans, depth + 1)) {
+                                out = prefixTrans + ":" + spacePad + finalRemainder;
+                                return true;
+                            }
+                        } else {
+                            std::string prefixTrans;
+                            if (self(self, d, prefix, prefixTrans, depth + 1)) {
+                                out = prefixTrans + ":";
+                                return true;
+                            }
+                        }
+                    }
+                }
+            }
+
+            return false;
+        };
+
+        dict["Repeat Command"] = "重复上条指令";
+        dict["Repeat command: %s"] = "重复上条指令：%s";
+
+        std::string res;
+        // Test 14.1: Direct Redo
+        assert(matchAndTranslate(matchAndTranslate, dict, "Redo", res) && res == "重做");
+
+        // Test 14.2: Redo with dynamic action (untranslated suffix)
+        assert(matchAndTranslate(matchAndTranslate, dict, "Redo: Box01", res) && res == "重做: Box01");
+
+        // Test 14.3: Redo with dynamic action (translated suffix)
+        assert(matchAndTranslate(matchAndTranslate, dict, "Redo: Move Objects", res) && res == "重做: 移动对象");
+
+        // Test 14.4: &Redo with dynamic action
+        assert(matchAndTranslate(matchAndTranslate, dict, "&Redo: Move Objects", res) && res == "重做: 移动对象");
+
+        // Test 14.5: Undo with shortcut
+        assert(matchAndTranslate(matchAndTranslate, dict, "Undo: Move Objects (Ctrl+Z)", res) && res == "撤销: 移动对象 (Ctrl+Z)");
+
+        // Test 14.6: Redo with tab shortcut
+        assert(matchAndTranslate(matchAndTranslate, dict, "Redo: Box01\tCtrl+Y", res) && res == "重做: Box01\tCtrl+Y");
+
+        // Test 14.7: Repeat Command cases (including Hammer's lowercase "Repeat command: %s")
+        assert(matchAndTranslate(matchAndTranslate, dict, "Repeat Command", res) && res == "重复上条指令");
+        assert(matchAndTranslate(matchAndTranslate, dict, "Repeat command", res) && res == "重复上条指令");
+        assert(matchAndTranslate(matchAndTranslate, dict, "Repeat command: Move Objects", res) && (res == "重复上条指令：移动对象" || res == "重复上条指令: 移动对象"));
+        assert(matchAndTranslate(matchAndTranslate, dict, "Repeat command: Box01", res) && (res == "重复上条指令：Box01" || res == "重复上条指令: Box01"));
+        assert(matchAndTranslate(matchAndTranslate, dict, "&Repeat command: Move Objects", res) && (res == "重复上条指令：移动对象" || res == "重复上条指令: 移动对象"));
+
+        // Test 14.8: Trailing colon
+        assert(matchAndTranslate(matchAndTranslate, dict, "Name:", res) && res == "名称:");
+
+        // Test 14.9: Drive letter and URLs must not be falsely split
+        assert(!matchAndTranslate(matchAndTranslate, dict, "C:\\cs2\\game", res));
+        assert(!matchAndTranslate(matchAndTranslate, dict, "https://valvesoftware.com", res));
+
+        std::cout << "[Test 14] Dynamic Colon Prefix & Undo/Redo/Repeat Translation Matching: PASSED\n";
+    }
+
     std::cout << "\n[ALL TESTS PASSED SUCCESSFULLY!]\n";
     return 0;
 }

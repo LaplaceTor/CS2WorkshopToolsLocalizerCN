@@ -444,12 +444,47 @@ static inline bool TryDirectMatch(const std::unordered_map<std::string, std::str
     return false;
 }
 
+static std::string ToTitleCase(const std::string& str) {
+    std::string res = str;
+    bool newWord = true;
+    for (size_t i = 0; i < res.length(); ++i) {
+        unsigned char c = (unsigned char)res[i];
+        if (c == ' ' || c == '\t' || c == '-' || c == '_') {
+            newWord = true;
+        } else if (newWord) {
+            if (c >= 'a' && c <= 'z') {
+                res[i] = (char)(c - 'a' + 'A');
+            }
+            newWord = false;
+        }
+    }
+    return res;
+}
+
+static std::string ToSentenceCase(const std::string& str) {
+    std::string res = str;
+    if (!res.empty() && res[0] >= 'a' && res[0] <= 'z') {
+        res[0] = (char)(res[0] - 'a' + 'A');
+    }
+    return res;
+}
+
 static bool MatchAndTranslateInternal(const std::unordered_map<std::string, std::string>& dict, 
                                       const std::string& text, std::string& outResult, int depth) {
     if (text.empty() || depth > 4) return false;
 
     // 1. 直接全匹配
     if (TryDirectMatch(dict, text, outResult)) return true;
+
+    // 1.1 尝试大小写归一化匹配（Title Case 如 "Repeat command" -> "Repeat Command", Sentence Case 如 "repeat command" -> "Repeat command"）
+    std::string titleCase = ToTitleCase(text);
+    if (titleCase != text) {
+        if (TryDirectMatch(dict, titleCase, outResult)) return true;
+    }
+    std::string sentenceCase = ToSentenceCase(text);
+    if (sentenceCase != text && sentenceCase != titleCase) {
+        if (TryDirectMatch(dict, sentenceCase, outResult)) return true;
+    }
 
     // 2. 去除快捷键加速符 '&'
     if (text.find('&') != std::string::npos) {
@@ -590,16 +625,69 @@ static bool MatchAndTranslateInternal(const std::unordered_map<std::string, std:
         }
     }
 
-    // 10. 智能匹配冒号后缀：例如 "Name:" -> "名称:"
-    if (text.back() == ':') {
-        std::string base = text.substr(0, text.length() - 1);
-        size_t baseLast = base.find_last_not_of(" \t");
-        if (baseLast != std::string::npos) {
-            base = base.substr(0, baseLast + 1);
-            std::string baseTrans;
-            if (MatchAndTranslateInternal(dict, base, baseTrans, depth + 1)) {
-                outResult = baseTrans + ":";
-                return true;
+    // 10. 智能匹配带冒号的前缀与复合结构：例如 "Redo: Move Objects" -> "重做: Move Objects", "Undo: Delete" -> "撤销: 删除", "Name:" -> "名称:"
+    size_t colonPos = text.find(':');
+    if (colonPos != std::string::npos && colonPos > 0) {
+        // 排除 C++ 作用域符 "::" 与 URL 协议 "://"
+        bool isScope = (colonPos + 1 < text.length() && text[colonPos + 1] == ':') || (colonPos > 0 && text[colonPos - 1] == ':');
+        bool isUrl = (colonPos + 2 < text.length() && text[colonPos + 1] == '/' && text[colonPos + 2] == '/');
+        // 排除 Windows 盘符路径 (如 "C:\...")
+        bool isDriveLetter = (colonPos == 1 && isalpha((unsigned char)text[0]) && (colonPos + 1 < text.length() && (text[colonPos + 1] == '\\' || text[colonPos + 1] == '/')));
+
+        if (!isScope && !isUrl && !isDriveLetter) {
+            std::string prefix = text.substr(0, colonPos);
+            size_t prefixLast = prefix.find_last_not_of(" \t");
+            if (prefixLast != std::string::npos) {
+                prefix = prefix.substr(0, prefixLast + 1);
+                std::string remainder = text.substr(colonPos + 1);
+                size_t remainderFirst = remainder.find_first_not_of(" \t");
+                std::string spacePad = " ";
+                if (remainderFirst != std::string::npos) {
+                    if (remainderFirst > 0) {
+                        spacePad = remainder.substr(0, remainderFirst);
+                    }
+                    remainder = remainder.substr(remainderFirst);
+                } else {
+                    remainder = "";
+                }
+
+                if (!remainder.empty()) {
+                    // 10.1 优先检查是否存在通配模板 (如 "Redo: %s" -> "重做：%s", "Undo: %1" -> "撤销：%1")
+                    std::string patternS = prefix + ": %s";
+                    std::string pattern1 = prefix + ": %1";
+                    std::string templateTrans;
+                    std::string remainderTrans;
+                    bool okRemainder = MatchAndTranslateInternal(dict, remainder, remainderTrans, depth + 1);
+                    const std::string& finalRemainder = okRemainder ? remainderTrans : remainder;
+
+                    if (TryDirectMatch(dict, patternS, templateTrans)) {
+                        size_t pos = templateTrans.find("%s");
+                        if (pos != std::string::npos) {
+                            outResult = templateTrans.substr(0, pos) + finalRemainder + templateTrans.substr(pos + 2);
+                            return true;
+                        }
+                    } else if (TryDirectMatch(dict, pattern1, templateTrans)) {
+                        size_t pos = templateTrans.find("%1");
+                        if (pos != std::string::npos) {
+                            outResult = templateTrans.substr(0, pos) + finalRemainder + templateTrans.substr(pos + 2);
+                            return true;
+                        }
+                    }
+
+                    // 10.2 尝试直接翻译前缀
+                    std::string prefixTrans;
+                    if (MatchAndTranslateInternal(dict, prefix, prefixTrans, depth + 1)) {
+                        outResult = prefixTrans + ":" + spacePad + finalRemainder;
+                        return true;
+                    }
+                } else {
+                    // 末尾冒号情况 (如 "Name:")
+                    std::string prefixTrans;
+                    if (MatchAndTranslateInternal(dict, prefix, prefixTrans, depth + 1)) {
+                        outResult = prefixTrans + ":";
+                        return true;
+                    }
+                }
             }
         }
     }
