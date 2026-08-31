@@ -196,5 +196,29 @@ size_t HookManager::GetHookCount() const {
     return m_hooks.size();
 }
 
+void HookManager::EmergencyDisableAllHooks() {
+    bool locked = m_mutex.try_lock();
+    for (auto& hook : m_hooks) {
+        if (hook.enabled && hook.target) {
+            MH_DisableHook(hook.target);
+            hook.enabled = false;
+        }
+    }
+    if (locked) {
+        m_mutex.unlock();
+    }
+}
+
+bool HookManager::IsHookAddress(void* addr) {
+    if (!addr) return false;
+    std::lock_guard<std::mutex> lock(m_mutex);
+    for (const auto& hook : m_hooks) {
+        if (hook.detour == addr || hook.target == addr) {
+            return true;
+        }
+    }
+    return false;
+}
+
 
 

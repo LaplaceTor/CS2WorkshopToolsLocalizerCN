@@ -5,6 +5,8 @@
 #include "backup_manager.h"
 
 #include <windows.h>
+#include <psapi.h>
+#include <thread>
 #include <QVBoxLayout>
 #include <QHBoxLayout>
 #include <QGridLayout>

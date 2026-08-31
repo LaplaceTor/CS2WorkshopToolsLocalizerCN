@@ -47,7 +47,7 @@ target_include_directories(qtcore_qm PRIVATE
     third_party/minhook/include
     third_party/minhook/src
 )
-target_link_libraries(qtcore_qm PRIVATE user32)
+target_link_libraries(qtcore_qm PRIVATE user32 psapi)
 set_target_properties(qtcore_qm PROPERTIES
     MSVC_RUNTIME_LIBRARY "MultiThreaded"
     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}"

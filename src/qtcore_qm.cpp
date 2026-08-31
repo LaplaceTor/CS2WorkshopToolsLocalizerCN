@@ -1,5 +1,6 @@
 #include <windows.h>
 #include <winternl.h>
+#include <psapi.h>
 #include <intrin.h>
 #include <string>
 #include <unordered_map>
@@ -1175,8 +1176,27 @@ static bool IsToolAddress(void* rip) {
 }
 
 // ==============================================================================
-// 6. 异常诊断捕获器与高精度安全防护（使用 MinHook HDE64 引擎精准安全跨越空写）
+// 6. 异常诊断捕获器（发生 Hook 自身异常时记录现场并紧急停用 Hook，绝不伪造状态主动跳过机器指令）
 // ==============================================================================
+static HMODULE g_hModule = NULL;
+
+static bool IsOurCodeAddress(void* rip) {
+    if (!rip) return false;
+    HMODULE hOurMod = g_hModule ? g_hModule : GetModuleHandleW(L"qtcore_qm.dll");
+    if (hOurMod) {
+        MODULEINFO mi = {0};
+        if (GetModuleInformation(GetCurrentProcess(), hOurMod, &mi, sizeof(mi))) {
+            uintptr_t base = (uintptr_t)mi.lpBaseOfDll;
+            uintptr_t end = base + mi.SizeOfImage;
+            uintptr_t addr = (uintptr_t)rip;
+            if (addr >= base && addr < end) {
+                return true;
+            }
+        }
+    }
+    return HookManager::Instance().IsHookAddress(rip);
+}
+
 static LONG WINAPI DiagnosticCrashLoggerVEH(PEXCEPTION_POINTERS pExceptionInfo) {
     if (!pExceptionInfo || !pExceptionInfo->ExceptionRecord || !pExceptionInfo->ContextRecord) {
         return EXCEPTION_CONTINUE_SEARCH;
@@ -1184,12 +1204,12 @@ static LONG WINAPI DiagnosticCrashLoggerVEH(PEXCEPTION_POINTERS pExceptionInfo) 
 
     DWORD code = pExceptionInfo->ExceptionRecord->ExceptionCode;
 
-    // 1. 高精度工具模块安全防护 (Targeted Precision Crash Guard via HDE64)
+    // 1. 精准工具模块低位空指针写守卫 (Targeted Tool Guard for Workshop Tools null writes)
     if (code == EXCEPTION_ACCESS_VIOLATION && pExceptionInfo->ExceptionRecord->NumberParameters >= 2) {
         ULONG_PTR faultAddr = pExceptionInfo->ExceptionRecord->ExceptionInformation[1];
         void* rip = (void*)pExceptionInfo->ContextRecord->Rip;
 
-        // 仅拦截：在 Workshop Tools 模块内访问低位未映射非法区 (< 0x10000，如未初始化结构的 0x50 偏移空写)
+        // 仅拦截：在 Workshop Tools 工具链模块内部访问低位未映射区 (< 0x10000，如未初始化结构的 0x50 偏移空写)
         if (faultAddr < 0x10000 && IsToolAddress(rip)) {
             hde64s hs;
             unsigned int len = hde64_disasm(rip, &hs);
@@ -1201,77 +1221,85 @@ static LONG WINAPI DiagnosticCrashLoggerVEH(PEXCEPTION_POINTERS pExceptionInfo) 
         }
     }
 
-    // 2. 真实异常捕获与诊断记录（记录崩溃现场，绝不跳过真实异常指令）
+    // 2. 诊断严重异常与 Hook 自身异常熔断
     if (code == EXCEPTION_ACCESS_VIOLATION || code == EXCEPTION_ILLEGAL_INSTRUCTION || code == EXCEPTION_DATATYPE_MISALIGNMENT) {
         void* rip = (void*)pExceptionInfo->ContextRecord->Rip;
-        std::wstring modName = GetCallerModuleName(rip);
-        ULONG_PTR faultAddr = 0;
-        int accessType = 0;
-        if (code == EXCEPTION_ACCESS_VIOLATION && pExceptionInfo->ExceptionRecord->NumberParameters >= 2) {
-            accessType = (int)pExceptionInfo->ExceptionRecord->ExceptionInformation[0];
-            faultAddr = pExceptionInfo->ExceptionRecord->ExceptionInformation[1];
-        }
 
-        LogHook("================ [EXCEPTION CAPTURED] ================");
-        LogHook("Exception Code : 0x%08X", code);
-        LogHook("Faulting RIP   : %p (Module: %ls)", rip, modName.c_str());
-        if (code == EXCEPTION_ACCESS_VIOLATION) {
-            LogHook("Access Violation: Attempt to %s memory at address %p",
-                accessType == 0 ? "READ" : (accessType == 1 ? "WRITE" : "EXECUTE"), (void*)faultAddr);
-        }
-        LogHook("Registers:");
-        LogHook("  RAX=%p  RBX=%p  RCX=%p  RDX=%p",
-            (void*)pExceptionInfo->ContextRecord->Rax, (void*)pExceptionInfo->ContextRecord->Rbx,
-            (void*)pExceptionInfo->ContextRecord->Rcx, (void*)pExceptionInfo->ContextRecord->Rdx);
-        LogHook("  RSI=%p  RDI=%p  RSP=%p  RBP=%p",
-            (void*)pExceptionInfo->ContextRecord->Rsi, (void*)pExceptionInfo->ContextRecord->Rdi,
-            (void*)pExceptionInfo->ContextRecord->Rsp, (void*)pExceptionInfo->ContextRecord->Rbp);
-        LogHook("  R8 =%p  R9 =%p  R10=%p  R11=%p",
-            (void*)pExceptionInfo->ContextRecord->R8, (void*)pExceptionInfo->ContextRecord->R9,
-            (void*)pExceptionInfo->ContextRecord->R10, (void*)pExceptionInfo->ContextRecord->R11);
-        LogHook("  R12=%p  R13=%p  R14=%p  R15=%p",
-            (void*)pExceptionInfo->ContextRecord->R12, (void*)pExceptionInfo->ContextRecord->R13,
-            (void*)pExceptionInfo->ContextRecord->R14, (void*)pExceptionInfo->ContextRecord->R15);
+        // 若异常发生在汉化插件自身代码或已安装的 Hook Detour 范围内，记录现场并紧急熔断全部 Hook
+        if (IsOurCodeAddress(rip)) {
+            std::wstring modName = GetCallerModuleName(rip);
+            ULONG_PTR faultAddr = 0;
+            int accessType = 0;
+            if (code == EXCEPTION_ACCESS_VIOLATION && pExceptionInfo->ExceptionRecord->NumberParameters >= 2) {
+                accessType = (int)pExceptionInfo->ExceptionRecord->ExceptionInformation[0];
+                faultAddr = pExceptionInfo->ExceptionRecord->ExceptionInformation[1];
+            }
 
-        // 记录调用栈帧
-        void** rsp = (void**)pExceptionInfo->ContextRecord->Rsp;
-        LogHook("Stack Frames (Top 32):");
-        for (int i = 0; i < 32; ++i) {
-            void* frame = nullptr;
-            if (SafeReadPointer(&rsp[i], frame) && frame) {
-                std::wstring m = GetCallerModuleName(frame);
-                if (!m.empty()) {
-                    LogHook("  [RSP+0x%02X] %p (%ls)", i * 8, frame, m.c_str());
+            LogHook("================ [HOOK EXCEPTION CAPTURED] ================");
+            LogHook("Exception Code : 0x%08X", code);
+            LogHook("Faulting RIP   : %p (Module: %ls)", rip, modName.c_str());
+            if (code == EXCEPTION_ACCESS_VIOLATION) {
+                LogHook("Access Violation: Attempt to %s memory at address %p",
+                    accessType == 0 ? "READ" : (accessType == 1 ? "WRITE" : "EXECUTE"), (void*)faultAddr);
+            }
+            LogHook("Registers:");
+            LogHook("  RAX=%p  RBX=%p  RCX=%p  RDX=%p",
+                (void*)pExceptionInfo->ContextRecord->Rax, (void*)pExceptionInfo->ContextRecord->Rbx,
+                (void*)pExceptionInfo->ContextRecord->Rcx, (void*)pExceptionInfo->ContextRecord->Rdx);
+            LogHook("  RSI=%p  RDI=%p  RSP=%p  RBP=%p",
+                (void*)pExceptionInfo->ContextRecord->Rsi, (void*)pExceptionInfo->ContextRecord->Rdi,
+                (void*)pExceptionInfo->ContextRecord->Rsp, (void*)pExceptionInfo->ContextRecord->Rbp);
+            LogHook("  R8 =%p  R9 =%p  R10=%p  R11=%p",
+                (void*)pExceptionInfo->ContextRecord->R8, (void*)pExceptionInfo->ContextRecord->R9,
+                (void*)pExceptionInfo->ContextRecord->R10, (void*)pExceptionInfo->ContextRecord->R11);
+            LogHook("  R12=%p  R13=%p  R14=%p  R15=%p",
+                (void*)pExceptionInfo->ContextRecord->R12, (void*)pExceptionInfo->ContextRecord->R13,
+                (void*)pExceptionInfo->ContextRecord->R14, (void*)pExceptionInfo->ContextRecord->R15);
+
+            // 记录调用栈帧
+            void** rsp = (void**)pExceptionInfo->ContextRecord->Rsp;
+            LogHook("Stack Frames (Top 32):");
+            for (int i = 0; i < 32; ++i) {
+                void* frame = nullptr;
+                if (SafeReadPointer(&rsp[i], frame) && frame) {
+                    std::wstring m = GetCallerModuleName(frame);
+                    if (!m.empty()) {
+                        LogHook("  [RSP+0x%02X] %p (%ls)", i * 8, frame, m.c_str());
+                    }
                 }
             }
-        }
-        LogHook("=======================================================");
+            LogHook("=======================================================");
 
-        // 自动写入 MiniDump
-        HMODULE hDbgHelp = LoadLibraryA("dbghelp.dll");
-        if (hDbgHelp) {
-            typedef BOOL(WINAPI* fnMiniDumpWriteDump)(HANDLE, DWORD, HANDLE, int, PVOID, PVOID, PVOID);
-            fnMiniDumpWriteDump pDump = (fnMiniDumpWriteDump)GetProcAddress(hDbgHelp, "MiniDumpWriteDump");
-            if (pDump) {
-                std::wstring dumpPath = GetBinDirectory() + L"captured_crash.dmp";
-                HANDLE hFile = CreateFileW(dumpPath.c_str(), GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
-                if (hFile != INVALID_HANDLE_VALUE) {
-                    struct {
-                        DWORD ThreadId;
-                        PEXCEPTION_POINTERS ExceptionPointers;
-                        BOOL ClientPointers;
-                    } exInfo;
-                    exInfo.ThreadId = GetCurrentThreadId();
-                    exInfo.ExceptionPointers = pExceptionInfo;
-                    exInfo.ClientPointers = FALSE;
-                    pDump(GetCurrentProcess(), GetCurrentProcessId(), hFile, 2 /* MiniDumpWithFullMemory */, &exInfo, NULL, NULL);
-                    CloseHandle(hFile);
-                    LogHook("[DUMP] Full minidump saved to: captured_crash.dmp");
+            // 自动写入 MiniDump
+            HMODULE hDbgHelp = LoadLibraryA("dbghelp.dll");
+            if (hDbgHelp) {
+                typedef BOOL(WINAPI* fnMiniDumpWriteDump)(HANDLE, DWORD, HANDLE, int, PVOID, PVOID, PVOID);
+                fnMiniDumpWriteDump pDump = (fnMiniDumpWriteDump)GetProcAddress(hDbgHelp, "MiniDumpWriteDump");
+                if (pDump) {
+                    std::wstring dumpPath = GetBinDirectory() + L"captured_crash.dmp";
+                    HANDLE hFile = CreateFileW(dumpPath.c_str(), GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+                    if (hFile != INVALID_HANDLE_VALUE) {
+                        struct {
+                            DWORD ThreadId;
+                            PEXCEPTION_POINTERS ExceptionPointers;
+                            BOOL ClientPointers;
+                        } exInfo;
+                        exInfo.ThreadId = GetCurrentThreadId();
+                        exInfo.ExceptionPointers = pExceptionInfo;
+                        exInfo.ClientPointers = FALSE;
+                        pDump(GetCurrentProcess(), GetCurrentProcessId(), hFile, 2 /* MiniDumpWithFullMemory */, &exInfo, NULL, NULL);
+                        CloseHandle(hFile);
+                        LogHook("[DUMP] Full minidump saved to: captured_crash.dmp");
+                    }
                 }
             }
+
+            // 紧急禁用所有 Hook，防止死锁与循环崩溃
+            HookManager::Instance().EmergencyDisableAllHooks();
         }
     }
 
+    // 允许异常在宿主进程中继续正常传播
     return EXCEPTION_CONTINUE_SEARCH;
 }
 
@@ -1282,7 +1310,7 @@ extern "C" __declspec(dllexport) bool InitializeTranslator() {
         return true;
     }
 
-    LogHook("[INIT] InitializeTranslator invoked");
+    LogHook("[INIT] InitializeTranslator invoked outside Loader Lock");
 
     // 1. 统一由 HookManager 管理 MinHook 初始化与 VEH 异常守卫
     if (!HookManager::Instance().Initialize(DiagnosticCrashLoggerVEH)) {
@@ -1353,7 +1381,6 @@ extern "C" __declspec(dllexport) void InitQtCoreQmTranslator() {
 }
 
 static DWORD WINAPI BootstrapThread(LPVOID lpParam) {
-    LogHook("[BOOTSTRAP] BootstrapThread started asynchronously outside Loader Lock");
     InitializeTranslator();
     return 0;
 }
@@ -1361,11 +1388,14 @@ static DWORD WINAPI BootstrapThread(LPVOID lpParam) {
 BOOL APIENTRY DllMain(HMODULE hModule, DWORD ul_reason_for_call, LPVOID lpReserved) {
     if (ul_reason_for_call == DLL_PROCESS_ATTACH) {
         DisableThreadLibraryCalls(hModule);
-        // 彻底脱离 Loader Lock：仅在 DLL attach 时创建后台 bootstrap 线程。
-        // Windows 保证该线程会在 DllMain 以及 Qt5Core.dll 的 EntryPoint 完全返回并释放 OS Loader Lock 之后才开始执行！
+        g_hModule = hModule;
         HANDLE hBootstrap = CreateThread(NULL, 0, BootstrapThread, NULL, 0, NULL);
         if (hBootstrap) {
             CloseHandle(hBootstrap);
+        }
+    } else if (ul_reason_for_call == DLL_PROCESS_DETACH) {
+        if (lpReserved == NULL) {
+            ShutdownTranslator();
         }
     }
     return TRUE;

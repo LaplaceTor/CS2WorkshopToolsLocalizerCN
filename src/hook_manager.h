@@ -72,6 +72,12 @@ public:
     //    LdrUnregisterDllNotification -> disable/remove hooks -> free trampolines -> RemoveVectoredExceptionHandler -> MH_Uninitialize
     void Shutdown();
 
+    // 8. 紧急停用所有 Hook（供 VEH 异常处理使用，防止死锁与循环崩溃）
+    void EmergencyDisableAllHooks();
+
+    // 9. 检查指定地址是否属于已安装的 Hook Detour 或 Target
+    bool IsHookAddress(void* addr);
+
     // 状态查询
     bool IsInitialized() const;
     size_t GetHookCount() const;
