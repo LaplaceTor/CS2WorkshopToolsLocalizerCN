@@ -1,0 +1,73 @@
+name: Release Build
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: '发布版本号 (例如 v1.0.0)'
+        required: true
+        type: string
+
+jobs:
+  build-and-release:
+    name: Build & Release
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Install Qt 6.8.0
+        uses: jurplel/install-qt-action@v4
+        with:
+          version: '6.8.0'
+          host: 'windows'
+          target: 'desktop'
+          arch: 'win64_msvc2022_64'
+          modules: 'qtnetworkauth'
+
+      - name: Setup MSVC Environment
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      - name: Configure CMake
+        run: |
+          mkdir build
+          cd build
+          cmake -G Ninja -DCMAKE_BUILD_TYPE=Release -DAPP_VERSION="${{ inputs.version }}" -DCMAKE_PREFIX_PATH="$env:Qt6_DIR" ..
+
+      - name: Build
+        run: cmake --build build --config Release
+
+      - name: Prepare Package
+        run: |
+          mkdir package
+
+          # 复制主要文件
+          Copy-Item "build\CS2WorkshopToolsLocalizerCN.exe" "package\"
+          Copy-Item "build\qtcore_qm.dll" "package\"
+          Copy-Item "qt_translations.json" "package\"
+          Copy-Item "fgd_translations.json" "package\"
+          if (Test-Path "fgd_override.json") { Copy-Item "fgd_override.json" "package\" }
+          if (Test-Path "README.md") { Copy-Item "README.md" "package\" }
+          if (Test-Path "LICENSE") { Copy-Item "LICENSE" "package\" }
+
+          # 运行 windeployqt 收集 Qt 运行时依赖
+          & "$env:Qt6_DIR\bin\windeployqt.exe" --release --no-translations "package\CS2WorkshopToolsLocalizerCN.exe"
+
+      - name: Create ZIP Package
+        run: |
+          $zipName = "CS2WorkshopToolsLocalizerCN-${{ inputs.version }}.zip"
+          Compress-Archive -Path "package\*" -DestinationPath $zipName -Force
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ inputs.version }}
+          name: CS2WorkshopToolsLocalizerCN ${{ inputs.version }}
+          draft: false
+          prerelease: false
+          files: CS2WorkshopToolsLocalizerCN-${{ inputs.version }}.zip
+          generate_release_notes: true
+
