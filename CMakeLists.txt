@@ -82,17 +82,13 @@ target_link_libraries(CS2WorkshopToolsLocalizerCN PRIVATE
     version
 )
 
-# 复制字典文件和 DLL 到输出目录方便调试运行
+# 复制字典文件目录和 DLL 到输出目录方便调试运行
 add_custom_command(TARGET CS2WorkshopToolsLocalizerCN POST_BUILD
-    COMMAND ${CMAKE_COMMAND} -E copy_if_different
-        "${CMAKE_CURRENT_SOURCE_DIR}/fgd_translations.json"
-        "$<TARGET_FILE_DIR:CS2WorkshopToolsLocalizerCN>/fgd_translations.json"
-    COMMAND ${CMAKE_COMMAND} -E copy_if_different
-        "${CMAKE_CURRENT_SOURCE_DIR}/fgd_override.json"
-        "$<TARGET_FILE_DIR:CS2WorkshopToolsLocalizerCN>/fgd_override.json"
-    COMMAND ${CMAKE_COMMAND} -E copy_if_different
-        "${CMAKE_CURRENT_SOURCE_DIR}/qt_translations.json"
-        "$<TARGET_FILE_DIR:CS2WorkshopToolsLocalizerCN>/qt_translations.json"
+    COMMAND ${CMAKE_COMMAND} -E make_directory
+        "$<TARGET_FILE_DIR:CS2WorkshopToolsLocalizerCN>/translations"
+    COMMAND ${CMAKE_COMMAND} -E copy_directory
+        "${CMAKE_CURRENT_SOURCE_DIR}/translations"
+        "$<TARGET_FILE_DIR:CS2WorkshopToolsLocalizerCN>/translations"
     COMMAND ${CMAKE_COMMAND} -E copy_if_different
         "$<TARGET_FILE:qtcore_qm>"
         "$<TARGET_FILE_DIR:CS2WorkshopToolsLocalizerCN>/qtcore_qm.dll"

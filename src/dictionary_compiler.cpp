@@ -3,6 +3,9 @@
 #include <sstream>
 #include <algorithm>
 #include <cstring>
+#include <filesystem>
+
+namespace fs = std::filesystem;
 
 std::string DictionaryCompiler::StripJsonComments(const char* p, size_t length) {
     std::string out;
@@ -43,7 +46,38 @@ std::string DictionaryCompiler::StripJsonComments(const char* p, size_t length) 
             }
         }
     }
-    return out;
+
+    // 移除尾随逗号 (trailing commas before } or ])，使 JSONC 兼容 QJsonDocument
+    std::string result;
+    result.reserve(out.size());
+    inQuote = false;
+    escape = false;
+    for (size_t i = 0; i < out.size(); ++i) {
+        char c = out[i];
+        if (inQuote) {
+            result.push_back(c);
+            if (escape) escape = false;
+            else if (c == '\\') escape = true;
+            else if (c == '"') inQuote = false;
+        } else {
+            if (c == '"') {
+                inQuote = true;
+                result.push_back(c);
+            } else if (c == ',') {
+                size_t j = i + 1;
+                while (j < out.size() && (out[j] == ' ' || out[j] == '\t' || out[j] == '\r' || out[j] == '\n')) {
+                    j++;
+                }
+                if (j < out.size() && (out[j] == '}' || out[j] == ']')) {
+                    continue; // 跳过尾随逗号
+                }
+                result.push_back(c);
+            } else {
+                result.push_back(c);
+            }
+        }
+    }
+    return result;
 }
 
 namespace {
@@ -247,7 +281,12 @@ private:
 
 } // namespace
 
-bool DictionaryCompiler::CompileJsonStringToBinary(const std::string& jsonContent, std::vector<uint8_t>& outBinary, std::wstring& outError) {
+bool DictionaryCompiler::ParseJsoncStringToMaps(
+    const std::string& jsonContent,
+    std::unordered_map<std::string, std::string>& outCommon,
+    std::unordered_map<std::wstring, std::unordered_map<std::string, std::string>>& outScoped,
+    std::wstring& outError
+) {
     if (jsonContent.empty()) {
         outError = L"JSON 文本为空";
         return false;
@@ -258,261 +297,153 @@ bool DictionaryCompiler::CompileJsonStringToBinary(const std::string& jsonConten
         return false;
     }
 
-    // 1. 去除注释
+    // 1. 去除注释与尾随逗号
     std::string cleanJson = StripJsonComments(jsonContent.data(), jsonContent.size());
 
     // 2. 解析为分块字典结构
-    std::unordered_map<std::string, std::string> commonDict;
-    std::unordered_map<std::wstring, std::unordered_map<std::string, std::string>> scopedDicts;
-
     SimpleJsonParser parser(cleanJson);
-    if (!parser.Parse(commonDict, scopedDicts, outError)) {
+    if (!parser.Parse(outCommon, outScoped, outError)) {
         return false;
     }
 
-    // 3. 构建 LCLD 结构：Sections, Entries, String Table
-    struct SectionWorkItem {
-        std::string sectionNameUtf8;
-        std::vector<std::pair<std::string, std::string>> entries;
-    };
-
-    std::vector<SectionWorkItem> workItems;
-    if (!commonDict.empty()) {
-        SectionWorkItem item;
-        item.sectionNameUtf8 = "common";
-        for (const auto& kv : commonDict) {
-            item.entries.push_back(kv);
-        }
-        workItems.push_back(std::move(item));
-    }
-
-    for (const auto& sc : scopedDicts) {
-        if (!sc.second.empty()) {
-            SectionWorkItem item;
-            std::string utf8Name;
-            for (wchar_t wc : sc.first) utf8Name.push_back(static_cast<char>(wc));
-            item.sectionNameUtf8 = utf8Name;
-            for (const auto& kv : sc.second) {
-                item.entries.push_back(kv);
-            }
-            workItems.push_back(std::move(item));
-        }
-    }
-
-    if (workItems.empty()) {
-        outError = L"未解析到有效的字典条目";
-        return false;
-    }
-
-    // 4. 构建字符串表并记录偏移
-    std::unordered_map<std::string, uint32_t> stringMap;
-    std::vector<char> stringTable;
-
-    auto addString = [&](const std::string& str) -> uint32_t {
-        auto it = stringMap.find(str);
-        if (it != stringMap.end()) {
-            return it->second;
-        }
-        uint32_t off = static_cast<uint32_t>(stringTable.size());
-        stringTable.insert(stringTable.end(), str.begin(), str.end());
-        stringTable.push_back('\0');
-        stringMap[str] = off;
-        return off;
-    };
-
-    // 检查数量上限保护
-    if (workItems.size() > 10000) {
-        outError = L"作用域数量超过安全上限";
-        return false;
-    }
-
-    uint64_t totalSections64 = workItems.size();
-    uint64_t totalEntries64 = 0;
-    for (const auto& w : workItems) {
-        totalEntries64 += w.entries.size();
-    }
-    if (totalEntries64 > 1000000) {
-        outError = L"字典总条目数超过安全上限";
-        return false;
-    }
-
-    uint32_t totalSections = static_cast<uint32_t>(totalSections64);
-    uint32_t totalEntries = static_cast<uint32_t>(totalEntries64);
-
-    uint64_t headerSize = sizeof(LcldHeader);
-    uint64_t sectionsArraySize = static_cast<uint64_t>(totalSections) * sizeof(LcldSection);
-    uint64_t entriesArraySize = static_cast<uint64_t>(totalEntries) * sizeof(LcldEntry);
-
-    uint64_t sectionsOffset = headerSize;
-    uint64_t entriesStartOffset = headerSize + sectionsArraySize;
-    uint64_t currentEntryOffset = entriesStartOffset;
-
-    std::vector<LcldSection> compiledSections;
-    std::vector<LcldEntry> compiledEntries;
-
-    for (const auto& w : workItems) {
-        LcldSection sec;
-        sec.nameOffset = addString(w.sectionNameUtf8);
-        sec.entryCount = static_cast<uint32_t>(w.entries.size());
-        sec.entriesOffset = static_cast<uint32_t>(currentEntryOffset);
-        compiledSections.push_back(sec);
-
-        for (const auto& e : w.entries) {
-            LcldEntry entry;
-            entry.keyOffset = addString(e.first);
-            entry.valOffset = addString(e.second);
-            compiledEntries.push_back(entry);
-        }
-        currentEntryOffset += static_cast<uint64_t>(w.entries.size()) * sizeof(LcldEntry);
-    }
-
-    uint64_t stringTableOffset = headerSize + sectionsArraySize + entriesArraySize;
-    uint64_t stringTableSize = stringTable.size();
-    uint64_t totalBinarySize = stringTableOffset + stringTableSize;
-
-    if (totalBinarySize > 0xFFFFFFFFULL) {
-        outError = L"编译后的字典数据超出 4GB 限制";
-        return false;
-    }
-
-    LcldHeader header;
-    std::memcpy(header.magic, "LCLD", 4);
-    header.version = 1;
-    header.totalSections = totalSections;
-    header.totalEntries = totalEntries;
-    header.sectionsOffset = static_cast<uint32_t>(sectionsOffset);
-    header.stringTableOffset = static_cast<uint32_t>(stringTableOffset);
-    header.stringTableSize = static_cast<uint32_t>(stringTableSize);
-
-    outBinary.clear();
-    outBinary.resize(static_cast<size_t>(totalBinarySize), 0);
-
-    std::memcpy(outBinary.data(), &header, sizeof(LcldHeader));
-    std::memcpy(outBinary.data() + sectionsOffset, compiledSections.data(), static_cast<size_t>(sectionsArraySize));
-    std::memcpy(outBinary.data() + entriesStartOffset, compiledEntries.data(), static_cast<size_t>(entriesArraySize));
-    std::memcpy(outBinary.data() + stringTableOffset, stringTable.data(), static_cast<size_t>(stringTableSize));
-
-    return true;
+    return (!outCommon.empty() || !outScoped.empty());
 }
 
-bool DictionaryCompiler::CompileJsonFileToLcld(const std::wstring& jsonPath, const std::wstring& lcldPath, std::wstring& outError) {
+bool DictionaryCompiler::ParseJsoncFileToMaps(
+    const std::wstring& jsonPath,
+    std::unordered_map<std::string, std::string>& outCommon,
+    std::unordered_map<std::wstring, std::unordered_map<std::string, std::string>>& outScoped,
+    std::wstring& outError,
+    const std::wstring& fallbackJsonPath
+) {
+    outCommon.clear();
+    outScoped.clear();
+
+    // 1. 若提供了 fallback 字典，先加载 fallback 作为兜底层
+    if (!fallbackJsonPath.empty() && fs::exists(fallbackJsonPath)) {
+        FILE* fbFp = _wfopen(fallbackJsonPath.c_str(), L"rb");
+        if (fbFp) {
+            fseek(fbFp, 0, SEEK_END);
+            long fbSize = ftell(fbFp);
+            fseek(fbFp, 0, SEEK_SET);
+            if (fbSize > 0 && fbSize <= static_cast<long>(MAX_JSON_FILE_SIZE)) {
+                std::string fbStr(static_cast<size_t>(fbSize), '\0');
+                fread(fbStr.data(), 1, fbSize, fbFp);
+                fclose(fbFp);
+                fbFp = nullptr;
+
+                std::string cleanFb = StripJsonComments(fbStr.data(), fbStr.size());
+                std::wstring fbErr;
+                SimpleJsonParser fbParser(cleanFb);
+                fbParser.Parse(outCommon, outScoped, fbErr);
+            } else {
+                fclose(fbFp);
+            }
+        }
+    }
+
+    // 2. 加载主字典覆盖/补充
     FILE* fp = _wfopen(jsonPath.c_str(), L"rb");
     if (!fp) {
-        outError = L"无法打开源 JSON 文件: " + jsonPath;
+        if (!outCommon.empty() || !outScoped.empty()) {
+            return true; // fallback 字典有效
+        }
+        outError = L"无法打开源 JSONC 文件: " + jsonPath;
         return false;
     }
+
     fseek(fp, 0, SEEK_END);
     long fsize = ftell(fp);
     fseek(fp, 0, SEEK_SET);
     if (fsize <= 0 || fsize > static_cast<long>(MAX_JSON_FILE_SIZE)) {
         fclose(fp);
-        outError = L"源 JSON 文件为空或大小超出 16MB 安全上限";
+        if (!outCommon.empty() || !outScoped.empty()) {
+            return true;
+        }
+        outError = L"源 JSONC 文件为空或大小超出 16MB 安全上限";
         return false;
     }
+
     std::string jsonStr(static_cast<size_t>(fsize), '\0');
     fread(jsonStr.data(), 1, fsize, fp);
     fclose(fp);
 
-    std::vector<uint8_t> binary;
-    if (!CompileJsonStringToBinary(jsonStr, binary, outError)) {
-        return false;
-    }
-
-    FILE* outFp = _wfopen(lcldPath.c_str(), L"wb");
-    if (!outFp) {
-        outError = L"无法创建目标 LCLD 二进制文件: " + lcldPath;
-        return false;
-    }
-    fwrite(binary.data(), 1, binary.size(), outFp);
-    fclose(outFp);
-    return true;
-}
-
-bool DictionaryCompiler::ParseLcldBinaryToMaps(
-    const uint8_t* data,
-    size_t size,
-    std::unordered_map<std::string, std::string>& outCommon,
-    std::unordered_map<std::wstring, std::unordered_map<std::string, std::string>>& outScoped) {
-
-    if (!data || size < sizeof(LcldHeader) || size > MAX_LCLD_FILE_SIZE) return false;
-
-    const LcldHeader* hdr = reinterpret_cast<const LcldHeader*>(data);
-    if (std::memcmp(hdr->magic, "LCLD", 4) != 0 || hdr->version != 1) {
-        return false;
-    }
-
-    // 检查合理的 section 和 entry 数量上限，防止畸形数据造成拒绝服务
-    if (hdr->totalSections > MAX_TOTAL_SECTIONS || hdr->totalEntries > MAX_TOTAL_ENTRIES) {
-        return false;
-    }
-
-    // 1. 严格 64-bit 无溢出计算 String Table 边界
-    uint64_t stringTableStart = static_cast<uint64_t>(hdr->stringTableOffset);
-    uint64_t stringTableSize = static_cast<uint64_t>(hdr->stringTableSize);
-    uint64_t stringTableEnd = stringTableStart + stringTableSize;
-    if (stringTableEnd > size || stringTableEnd < stringTableStart || stringTableSize > MAX_LCLD_FILE_SIZE) return false;
-
-    const char* strTable = reinterpret_cast<const char*>(data + stringTableStart);
-
-    // 2. 严格 64-bit 无溢出计算 Sections 数组边界
-    uint64_t sectionsStart = static_cast<uint64_t>(hdr->sectionsOffset);
-    uint64_t sectionsSize = static_cast<uint64_t>(hdr->totalSections) * sizeof(LcldSection);
-    uint64_t sectionsEnd = sectionsStart + sectionsSize;
-    if (sectionsEnd > size || sectionsEnd < sectionsStart) return false;
-
-    const LcldSection* sections = reinterpret_cast<const LcldSection*>(data + sectionsStart);
-
-    outCommon.clear();
-    outScoped.clear();
-
-    // 3. 安全提取以 '\0' 结尾的字符串，严格杜绝越界读取与超长字符串
-    auto getSafeString = [&](uint32_t offset) -> const char* {
-        if (offset >= stringTableSize) return nullptr;
-        size_t maxLen = static_cast<size_t>(stringTableSize - offset);
-        if (maxLen > MAX_SINGLE_STRING_LENGTH + 1) {
-            maxLen = MAX_SINGLE_STRING_LENGTH + 1;
+    std::string cleanPrimary = StripJsonComments(jsonStr.data(), jsonStr.size());
+    SimpleJsonParser primaryParser(cleanPrimary);
+    if (!primaryParser.Parse(outCommon, outScoped, outError)) {
+        if (!outCommon.empty() || !outScoped.empty()) {
+            return true;
         }
-        const char* p = strTable + offset;
-        const char* nullPos = static_cast<const char*>(std::memchr(p, '\0', maxLen));
-        if (!nullPos) return nullptr; // 字符串在限制长度内未以 '\0' 终结
-        return p;
-    };
-
-    auto NormalizeSectionName = [](const char* name) -> std::wstring {
-        std::wstring wname;
-        for (const char* p = name; *p; ++p) wname.push_back(static_cast<wchar_t>(*p));
-        std::transform(wname.begin(), wname.end(), wname.begin(), ::towlower);
-        if (wname.length() > 4 && wname.substr(wname.length() - 4) == L".dll") {
-            wname = wname.substr(0, wname.length() - 4);
-        }
-        return wname;
-    };
-
-    for (uint32_t s = 0; s < hdr->totalSections; ++s) {
-        const LcldSection& sec = sections[s];
-        const char* secNameUtf8 = getSafeString(sec.nameOffset);
-        if (!secNameUtf8) continue;
-        std::wstring secName = NormalizeSectionName(secNameUtf8);
-
-        // 严格 64-bit 无溢出计算 Entries 数组边界
-        uint64_t entriesStart = static_cast<uint64_t>(sec.entriesOffset);
-        uint64_t entriesSize = static_cast<uint64_t>(sec.entryCount) * sizeof(LcldEntry);
-        uint64_t entriesEnd = entriesStart + entriesSize;
-        if (entriesEnd > size || entriesEnd < entriesStart) continue;
-
-        const LcldEntry* entries = reinterpret_cast<const LcldEntry*>(data + entriesStart);
-        auto& targetMap = (secName == L"common" || secName == L"general") ? outCommon : outScoped[secName];
-
-        for (uint32_t e = 0; e < sec.entryCount; ++e) {
-            const LcldEntry& entry = entries[e];
-            const char* key = getSafeString(entry.keyOffset);
-            const char* val = getSafeString(entry.valOffset);
-            if (key && val && key[0] != '\0' && val[0] != '\0') {
-                targetMap[key] = val;
-            }
-        }
+        return false;
     }
 
     return (!outCommon.empty() || !outScoped.empty());
+}
+
+static std::string EscapeJsonStr(const std::string& str) {
+    std::string out;
+    out.reserve(str.size() + 16);
+    for (char c : str) {
+        if (c == '"') out += "\\\"";
+        else if (c == '\\') out += "\\\\";
+        else if (c == '\b') out += "\\b";
+        else if (c == '\f') out += "\\f";
+        else if (c == '\n') out += "\\n";
+        else if (c == '\r') out += "\\r";
+        else if (c == '\t') out += "\\t";
+        else out += c;
+    }
+    return out;
+}
+
+bool DictionaryCompiler::MergeJsonFiles(
+    const std::wstring& primaryJsonPath,
+    const std::wstring& fallbackJsonPath,
+    const std::wstring& outJsonPath,
+    std::wstring& outError
+) {
+    std::unordered_map<std::string, std::string> commonDict;
+    std::unordered_map<std::wstring, std::unordered_map<std::string, std::string>> scopedDicts;
+
+    if (!ParseJsoncFileToMaps(primaryJsonPath, commonDict, scopedDicts, outError, fallbackJsonPath)) {
+        outError = L"合并字典失败：未找到有效词条";
+        return false;
+    }
+
+    FILE* outFp = _wfopen(outJsonPath.c_str(), L"wb");
+    if (!outFp) {
+        outError = L"无法创建目标 JSONC 文件: " + outJsonPath;
+        return false;
+    }
+
+    fputs("{\n", outFp);
+    bool first = true;
+    for (const auto& kv : commonDict) {
+        if (!first) fputs(",\n", outFp);
+        first = false;
+        std::string line = "  \"" + EscapeJsonStr(kv.first) + "\": \"" + EscapeJsonStr(kv.second) + "\"";
+        fputs(line.c_str(), outFp);
+    }
+
+    for (const auto& sc : scopedDicts) {
+        if (sc.second.empty()) continue;
+        if (!first) fputs(",\n", outFp);
+        first = false;
+        std::string secUtf8;
+        for (wchar_t wc : sc.first) secUtf8.push_back(static_cast<char>(wc));
+        std::string secHead = "  \"" + EscapeJsonStr(secUtf8) + "\": {\n";
+        fputs(secHead.c_str(), outFp);
+        bool secFirst = true;
+        for (const auto& kv : sc.second) {
+            if (!secFirst) fputs(",\n", outFp);
+            secFirst = false;
+            std::string subLine = "    \"" + EscapeJsonStr(kv.first) + "\": \"" + EscapeJsonStr(kv.second) + "\"";
+            fputs(subLine.c_str(), outFp);
+        }
+        fputs("\n  }", outFp);
+    }
+    fputs("\n}\n", outFp);
+    fclose(outFp);
+    return true;
 }
 

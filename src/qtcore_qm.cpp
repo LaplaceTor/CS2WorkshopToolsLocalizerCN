@@ -28,6 +28,8 @@ typedef void* (__fastcall *fnQString_fromUtf8)(void* pOutQString, const char* ut
 typedef const wchar_t* (__fastcall *fnQString_utf16)(const void* pQString);
 typedef void (__fastcall *fnQString_dtor)(void* pQString);
 
+typedef void* (__fastcall *fnQAction_ctor)(void* pAction, const void* pQString, void* pParent);
+typedef void* (__fastcall *fnQAction_ctor_icon)(void* pAction, const void* pIcon, const void* pQString, void* pParent);
 typedef void (__fastcall *fnQAction_setText)(void* pAction, const void* pQString);
 typedef void (__fastcall *fnQAction_setToolTip)(void* pAction, const void* pQString);
 typedef void (__fastcall *fnQAction_setStatusTip)(void* pAction, const void* pQString);
@@ -36,18 +38,35 @@ typedef void (__fastcall *fnQAction_setWhatsThis)(void* pAction, const void* pQS
 typedef void (__fastcall *fnQAbstractButton_setText)(void* pButton, const void* pQString);
 typedef void (__fastcall *fnQLabel_setText)(void* pLabel, const void* pQString);
 typedef void (__fastcall *fnQWidget_setWindowTitle)(void* pWidget, const void* pQString);
+typedef void (__fastcall *fnQGroupBox_setTitle)(void* pBox, const void* pQString);
 
 typedef void (__fastcall *fnQTreeWidgetItem_setText)(void* pItem, int column, const void* pQString);
+typedef void (__fastcall *fnQTreeWidget_setHeaderLabel)(void* pTree, const void* pQString);
+typedef void* (__fastcall *fnQTableWidgetItem_ctor)(void* pItem, const void* pQString, int type);
 typedef void (__fastcall *fnQTableWidgetItem_setText)(void* pItem, const void* pQString);
+typedef void* (__fastcall *fnQListWidgetItem_ctor)(void* pItem, const void* pQString, void* pListWidget, int type);
 typedef void (__fastcall *fnQListWidgetItem_setText)(void* pItem, const void* pQString);
+
 typedef void (__fastcall *fnQComboBox_addItem)(void* pBox, const void* pQString, const void* pUserData);
+typedef void (__fastcall *fnQComboBox_addItem_icon)(void* pBox, const void* pIcon, const void* pQString, const void* pUserData);
+typedef void (__fastcall *fnQComboBox_setItemText)(void* pBox, int index, const void* pQString);
+typedef void (__fastcall *fnQComboBox_insertItem)(void* pBox, int index, const void* pQString, const void* pUserData);
+typedef void (__fastcall *fnQComboBox_insertItem_icon)(void* pBox, int index, const void* pIcon, const void* pQString, const void* pUserData);
 
 typedef void (__fastcall *fnQPainter_drawText_Rect)(void* pPainter, const void* pRect, int flags, const void* pQString, void* pBoundingRect);
 typedef void (__fastcall *fnQPainter_drawText_RectF)(void* pPainter, const void* pRectF, int flags, const void* pQString, void* pBoundingRect);
 typedef void (__fastcall *fnQPainter_drawText_PointF)(void* pPainter, const void* pPointF, const void* pQString);
+typedef void (__fastcall *fnQPainter_drawText_RectF_Option)(void* pPainter, const void* pRectF, const void* pQString, const void* pOption);
+typedef void (__fastcall *fnQPainter_drawText_Point)(void* pPainter, const void* pPoint, const void* pQString);
+typedef void (__fastcall *fnQPainter_drawText_xy)(void* pPainter, int x, int y, const void* pQString);
+
+typedef void (__fastcall *fnQTextDocument_setPlainText)(void* pDoc, const void* pQString);
+typedef void (__fastcall *fnQTextDocument_setHtml)(void* pDoc, const void* pQString);
 
 // 原函数指针存储
 static fnQMetaObject_tr g_o_QMetaObject_tr = nullptr;
+static fnQAction_ctor g_o_QAction_ctor = nullptr;
+static fnQAction_ctor_icon g_o_QAction_ctor_icon = nullptr;
 static fnQAction_setText g_o_QAction_setText = nullptr;
 static fnQAction_setToolTip g_o_QAction_setToolTip = nullptr;
 static fnQAction_setStatusTip g_o_QAction_setStatusTip = nullptr;
@@ -55,15 +74,30 @@ static fnQAction_setWhatsThis g_o_QAction_setWhatsThis = nullptr;
 static fnQAbstractButton_setText g_o_QAbstractButton_setText = nullptr;
 static fnQLabel_setText g_o_QLabel_setText = nullptr;
 static fnQWidget_setWindowTitle g_o_QWidget_setWindowTitle = nullptr;
+static fnQGroupBox_setTitle g_o_QGroupBox_setTitle = nullptr;
 
 static fnQTreeWidgetItem_setText g_o_QTreeWidgetItem_setText = nullptr;
+static fnQTreeWidget_setHeaderLabel g_o_QTreeWidget_setHeaderLabel = nullptr;
+static fnQTableWidgetItem_ctor g_o_QTableWidgetItem_ctor = nullptr;
 static fnQTableWidgetItem_setText g_o_QTableWidgetItem_setText = nullptr;
+static fnQListWidgetItem_ctor g_o_QListWidgetItem_ctor = nullptr;
 static fnQListWidgetItem_setText g_o_QListWidgetItem_setText = nullptr;
+
 static fnQComboBox_addItem g_o_QComboBox_addItem = nullptr;
+static fnQComboBox_addItem_icon g_o_QComboBox_addItem_icon = nullptr;
+static fnQComboBox_setItemText g_o_QComboBox_setItemText = nullptr;
+static fnQComboBox_insertItem g_o_QComboBox_insertItem = nullptr;
+static fnQComboBox_insertItem_icon g_o_QComboBox_insertItem_icon = nullptr;
 
 static fnQPainter_drawText_Rect g_o_QPainter_drawText_Rect = nullptr;
 static fnQPainter_drawText_RectF g_o_QPainter_drawText_RectF = nullptr;
 static fnQPainter_drawText_PointF g_o_QPainter_drawText_PointF = nullptr;
+static fnQPainter_drawText_RectF_Option g_o_QPainter_drawText_RectF_Option = nullptr;
+static fnQPainter_drawText_Point g_o_QPainter_drawText_Point = nullptr;
+static fnQPainter_drawText_xy g_o_QPainter_drawText_xy = nullptr;
+
+static fnQTextDocument_setPlainText g_o_QTextDocument_setPlainText = nullptr;
+static fnQTextDocument_setHtml g_o_QTextDocument_setHtml = nullptr;
 
 static fnQString_fromUtf8 g_pfn_fromUtf8 = nullptr;
 static fnQString_utf16 g_pfn_utf16 = nullptr;
@@ -348,71 +382,18 @@ static bool GetCallerModuleName(void* callerAddr, wchar_t* outBuf, size_t maxLen
 }
 
 // ==============================================================================
-// 3. 零 ABI 依赖纯 C 二进制字典 (LCLD) 与标准 C++ 解析引擎
+// 3. 纯 C++ 零 ABI 依赖 JSONC 字典加载与解析引擎
 // ==============================================================================
 static void LoadMasterTranslations() {
     std::wstring binDir = GetBinDirectory();
-    std::wstring binaryPath = binDir + L"qt_translations.lcld";
-    std::wstring jsonPath = binDir + L"qt_translations.json";
-    std::wstring backupJsonPath = binDir + L"translations_cache.json";
+    std::wstring jsoncPath = binDir + L"qt_translations.jsonc";
+    std::wstring err;
 
-    // 1. 优先加载由 Launcher 预编译的纯 C 二进制字典 .lcld（0 ABI 依赖，< 50μs 极速纯内存解析）
-    auto tryLoadLcld = [](const std::wstring& path) -> bool {
-        FILE* fp = _wfopen(path.c_str(), L"rb");
-        if (!fp) return false;
-        fseek(fp, 0, SEEK_END);
-        long fsize = ftell(fp);
-        fseek(fp, 0, SEEK_SET);
-        if (fsize <= 0) {
-            fclose(fp);
-            return false;
-        }
-        std::vector<uint8_t> buffer(static_cast<size_t>(fsize));
-        fread(buffer.data(), 1, fsize, fp);
-        fclose(fp);
-        return DictionaryCompiler::ParseLcldBinaryToMaps(buffer.data(), fsize, g_CommonDict, g_ScopedDicts);
-    };
-
-    if (tryLoadLcld(binaryPath)) {
-        LogHook("[DICT] Loaded compiled binary dictionary (LCLD): %zu common, %zu scoped modules",
+    if (DictionaryCompiler::ParseJsoncFileToMaps(jsoncPath, g_CommonDict, g_ScopedDicts, err)) {
+        LogHook("[DICT] Loaded JSONC dictionary via pure C++ parser: %zu common, %zu scoped modules",
             g_CommonDict.size(), g_ScopedDicts.size());
-        return;
-    }
-
-    // 2. 回退：直接使用纯 C++ 零依赖标准 JSON 编译器与解析器加载文本字典
-    auto tryLoadJson = [](const std::wstring& path) -> bool {
-        FILE* fp = _wfopen(path.c_str(), L"rb");
-        if (!fp) return false;
-        fseek(fp, 0, SEEK_END);
-        long fsize = ftell(fp);
-        fseek(fp, 0, SEEK_SET);
-        if (fsize <= 0) {
-            fclose(fp);
-            return false;
-        }
-        std::string jsonStr(static_cast<size_t>(fsize), '\0');
-        fread(jsonStr.data(), 1, fsize, fp);
-        fclose(fp);
-
-        std::vector<uint8_t> binary;
-        std::wstring err;
-        if (!DictionaryCompiler::CompileJsonStringToBinary(jsonStr, binary, err)) {
-            LogHook("[DICT] CompileJsonStringToBinary failed: %ls", err.c_str());
-            return false;
-        }
-        return DictionaryCompiler::ParseLcldBinaryToMaps(binary.data(), binary.size(), g_CommonDict, g_ScopedDicts);
-    };
-
-    if (tryLoadJson(jsonPath)) {
-        LogHook("[DICT] Loaded JSON dictionary via pure C++ parser fallback: %zu common, %zu scoped modules",
-            g_CommonDict.size(), g_ScopedDicts.size());
-        return;
-    }
-
-    if (tryLoadJson(backupJsonPath)) {
-        LogHook("[DICT] Loaded backup JSON dictionary via pure C++ parser fallback: %zu common, %zu scoped modules",
-            g_CommonDict.size(), g_ScopedDicts.size());
-        return;
+    } else {
+        LogHook("[DICT] Failed to load JSONC dictionary: %ls", err.c_str());
     }
 }
 
@@ -695,8 +676,70 @@ static bool MatchAndTranslateInternal(const std::unordered_map<std::string, std:
     return false;
 }
 
-// 核心多级分层翻译查找函数（基于 Caller Address 精准隔离）
-static bool FindTranslationScoped(void* callerAddr, const char* text, std::string& outResult) {
+// 核心字符串来源分类
+enum class TranslationSource {
+    StaticUI,       // QMetaObject::tr, QAction, QAbstractButton, QLabel, QWidget::setWindowTitle, QGroupBox::setTitle
+    ItemWidget,     // QTableWidgetItem, QListWidgetItem, QTreeWidgetItem, QComboBox
+    Painter         // QPainter::drawText
+};
+
+// 文件路径与文件名保护检测
+static bool IsFilePathOrIdentifier(const std::string& s) {
+    if (s.empty()) return false;
+
+    // 1. URL 协议检测 (http://, https://, file://)
+    if (s.rfind("http://", 0) == 0 || s.rfind("https://", 0) == 0 || s.rfind("file://", 0) == 0) {
+        return true;
+    }
+
+    // 2. Windows 反斜杠路径 (如 C:\... 或 tools\images\...)
+    if (s.find('\\') != std::string::npos) {
+        return true;
+    }
+
+    // 3. 正斜杠路径检测（排除形如 "5/5"、"13/13" 的纯数字比率分数）
+    size_t slash = s.find('/');
+    while (slash != std::string::npos) {
+        bool isFraction = (slash > 0 && slash + 1 < s.length() && 
+                           isdigit((unsigned char)s[slash - 1]) && 
+                           isdigit((unsigned char)s[slash + 1]));
+        if (!isFraction) {
+            return true;
+        }
+        slash = s.find('/', slash + 1);
+    }
+
+    // 4. 文件扩展名检测（检测常见游戏与系统文件扩展名，如 .vmap, .vmdl, .vmat, .txt, .exe 等）
+    size_t dot = s.rfind('.');
+    if (dot != std::string::npos && dot > 0 && dot + 1 < s.length()) {
+        // 排除省略号 (..., ..)
+        if (s[dot - 1] != '.' && (dot + 1 >= s.length() || s[dot + 1] != '.')) {
+            std::string ext = s.substr(dot + 1);
+            bool validExt = true;
+            for (char c : ext) {
+                if (!isalnum((unsigned char)c) && c != '_') {
+                    validExt = false;
+                    break;
+                }
+            }
+            if (validExt && ext.length() >= 1 && ext.length() <= 8) {
+                // 特殊排除: 纯数字（如版本号 "1.0", "2.5"）
+                bool allDigits = true;
+                for (char c : ext) {
+                    if (!isdigit((unsigned char)c)) { allDigits = false; break; }
+                }
+                if (!allDigits) {
+                    return true;
+                }
+            }
+        }
+    }
+
+    return false;
+}
+
+// 核心多级分层翻译查找函数（基于 Caller Address 精准隔离与来源分类保护）
+static bool FindTranslationScoped(void* callerAddr, const char* text, std::string& outResult, TranslationSource source = TranslationSource::StaticUI) {
     if (!text || text[0] == '\0') return false;
 
     // 若字典尚未由后台 Worker 线程加载完毕，绝不在此同步阻塞业务线程，直接返回 false
@@ -706,37 +749,151 @@ static bool FindTranslationScoped(void* callerAddr, const char* text, std::strin
 
     std::string textStr(text);
 
-    // 1. 优先根据 callerAddr 判定发起调用的模块
-    if (callerAddr != nullptr) {
-        wchar_t callerStemBuf[64] = {0};
-        if (GetCallerModuleName(callerAddr, callerStemBuf, 64)) {
-            std::wstring callerStem(callerStemBuf);
+    // 0. 文件路径与文件名保护检测
+    bool isFileOrPath = IsFilePathOrIdentifier(textStr);
+    if (isFileOrPath && source != TranslationSource::StaticUI) {
+        // 非静态 UI 来源（表格、列表、绘制等）严禁翻译任何文件路径与动态文件名
+        return false;
+    }
 
-            // 如果命中了特定模块的专属子块，优先在其独立字典中查找
+    wchar_t callerStemBuf[64] = {0};
+    bool hasCaller = (callerAddr != nullptr && GetCallerModuleName(callerAddr, callerStemBuf, 64));
+    std::wstring callerStem = hasCaller ? callerStemBuf : L"";
+
+    // 资产浏览器 (assetbrowser.dll) 包含海量动态文件与用户资源项，其 Item 和绘制来源严禁翻译
+    if (source != TranslationSource::StaticUI && hasCaller && callerStem == L"assetbrowser") {
+        return false;
+    }
+
+    // 针对 QPainter::drawText 底层绘制来源的防御：
+    if (source == TranslationSource::Painter) {
+        // 如果包含下划线（snake_case 标识符/文件名词元）且未被公共字典精确收录，直接阻断
+        if (textStr.find('_') != std::string::npos) {
             std::lock_guard<std::mutex> lock(g_DictMutex);
-            auto itSec = g_ScopedDicts.find(callerStem);
-            if (itSec != g_ScopedDicts.end()) {
-                const auto& secDict = itSec->second;
-                auto& secCache = g_ScopedCaches[callerStem];
+            if (g_CommonDict.find(textStr) == g_CommonDict.end()) {
+                return false;
+            }
+        }
+        // 如果是纯小写单个单词（如 "lighting", "info"），绝不作为属性标题翻译
+        if (!textStr.empty() && textStr.find(' ') == std::string::npos) {
+            bool allLower = true;
+            for (char c : textStr) {
+                if (!islower((unsigned char)c)) { allLower = false; break; }
+            }
+            if (allLower) {
+                return false;
+            }
+        }
+    }
 
-                // 静态查找
-                auto itDirect = secDict.find(textStr);
-                if (itDirect != secDict.end()) {
-                    outResult = itDirect->second;
+    // 针对 ItemWidget 来源（表格项、列表项、树项、下拉项）：
+    if (source == TranslationSource::ItemWidget) {
+        // 如果包含下划线且未被字典精确收录，直接阻断（保护没有扩展名的动态变量/地图名）
+        if (textStr.find('_') != std::string::npos) {
+            std::lock_guard<std::mutex> lock(g_DictMutex);
+            bool inDict = (g_CommonDict.find(textStr) != g_CommonDict.end());
+            if (!inDict && hasCaller) {
+                auto itSec = g_ScopedDicts.find(callerStem);
+                if (itSec != g_ScopedDicts.end() && itSec->second.find(textStr) != itSec->second.end()) {
+                    inDict = true;
+                }
+                if (!inDict && callerStem != L"hammer") {
+                    auto itHammer = g_ScopedDicts.find(L"hammer");
+                    if (itHammer != g_ScopedDicts.end() && itHammer->second.find(textStr) != itHammer->second.end()) {
+                        inDict = true;
+                    }
+                }
+            }
+            if (!inDict) {
+                return false;
+            }
+        }
+    }
+
+    // 辅助 lambda：静态精确全词匹配与基础修剪
+    auto tryDirectScoped = [&](const std::unordered_map<std::string, std::string>& dict, 
+                               std::unordered_map<std::string, std::string>& cache) -> bool {
+        // 1. 精确全字匹配
+        auto itDirect = dict.find(textStr);
+        if (itDirect != dict.end()) {
+            outResult = itDirect->second;
+            return true;
+        }
+        auto itCache = cache.find(textStr);
+        if (itCache != cache.end()) {
+            outResult = itCache->second;
+            return true;
+        }
+        // 2. 去除前后空白匹配
+        size_t first = textStr.find_first_not_of(" \t\r\n");
+        if (first != std::string::npos) {
+            size_t last = textStr.find_last_not_of(" \t\r\n");
+            if (first > 0 || last < textStr.length() - 1) {
+                std::string sub = textStr.substr(first, last - first + 1);
+                auto itSub = dict.find(sub);
+                if (itSub != dict.end()) {
+                    outResult = textStr.substr(0, first) + itSub->second + textStr.substr(last + 1);
+                    cache[textStr] = outResult;
                     return true;
                 }
+            }
+        }
+        // 3. 剥离加速键 '&' 匹配
+        if (textStr.find('&') != std::string::npos) {
+            std::string stripped;
+            stripped.reserve(textStr.length());
+            for (char c : textStr) {
+                if (c != '&') stripped.push_back(c);
+            }
+            auto itStrip = dict.find(stripped);
+            if (itStrip != dict.end()) {
+                outResult = itStrip->second;
+                cache[textStr] = outResult;
+                return true;
+            }
+        }
+        return false;
+    };
 
-                // 缓存查找
-                auto itCache = secCache.find(textStr);
-                if (itCache != secCache.end()) {
-                    outResult = itCache->second;
-                    return true;
-                }
+    // 1. 优先根据 callerAddr 判定发起调用的模块，在其独立子块中查找
+    if (hasCaller) {
+        std::lock_guard<std::mutex> lock(g_DictMutex);
+        auto itSec = g_ScopedDicts.find(callerStem);
+        if (itSec != g_ScopedDicts.end()) {
+            const auto& secDict = itSec->second;
+            auto& secCache = g_ScopedCaches[callerStem];
 
-                // 递归拆分匹配
+            if (tryDirectScoped(secDict, secCache)) {
+                return true;
+            }
+
+            // 仅 StaticUI 来源且非文件路径时允许执行递归智能拆分与复合前缀/后缀匹配
+            if (source == TranslationSource::StaticUI && !isFileOrPath) {
                 if (MatchAndTranslateInternal(secDict, textStr, outResult)) {
                     secCache[textStr] = outResult;
                     return true;
+                }
+            }
+        }
+
+        // 核心跨模块继承机制：CS2 各子工具（如 pet 粒子编辑器、met 材质编辑器、sfm、subtool_* 等）
+        // 的算子、初始器、发射器、约束、材质节点与属性元数据原始字符串均由 hammer.dll 集中注册并编译。
+        // 若子工具字典未命中，自动回退到 hammer 字典检索，确保子工具能够直接继承 hammer.jsonc 中的词条。
+        if (callerStem != L"hammer") {
+            auto itHammer = g_ScopedDicts.find(L"hammer");
+            if (itHammer != g_ScopedDicts.end()) {
+                const auto& hammerDict = itHammer->second;
+                auto& hammerCache = g_ScopedCaches[L"hammer"];
+
+                if (tryDirectScoped(hammerDict, hammerCache)) {
+                    return true;
+                }
+
+                if (source == TranslationSource::StaticUI && !isFileOrPath) {
+                    if (MatchAndTranslateInternal(hammerDict, textStr, outResult)) {
+                        hammerCache[textStr] = outResult;
+                        return true;
+                    }
                 }
             }
         }
@@ -746,24 +903,16 @@ static bool FindTranslationScoped(void* callerAddr, const char* text, std::strin
     {
         std::lock_guard<std::mutex> lock(g_DictMutex);
         if (!g_CommonDict.empty()) {
-            // 静态查找
-            auto itDirect = g_CommonDict.find(textStr);
-            if (itDirect != g_CommonDict.end()) {
-                outResult = itDirect->second;
+            if (tryDirectScoped(g_CommonDict, g_CommonCache)) {
                 return true;
             }
 
-            // 缓存查找
-            auto itCache = g_CommonCache.find(textStr);
-            if (itCache != g_CommonCache.end()) {
-                outResult = itCache->second;
-                return true;
-            }
-
-            // 递归拆分匹配
-            if (MatchAndTranslateInternal(g_CommonDict, textStr, outResult)) {
-                g_CommonCache[textStr] = outResult;
-                return true;
+            // 仅 StaticUI 来源且非文件路径时允许执行递归智能拆分与复合前缀/后缀匹配
+            if (source == TranslationSource::StaticUI && !isFileOrPath) {
+                if (MatchAndTranslateInternal(g_CommonDict, textStr, outResult)) {
+                    g_CommonCache[textStr] = outResult;
+                    return true;
+                }
             }
         }
     }
@@ -785,16 +934,16 @@ static std::string WStringToUtf8(const wchar_t* wstr) {
     return str;
 }
 
-static bool FindTranslationScopedW(void* callerAddr, const wchar_t* wstr, std::string& outResult) {
+static bool FindTranslationScopedW(void* callerAddr, const wchar_t* wstr, std::string& outResult, TranslationSource source = TranslationSource::StaticUI) {
     if (!wstr || wstr[0] == L'\0') return false;
     char utf8Stack[1024] = {0};
     int written = WideCharToMultiByte(CP_UTF8, 0, wstr, -1, utf8Stack, sizeof(utf8Stack), NULL, NULL);
     if (written > 0) {
-        return FindTranslationScoped(callerAddr, utf8Stack, outResult);
+        return FindTranslationScoped(callerAddr, utf8Stack, outResult, source);
     }
     std::string dynamicUtf8 = WStringToUtf8(wstr);
     if (!dynamicUtf8.empty()) {
-        return FindTranslationScoped(callerAddr, dynamicUtf8.c_str(), outResult);
+        return FindTranslationScoped(callerAddr, dynamicUtf8.c_str(), outResult, source);
     }
     return false;
 }
@@ -870,7 +1019,7 @@ static void __fastcall hk_QPainter_drawText_Rect(void* pPainter, const void* pRe
     const wchar_t* wstr = nullptr;
     if (SafeGetUtf16(g_pfn_utf16, pQString, wstr)) {
         std::string trans;
-        if (FindTranslationScopedW(caller, wstr, trans)) {
+        if (FindTranslationScopedW(caller, wstr, trans, TranslationSource::Painter)) {
             void* qstr[1] = {0};
             if (SafeCreateQString(g_pfn_fromUtf8, qstr, trans.c_str(), (int)trans.length())) {
                 if (g_o_QPainter_drawText_Rect) g_o_QPainter_drawText_Rect(pPainter, pRect, flags, qstr, pBoundingRect);
@@ -887,7 +1036,7 @@ static void __fastcall hk_QPainter_drawText_RectF(void* pPainter, const void* pR
     const wchar_t* wstr = nullptr;
     if (SafeGetUtf16(g_pfn_utf16, pQString, wstr)) {
         std::string trans;
-        if (FindTranslationScopedW(caller, wstr, trans)) {
+        if (FindTranslationScopedW(caller, wstr, trans, TranslationSource::Painter)) {
             void* qstr[1] = {0};
             if (SafeCreateQString(g_pfn_fromUtf8, qstr, trans.c_str(), (int)trans.length())) {
                 if (g_o_QPainter_drawText_RectF) g_o_QPainter_drawText_RectF(pPainter, pRectF, flags, qstr, pBoundingRect);
@@ -904,7 +1053,7 @@ static void __fastcall hk_QPainter_drawText_PointF(void* pPainter, const void* p
     const wchar_t* wstr = nullptr;
     if (SafeGetUtf16(g_pfn_utf16, pQString, wstr)) {
         std::string trans;
-        if (FindTranslationScopedW(caller, wstr, trans)) {
+        if (FindTranslationScopedW(caller, wstr, trans, TranslationSource::Painter)) {
             void* qstr[1] = {0};
             if (SafeCreateQString(g_pfn_fromUtf8, qstr, trans.c_str(), (int)trans.length())) {
                 if (g_o_QPainter_drawText_PointF) g_o_QPainter_drawText_PointF(pPainter, pPointF, qstr);
@@ -916,7 +1065,126 @@ static void __fastcall hk_QPainter_drawText_PointF(void* pPainter, const void* p
     if (g_o_QPainter_drawText_PointF) g_o_QPainter_drawText_PointF(pPainter, pPointF, pQString);
 }
 
+static void __fastcall hk_QPainter_drawText_RectF_Option(void* pPainter, const void* pRectF, const void* pQString, const void* pOption) {
+    void* caller = _ReturnAddress();
+    const wchar_t* wstr = nullptr;
+    if (SafeGetUtf16(g_pfn_utf16, pQString, wstr)) {
+        std::string trans;
+        if (FindTranslationScopedW(caller, wstr, trans, TranslationSource::Painter)) {
+            void* qstr[1] = {0};
+            if (SafeCreateQString(g_pfn_fromUtf8, qstr, trans.c_str(), (int)trans.length())) {
+                if (g_o_QPainter_drawText_RectF_Option) g_o_QPainter_drawText_RectF_Option(pPainter, pRectF, qstr, pOption);
+                SafeDestroyQString(g_pfn_QString_dtor, qstr);
+                return;
+            }
+        }
+    }
+    if (g_o_QPainter_drawText_RectF_Option) g_o_QPainter_drawText_RectF_Option(pPainter, pRectF, pQString, pOption);
+}
+
+static void __fastcall hk_QPainter_drawText_Point(void* pPainter, const void* pPoint, const void* pQString) {
+    void* caller = _ReturnAddress();
+    const wchar_t* wstr = nullptr;
+    if (SafeGetUtf16(g_pfn_utf16, pQString, wstr)) {
+        std::string trans;
+        if (FindTranslationScopedW(caller, wstr, trans, TranslationSource::Painter)) {
+            void* qstr[1] = {0};
+            if (SafeCreateQString(g_pfn_fromUtf8, qstr, trans.c_str(), (int)trans.length())) {
+                if (g_o_QPainter_drawText_Point) g_o_QPainter_drawText_Point(pPainter, pPoint, qstr);
+                SafeDestroyQString(g_pfn_QString_dtor, qstr);
+                return;
+            }
+        }
+    }
+    if (g_o_QPainter_drawText_Point) g_o_QPainter_drawText_Point(pPainter, pPoint, pQString);
+}
+
+static void __fastcall hk_QPainter_drawText_xy(void* pPainter, int x, int y, const void* pQString) {
+    void* caller = _ReturnAddress();
+    const wchar_t* wstr = nullptr;
+    if (SafeGetUtf16(g_pfn_utf16, pQString, wstr)) {
+        std::string trans;
+        if (FindTranslationScopedW(caller, wstr, trans, TranslationSource::Painter)) {
+            void* qstr[1] = {0};
+            if (SafeCreateQString(g_pfn_fromUtf8, qstr, trans.c_str(), (int)trans.length())) {
+                if (g_o_QPainter_drawText_xy) g_o_QPainter_drawText_xy(pPainter, x, y, qstr);
+                SafeDestroyQString(g_pfn_QString_dtor, qstr);
+                return;
+            }
+        }
+    }
+    if (g_o_QPainter_drawText_xy) g_o_QPainter_drawText_xy(pPainter, x, y, pQString);
+}
+
+// 2.1 QTextDocument (拦截 CQRichItemListPicker 等富文本代理列表项与描述文本)
+static void __fastcall hk_QTextDocument_setPlainText(void* pDoc, const void* pQString) {
+    void* caller = _ReturnAddress();
+    const wchar_t* wstr = nullptr;
+    if (SafeGetUtf16(g_pfn_utf16, pQString, wstr)) {
+        std::string trans;
+        if (FindTranslationScopedW(caller, wstr, trans, TranslationSource::StaticUI)) {
+            void* qstr[1] = {0};
+            if (SafeCreateQString(g_pfn_fromUtf8, qstr, trans.c_str(), (int)trans.length())) {
+                if (g_o_QTextDocument_setPlainText) g_o_QTextDocument_setPlainText(pDoc, qstr);
+                SafeDestroyQString(g_pfn_QString_dtor, qstr);
+                return;
+            }
+        }
+    }
+    if (g_o_QTextDocument_setPlainText) g_o_QTextDocument_setPlainText(pDoc, pQString);
+}
+
+static void __fastcall hk_QTextDocument_setHtml(void* pDoc, const void* pQString) {
+    void* caller = _ReturnAddress();
+    const wchar_t* wstr = nullptr;
+    if (SafeGetUtf16(g_pfn_utf16, pQString, wstr)) {
+        std::string trans;
+        if (FindTranslationScopedW(caller, wstr, trans, TranslationSource::StaticUI)) {
+            void* qstr[1] = {0};
+            if (SafeCreateQString(g_pfn_fromUtf8, qstr, trans.c_str(), (int)trans.length())) {
+                if (g_o_QTextDocument_setHtml) g_o_QTextDocument_setHtml(pDoc, qstr);
+                SafeDestroyQString(g_pfn_QString_dtor, qstr);
+                return;
+            }
+        }
+    }
+    if (g_o_QTextDocument_setHtml) g_o_QTextDocument_setHtml(pDoc, pQString);
+}
+
 // 3. QAction
+static void* __fastcall hk_QAction_ctor(void* pAction, const void* pQString, void* pParent) {
+    void* caller = _ReturnAddress();
+    const wchar_t* wstr = nullptr;
+    if (SafeGetUtf16(g_pfn_utf16, pQString, wstr)) {
+        std::string trans;
+        if (FindTranslationScopedW(caller, wstr, trans)) {
+            void* qstr[1] = {0};
+            if (SafeCreateQString(g_pfn_fromUtf8, qstr, trans.c_str(), (int)trans.length())) {
+                void* res = g_o_QAction_ctor(pAction, qstr, pParent);
+                SafeDestroyQString(g_pfn_QString_dtor, qstr);
+                return res;
+            }
+        }
+    }
+    return g_o_QAction_ctor(pAction, pQString, pParent);
+}
+
+static void* __fastcall hk_QAction_ctor_icon(void* pAction, const void* pIcon, const void* pQString, void* pParent) {
+    void* caller = _ReturnAddress();
+    const wchar_t* wstr = nullptr;
+    if (SafeGetUtf16(g_pfn_utf16, pQString, wstr)) {
+        std::string trans;
+        if (FindTranslationScopedW(caller, wstr, trans)) {
+            void* qstr[1] = {0};
+            if (SafeCreateQString(g_pfn_fromUtf8, qstr, trans.c_str(), (int)trans.length())) {
+                void* res = g_o_QAction_ctor_icon(pAction, pIcon, qstr, pParent);
+                SafeDestroyQString(g_pfn_QString_dtor, qstr);
+                return res;
+            }
+        }
+    }
+    return g_o_QAction_ctor_icon(pAction, pIcon, pQString, pParent);
+}
 static void __fastcall hk_QAction_setText(void* pAction, const void* pQString) {
     void* caller = _ReturnAddress();
     const wchar_t* wstr = nullptr;
@@ -1037,13 +1305,30 @@ static void __fastcall hk_QWidget_setWindowTitle(void* pWidget, const void* pQSt
     if (g_o_QWidget_setWindowTitle) g_o_QWidget_setWindowTitle(pWidget, pQString);
 }
 
+static void __fastcall hk_QGroupBox_setTitle(void* pBox, const void* pQString) {
+    void* caller = _ReturnAddress();
+    const wchar_t* wstr = nullptr;
+    if (SafeGetUtf16(g_pfn_utf16, pQString, wstr)) {
+        std::string trans;
+        if (FindTranslationScopedW(caller, wstr, trans)) {
+            void* qstr[1] = {0};
+            if (SafeCreateQString(g_pfn_fromUtf8, qstr, trans.c_str(), (int)trans.length())) {
+                if (g_o_QGroupBox_setTitle) g_o_QGroupBox_setTitle(pBox, qstr);
+                SafeDestroyQString(g_pfn_QString_dtor, qstr);
+                return;
+            }
+        }
+    }
+    if (g_o_QGroupBox_setTitle) g_o_QGroupBox_setTitle(pBox, pQString);
+}
+
 // 5. Item 控件
 static void __fastcall hk_QTreeWidgetItem_setText(void* pItem, int column, const void* pQString) {
     void* caller = _ReturnAddress();
     const wchar_t* wstr = nullptr;
     if (SafeGetUtf16(g_pfn_utf16, pQString, wstr)) {
         std::string trans;
-        if (FindTranslationScopedW(caller, wstr, trans)) {
+        if (FindTranslationScopedW(caller, wstr, trans, TranslationSource::ItemWidget)) {
             void* qstr[1] = {0};
             if (SafeCreateQString(g_pfn_fromUtf8, qstr, trans.c_str(), (int)trans.length())) {
                 if (g_o_QTreeWidgetItem_setText) g_o_QTreeWidgetItem_setText(pItem, column, qstr);
@@ -1055,12 +1340,46 @@ static void __fastcall hk_QTreeWidgetItem_setText(void* pItem, int column, const
     if (g_o_QTreeWidgetItem_setText) g_o_QTreeWidgetItem_setText(pItem, column, pQString);
 }
 
+static void __fastcall hk_QTreeWidget_setHeaderLabel(void* pTree, const void* pQString) {
+    void* caller = _ReturnAddress();
+    const wchar_t* wstr = nullptr;
+    if (SafeGetUtf16(g_pfn_utf16, pQString, wstr)) {
+        std::string trans;
+        if (FindTranslationScopedW(caller, wstr, trans, TranslationSource::ItemWidget)) {
+            void* qstr[1] = {0};
+            if (SafeCreateQString(g_pfn_fromUtf8, qstr, trans.c_str(), (int)trans.length())) {
+                if (g_o_QTreeWidget_setHeaderLabel) g_o_QTreeWidget_setHeaderLabel(pTree, qstr);
+                SafeDestroyQString(g_pfn_QString_dtor, qstr);
+                return;
+            }
+        }
+    }
+    if (g_o_QTreeWidget_setHeaderLabel) g_o_QTreeWidget_setHeaderLabel(pTree, pQString);
+}
+
+static void* __fastcall hk_QTableWidgetItem_ctor(void* pItem, const void* pQString, int type) {
+    void* caller = _ReturnAddress();
+    const wchar_t* wstr = nullptr;
+    if (SafeGetUtf16(g_pfn_utf16, pQString, wstr)) {
+        std::string trans;
+        if (FindTranslationScopedW(caller, wstr, trans, TranslationSource::ItemWidget)) {
+            void* qstr[1] = {0};
+            if (SafeCreateQString(g_pfn_fromUtf8, qstr, trans.c_str(), (int)trans.length())) {
+                void* res = g_o_QTableWidgetItem_ctor(pItem, qstr, type);
+                SafeDestroyQString(g_pfn_QString_dtor, qstr);
+                return res;
+            }
+        }
+    }
+    return g_o_QTableWidgetItem_ctor(pItem, pQString, type);
+}
+
 static void __fastcall hk_QTableWidgetItem_setText(void* pItem, const void* pQString) {
     void* caller = _ReturnAddress();
     const wchar_t* wstr = nullptr;
     if (SafeGetUtf16(g_pfn_utf16, pQString, wstr)) {
         std::string trans;
-        if (FindTranslationScopedW(caller, wstr, trans)) {
+        if (FindTranslationScopedW(caller, wstr, trans, TranslationSource::ItemWidget)) {
             void* qstr[1] = {0};
             if (SafeCreateQString(g_pfn_fromUtf8, qstr, trans.c_str(), (int)trans.length())) {
                 if (g_o_QTableWidgetItem_setText) g_o_QTableWidgetItem_setText(pItem, qstr);
@@ -1072,12 +1391,29 @@ static void __fastcall hk_QTableWidgetItem_setText(void* pItem, const void* pQSt
     if (g_o_QTableWidgetItem_setText) g_o_QTableWidgetItem_setText(pItem, pQString);
 }
 
+static void* __fastcall hk_QListWidgetItem_ctor(void* pItem, const void* pQString, void* pListWidget, int type) {
+    void* caller = _ReturnAddress();
+    const wchar_t* wstr = nullptr;
+    if (SafeGetUtf16(g_pfn_utf16, pQString, wstr)) {
+        std::string trans;
+        if (FindTranslationScopedW(caller, wstr, trans, TranslationSource::ItemWidget)) {
+            void* qstr[1] = {0};
+            if (SafeCreateQString(g_pfn_fromUtf8, qstr, trans.c_str(), (int)trans.length())) {
+                void* res = g_o_QListWidgetItem_ctor(pItem, qstr, pListWidget, type);
+                SafeDestroyQString(g_pfn_QString_dtor, qstr);
+                return res;
+            }
+        }
+    }
+    return g_o_QListWidgetItem_ctor(pItem, pQString, pListWidget, type);
+}
+
 static void __fastcall hk_QListWidgetItem_setText(void* pItem, const void* pQString) {
     void* caller = _ReturnAddress();
     const wchar_t* wstr = nullptr;
     if (SafeGetUtf16(g_pfn_utf16, pQString, wstr)) {
         std::string trans;
-        if (FindTranslationScopedW(caller, wstr, trans)) {
+        if (FindTranslationScopedW(caller, wstr, trans, TranslationSource::ItemWidget)) {
             void* qstr[1] = {0};
             if (SafeCreateQString(g_pfn_fromUtf8, qstr, trans.c_str(), (int)trans.length())) {
                 if (g_o_QListWidgetItem_setText) g_o_QListWidgetItem_setText(pItem, qstr);
@@ -1094,7 +1430,7 @@ static void __fastcall hk_QComboBox_addItem(void* pBox, const void* pQString, co
     const wchar_t* wstr = nullptr;
     if (SafeGetUtf16(g_pfn_utf16, pQString, wstr)) {
         std::string trans;
-        if (FindTranslationScopedW(caller, wstr, trans)) {
+        if (FindTranslationScopedW(caller, wstr, trans, TranslationSource::ItemWidget)) {
             void* qstr[1] = {0};
             if (SafeCreateQString(g_pfn_fromUtf8, qstr, trans.c_str(), (int)trans.length())) {
                 if (g_o_QComboBox_addItem) g_o_QComboBox_addItem(pBox, qstr, pUserData);
@@ -1104,6 +1440,74 @@ static void __fastcall hk_QComboBox_addItem(void* pBox, const void* pQString, co
         }
     }
     if (g_o_QComboBox_addItem) g_o_QComboBox_addItem(pBox, pQString, pUserData);
+}
+
+static void __fastcall hk_QComboBox_addItem_icon(void* pBox, const void* pIcon, const void* pQString, const void* pUserData) {
+    void* caller = _ReturnAddress();
+    const wchar_t* wstr = nullptr;
+    if (SafeGetUtf16(g_pfn_utf16, pQString, wstr)) {
+        std::string trans;
+        if (FindTranslationScopedW(caller, wstr, trans, TranslationSource::ItemWidget)) {
+            void* qstr[1] = {0};
+            if (SafeCreateQString(g_pfn_fromUtf8, qstr, trans.c_str(), (int)trans.length())) {
+                if (g_o_QComboBox_addItem_icon) g_o_QComboBox_addItem_icon(pBox, pIcon, qstr, pUserData);
+                SafeDestroyQString(g_pfn_QString_dtor, qstr);
+                return;
+            }
+        }
+    }
+    if (g_o_QComboBox_addItem_icon) g_o_QComboBox_addItem_icon(pBox, pIcon, pQString, pUserData);
+}
+
+static void __fastcall hk_QComboBox_setItemText(void* pBox, int index, const void* pQString) {
+    void* caller = _ReturnAddress();
+    const wchar_t* wstr = nullptr;
+    if (SafeGetUtf16(g_pfn_utf16, pQString, wstr)) {
+        std::string trans;
+        if (FindTranslationScopedW(caller, wstr, trans, TranslationSource::ItemWidget)) {
+            void* qstr[1] = {0};
+            if (SafeCreateQString(g_pfn_fromUtf8, qstr, trans.c_str(), (int)trans.length())) {
+                if (g_o_QComboBox_setItemText) g_o_QComboBox_setItemText(pBox, index, qstr);
+                SafeDestroyQString(g_pfn_QString_dtor, qstr);
+                return;
+            }
+        }
+    }
+    if (g_o_QComboBox_setItemText) g_o_QComboBox_setItemText(pBox, index, pQString);
+}
+
+static void __fastcall hk_QComboBox_insertItem(void* pBox, int index, const void* pQString, const void* pUserData) {
+    void* caller = _ReturnAddress();
+    const wchar_t* wstr = nullptr;
+    if (SafeGetUtf16(g_pfn_utf16, pQString, wstr)) {
+        std::string trans;
+        if (FindTranslationScopedW(caller, wstr, trans, TranslationSource::ItemWidget)) {
+            void* qstr[1] = {0};
+            if (SafeCreateQString(g_pfn_fromUtf8, qstr, trans.c_str(), (int)trans.length())) {
+                if (g_o_QComboBox_insertItem) g_o_QComboBox_insertItem(pBox, index, qstr, pUserData);
+                SafeDestroyQString(g_pfn_QString_dtor, qstr);
+                return;
+            }
+        }
+    }
+    if (g_o_QComboBox_insertItem) g_o_QComboBox_insertItem(pBox, index, pQString, pUserData);
+}
+
+static void __fastcall hk_QComboBox_insertItem_icon(void* pBox, int index, const void* pIcon, const void* pQString, const void* pUserData) {
+    void* caller = _ReturnAddress();
+    const wchar_t* wstr = nullptr;
+    if (SafeGetUtf16(g_pfn_utf16, pQString, wstr)) {
+        std::string trans;
+        if (FindTranslationScopedW(caller, wstr, trans, TranslationSource::ItemWidget)) {
+            void* qstr[1] = {0};
+            if (SafeCreateQString(g_pfn_fromUtf8, qstr, trans.c_str(), (int)trans.length())) {
+                if (g_o_QComboBox_insertItem_icon) g_o_QComboBox_insertItem_icon(pBox, index, pIcon, qstr, pUserData);
+                SafeDestroyQString(g_pfn_QString_dtor, qstr);
+                return;
+            }
+        }
+    }
+    if (g_o_QComboBox_insertItem_icon) g_o_QComboBox_insertItem_icon(pBox, index, pIcon, pQString, pUserData);
 }
 
 // ==============================================================================
@@ -1166,6 +1570,8 @@ static bool TryHookQtToolsModules() {
         HMODULE hQtWidgets = GetModuleHandleW(L"Qt5Widgets.dll");
         if (hQtWidgets) {
             LogHook("[HOOK] Found Qt5Widgets.dll (%p), installing widget hooks...", hQtWidgets);
+            void* pActionCtorText  = (void*)GetProcAddress(hQtWidgets, "??0QAction@@QEAA@AEBVQString@@PEAVQObject@@@Z");
+            void* pActionCtorIcon  = (void*)GetProcAddress(hQtWidgets, "??0QAction@@QEAA@AEBVQIcon@@AEBVQString@@PEAVQObject@@@Z");
             void* pActionSetText   = (void*)GetProcAddress(hQtWidgets, "?setText@QAction@@QEAAXAEBVQString@@@Z");
             void* pActionSetTip    = (void*)GetProcAddress(hQtWidgets, "?setToolTip@QAction@@QEAAXAEBVQString@@@Z");
             void* pActionSetStatus = (void*)GetProcAddress(hQtWidgets, "?setStatusTip@QAction@@QEAAXAEBVQString@@@Z");
@@ -1173,29 +1579,48 @@ static bool TryHookQtToolsModules() {
             void* pButtonSetText   = (void*)GetProcAddress(hQtWidgets, "?setText@QAbstractButton@@QEAAXAEBVQString@@@Z");
             void* pLabelSetText    = (void*)GetProcAddress(hQtWidgets, "?setText@QLabel@@QEAAXAEBVQString@@@Z");
             void* pSetTitle        = (void*)GetProcAddress(hQtWidgets, "?setWindowTitle@QWidget@@QEAAXAEBVQString@@@Z");
+            void* pGroupSetTitle   = (void*)GetProcAddress(hQtWidgets, "?setTitle@QGroupBox@@QEAAXAEBVQString@@@Z");
 
             void* pTreeSetText     = (void*)GetProcAddress(hQtWidgets, "?setText@QTreeWidgetItem@@QEAAXHAEBVQString@@@Z");
+            void* pTreeSetHeader   = (void*)GetProcAddress(hQtWidgets, "?setHeaderLabel@QTreeWidget@@QEAAXAEBVQString@@@Z");
+            void* pTableCtor       = (void*)GetProcAddress(hQtWidgets, "??0QTableWidgetItem@@QEAA@AEBVQString@@H@Z");
             void* pTableSetText    = (void*)GetProcAddress(hQtWidgets, "?setText@QTableWidgetItem@@QEAAXAEBVQString@@@Z");
+            void* pListCtor        = (void*)GetProcAddress(hQtWidgets, "??0QListWidgetItem@@QEAA@AEBVQString@@PEAVQListWidget@@H@Z");
             void* pListSetText     = (void*)GetProcAddress(hQtWidgets, "?setText@QListWidgetItem@@QEAAXAEBVQString@@@Z");
+
             void* pComboAddItem    = (void*)GetProcAddress(hQtWidgets, "?addItem@QComboBox@@QEAAXAEBVQString@@AEBVQVariant@@@Z");
+            void* pComboAddItemIcon= (void*)GetProcAddress(hQtWidgets, "?addItem@QComboBox@@QEAAXAEBVQIcon@@AEBVQString@@AEBVQVariant@@@Z");
+            void* pComboSetItemText= (void*)GetProcAddress(hQtWidgets, "?setItemText@QComboBox@@QEAAXHAEBVQString@@@Z");
+            void* pComboInsertItem = (void*)GetProcAddress(hQtWidgets, "?insertItem@QComboBox@@QEAAXHAEBVQString@@AEBVQVariant@@@Z");
+            void* pComboInsertItemIcon = (void*)GetProcAddress(hQtWidgets, "?insertItem@QComboBox@@QEAAXHAEBVQIcon@@AEBVQString@@AEBVQVariant@@@Z");
 
             std::vector<HookRequest> widgetRequests = {
-                { pActionSetText,   (void*)hk_QAction_setText,          (void**)&g_o_QAction_setText,          "QAction::setText" },
-                { pActionSetTip,    (void*)hk_QAction_setToolTip,       (void**)&g_o_QAction_setToolTip,       "QAction::setToolTip" },
-                { pActionSetStatus, (void*)hk_QAction_setStatusTip,     (void**)&g_o_QAction_setStatusTip,     "QAction::setStatusTip" },
-                { pActionSetWhats,  (void*)hk_QAction_setWhatsThis,     (void**)&g_o_QAction_setWhatsThis,     "QAction::setWhatsThis" },
-                { pButtonSetText,   (void*)hk_QAbstractButton_setText,  (void**)&g_o_QAbstractButton_setText,  "QAbstractButton::setText" },
-                { pLabelSetText,    (void*)hk_QLabel_setText,           (void**)&g_o_QLabel_setText,           "QLabel::setText" },
-                { pSetTitle,        (void*)hk_QWidget_setWindowTitle,   (void**)&g_o_QWidget_setWindowTitle,   "QWidget::setWindowTitle" },
-                { pTreeSetText,     (void*)hk_QTreeWidgetItem_setText,  (void**)&g_o_QTreeWidgetItem_setText,  "QTreeWidgetItem::setText" },
-                { pTableSetText,    (void*)hk_QTableWidgetItem_setText, (void**)&g_o_QTableWidgetItem_setText, "QTableWidgetItem::setText" },
-                { pListSetText,     (void*)hk_QListWidgetItem_setText,  (void**)&g_o_QListWidgetItem_setText,  "QListWidgetItem::setText" },
-                { pComboAddItem,    (void*)hk_QComboBox_addItem,        (void**)&g_o_QComboBox_addItem,        "QComboBox::addItem" }
+                { pActionCtorText,      (void*)hk_QAction_ctor,             (void**)&g_o_QAction_ctor,             "QAction::QAction(text)" },
+                { pActionCtorIcon,      (void*)hk_QAction_ctor_icon,        (void**)&g_o_QAction_ctor_icon,        "QAction::QAction(icon,text)" },
+                { pActionSetText,       (void*)hk_QAction_setText,          (void**)&g_o_QAction_setText,          "QAction::setText" },
+                { pActionSetTip,        (void*)hk_QAction_setToolTip,       (void**)&g_o_QAction_setToolTip,       "QAction::setToolTip" },
+                { pActionSetStatus,     (void*)hk_QAction_setStatusTip,     (void**)&g_o_QAction_setStatusTip,     "QAction::setStatusTip" },
+                { pActionSetWhats,      (void*)hk_QAction_setWhatsThis,     (void**)&g_o_QAction_setWhatsThis,     "QAction::setWhatsThis" },
+                { pButtonSetText,       (void*)hk_QAbstractButton_setText,  (void**)&g_o_QAbstractButton_setText,  "QAbstractButton::setText" },
+                { pLabelSetText,        (void*)hk_QLabel_setText,           (void**)&g_o_QLabel_setText,           "QLabel::setText" },
+                { pSetTitle,            (void*)hk_QWidget_setWindowTitle,   (void**)&g_o_QWidget_setWindowTitle,   "QWidget::setWindowTitle" },
+                { pGroupSetTitle,       (void*)hk_QGroupBox_setTitle,       (void**)&g_o_QGroupBox_setTitle,       "QGroupBox::setTitle" },
+                { pTreeSetText,         (void*)hk_QTreeWidgetItem_setText,  (void**)&g_o_QTreeWidgetItem_setText,  "QTreeWidgetItem::setText" },
+                { pTreeSetHeader,       (void*)hk_QTreeWidget_setHeaderLabel,(void**)&g_o_QTreeWidget_setHeaderLabel,"QTreeWidget::setHeaderLabel" },
+                { pTableCtor,           (void*)hk_QTableWidgetItem_ctor,    (void**)&g_o_QTableWidgetItem_ctor,    "QTableWidgetItem::QTableWidgetItem" },
+                { pTableSetText,        (void*)hk_QTableWidgetItem_setText, (void**)&g_o_QTableWidgetItem_setText, "QTableWidgetItem::setText" },
+                { pListCtor,            (void*)hk_QListWidgetItem_ctor,     (void**)&g_o_QListWidgetItem_ctor,     "QListWidgetItem::QListWidgetItem" },
+                { pListSetText,         (void*)hk_QListWidgetItem_setText,  (void**)&g_o_QListWidgetItem_setText,  "QListWidgetItem::setText" },
+                { pComboAddItem,        (void*)hk_QComboBox_addItem,        (void**)&g_o_QComboBox_addItem,        "QComboBox::addItem(text)" },
+                { pComboAddItemIcon,    (void*)hk_QComboBox_addItem_icon,   (void**)&g_o_QComboBox_addItem_icon,   "QComboBox::addItem(icon,text)" },
+                { pComboSetItemText,    (void*)hk_QComboBox_setItemText,    (void**)&g_o_QComboBox_setItemText,    "QComboBox::setItemText" },
+                { pComboInsertItem,     (void*)hk_QComboBox_insertItem,     (void**)&g_o_QComboBox_insertItem,     "QComboBox::insertItem(text)" },
+                { pComboInsertItemIcon, (void*)hk_QComboBox_insertItem_icon, (void**)&g_o_QComboBox_insertItem_icon, "QComboBox::insertItem(icon,text)" }
             };
 
             if (InstallHookBatch(widgetRequests, "Qt5Widgets")) {
                 g_bWidgetsHooked.store(true);
-                LogHook("[HOOK] Qt5Widgets hooks installed successfully (all 11/11 OK)");
+                LogHook("[HOOK] Qt5Widgets hooks installed successfully (all %zu/%zu OK)", widgetRequests.size(), widgetRequests.size());
             }
         }
     }
@@ -1204,19 +1629,30 @@ static bool TryHookQtToolsModules() {
         HMODULE hQtGui = GetModuleHandleW(L"Qt5Gui.dll");
         if (hQtGui) {
             LogHook("[HOOK] Found Qt5Gui.dll (%p), installing GUI hooks...", hQtGui);
-            void* pDrawRect   = (void*)GetProcAddress(hQtGui, "?drawText@QPainter@@QEAAXAEBVQRect@@HAEBVQString@@PEAV2@@Z");
-            void* pDrawRectF  = (void*)GetProcAddress(hQtGui, "?drawText@QPainter@@QEAAXAEBVQRectF@@HAEBVQString@@PEAV2@@Z");
-            void* pDrawPointF = (void*)GetProcAddress(hQtGui, "?drawText@QPainter@@QEAAXAEBVQPointF@@AEBVQString@@@Z");
+            void* pDrawRect       = (void*)GetProcAddress(hQtGui, "?drawText@QPainter@@QEAAXAEBVQRect@@HAEBVQString@@PEAV2@@Z");
+            void* pDrawRectF      = (void*)GetProcAddress(hQtGui, "?drawText@QPainter@@QEAAXAEBVQRectF@@HAEBVQString@@PEAV2@@Z");
+            void* pDrawPointF     = (void*)GetProcAddress(hQtGui, "?drawText@QPainter@@QEAAXAEBVQPointF@@AEBVQString@@@Z");
+            void* pDrawRectFOpt   = (void*)GetProcAddress(hQtGui, "?drawText@QPainter@@QEAAXAEBVQRectF@@AEBVQString@@AEBVQTextOption@@@Z");
+            void* pDrawPoint      = (void*)GetProcAddress(hQtGui, "?drawText@QPainter@@QEAAXAEBVQPoint@@AEBVQString@@@Z");
+            void* pDrawXY         = (void*)GetProcAddress(hQtGui, "?drawText@QPainter@@QEAAXHHAEBVQString@@@Z");
+
+            void* pDocSetPlainText= (void*)GetProcAddress(hQtGui, "?setPlainText@QTextDocument@@QEAAXAEBVQString@@@Z");
+            void* pDocSetHtml     = (void*)GetProcAddress(hQtGui, "?setHtml@QTextDocument@@QEAAXAEBVQString@@@Z");
 
             std::vector<HookRequest> guiRequests = {
-                { pDrawRect,   (void*)hk_QPainter_drawText_Rect,   (void**)&g_o_QPainter_drawText_Rect,   "QPainter::drawText(Rect)" },
-                { pDrawRectF,  (void*)hk_QPainter_drawText_RectF,  (void**)&g_o_QPainter_drawText_RectF,  "QPainter::drawText(RectF)" },
-                { pDrawPointF, (void*)hk_QPainter_drawText_PointF, (void**)&g_o_QPainter_drawText_PointF, "QPainter::drawText(PointF)" }
+                { pDrawRect,        (void*)hk_QPainter_drawText_Rect,           (void**)&g_o_QPainter_drawText_Rect,           "QPainter::drawText(Rect)" },
+                { pDrawRectF,       (void*)hk_QPainter_drawText_RectF,          (void**)&g_o_QPainter_drawText_RectF,          "QPainter::drawText(RectF)" },
+                { pDrawPointF,      (void*)hk_QPainter_drawText_PointF,         (void**)&g_o_QPainter_drawText_PointF,         "QPainter::drawText(PointF)" },
+                { pDrawRectFOpt,    (void*)hk_QPainter_drawText_RectF_Option,   (void**)&g_o_QPainter_drawText_RectF_Option,   "QPainter::drawText(RectF,Option)" },
+                { pDrawPoint,       (void*)hk_QPainter_drawText_Point,          (void**)&g_o_QPainter_drawText_Point,          "QPainter::drawText(Point)" },
+                { pDrawXY,          (void*)hk_QPainter_drawText_xy,             (void**)&g_o_QPainter_drawText_xy,             "QPainter::drawText(xy)" },
+                { pDocSetPlainText, (void*)hk_QTextDocument_setPlainText,       (void**)&g_o_QTextDocument_setPlainText,       "QTextDocument::setPlainText" },
+                { pDocSetHtml,      (void*)hk_QTextDocument_setHtml,            (void**)&g_o_QTextDocument_setHtml,            "QTextDocument::setHtml" }
             };
 
             if (InstallHookBatch(guiRequests, "Qt5Gui")) {
                 g_bGuiHooked.store(true);
-                LogHook("[HOOK] Qt5Gui hooks installed successfully (all 3/3 OK)");
+                LogHook("[HOOK] Qt5Gui hooks installed successfully (all %zu/%zu OK)", guiRequests.size(), guiRequests.size());
             }
         }
     }

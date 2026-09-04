@@ -1,0 +1,97 @@
+{
+  // ==============================================================================
+  // CS2 Workshop Tools FGD 实体定义翻译字典 (jsonc)
+  // ==============================================================================
+  //
+  // 【译制提示】
+  // - 格式为标准的键值对："原文": "译文"
+  // - 请使用 // 类型注释，避免使用 /** */ 。
+  // - 出现覆盖无效的情况，请用github仓库中的 find_dll_strings.py 尝试查询具体键。
+  // 
+  // 【可翻译内容】
+  // 1. 实体类说明 (@PointClass ... = name : "Description")
+  // 2. 属性显示名称 (targetname : "Name" : : "...")
+  // 3. 属性悬停描述 (... : "Name" : default : "Description")
+  // 4. 选项与标记 ("0" : "Enabled" : "Option Desc")
+  // 5. 输入输出 (input Kill : "Description")
+  // 6. 绑定按钮说明 (desc = "Description")
+  // 7. 属性组名 ([ group="Render Properties" ] / { group="Style" })
+  // 
+  // 【格式与安全】
+  // - 所有底层 RAW 标识符（如 targetname、angles、thinkalways、io 类型与默认值）引擎会自动保护，请仅翻译双引号内的文本。
+  // - 修改保存后重新在启动器点击启动即可自动重新编译部署。
+  // ==============================================================================
+  //
+  // 【译者注】
+  // - 禁止修改实体类名。
+  //
+  // - 待定
+  // - 尚未确立标准。请稍后开始工作
+
+  "Omnidirectional point light": "全向点光源",
+  "Light Source": "光源",
+  "Name": "名称",
+  "The name that other entities use to refer to this entity.": "其他实体用于引用此实体的名称。",
+  "Removes this entity from the world.": "从世界中移除此实体。",
+  "Enabled": "已启用",
+  "Disabled": "已禁用",
+
+  // 实体属性分组 (Property Inspector Groups)
+  "Render Properties": "渲染属性",
+  "Physics Properties": "物理属性",
+  "Advanced Properties": "高级属性",
+  "Breakable Properties": "易碎属性",
+  "Glow Properties": "发光属性",
+  "NPC Properties": "NPC属性",
+  "Hierarchy": "层级结构",
+  "Direct Light": "直接光",
+  "Indirect Light": "间接光",
+  "Indirect Lighting": "间接照明",
+  "Light Shape": "灯光形状",
+  "Cascade Shadow Maps": "级联阴影贴图",
+  "Volumetric": "体积",
+  "Exposure Controls": "曝光控制",
+  "Fog": "雾",
+  "Fog & Sky": "雾与天空",
+  "Fog Color": "雾颜色",
+  "Fog Cubemap": "雾立方体贴图",
+  "Fog Distance": "雾距离",
+  "Fog Height": "雾高度",
+  "Ambient Occlusion": "环境光遮蔽",
+  "Ambient Occlusion Proxies": "环境光遮蔽代理",
+  "Depth Of Field": "景深",
+  "Sky": "天空",
+  "Specular": "高光",
+  "Style": "样式",
+  "Wind": "风",
+  "Noise": "噪波",
+  "Resolution": "分辨率",
+  "Sequence": "序列",
+  "Bounds": "边界",
+  "Collision": "碰撞",
+  "Content": "内容",
+  "Control Points": "控制点",
+  "Control Points Parents": "控制点父级",
+  "Cookie": "Cookie",
+  "Cubemap": "立方体贴图",
+  "Frustum": "视锥体",
+  "Logic": "逻辑",
+  "Misc": "其他",
+  "Particles": "粒子",
+  "Player": "玩家",
+  "Precomputed Visibility": "预计算可见性",
+  "Render": "渲染",
+  "Attachments": "附件",
+  "Build Settings": "构建设置",
+  "Break Contents": "碎裂内容",
+  "Initially Destroyed Destructible Parts": "初始摧毁可破坏部件",
+  "Material Override ": "材质覆盖",
+  "Material Override": "材质覆盖",
+  "Tactical Search Spawn": "战术搜索生成",
+  "Transitions": "过渡",
+  "+Stage Start": "+阶段开始",
+  "+Stage End": "+阶段结束",
+  "Steam Audio Custom Data Settings": "Steam音频自定义数据设置",
+  "Steam Audio Pathing Settings": "Steam音频寻路设置",
+  "Steam Audio Reverb Settings": "Steam音频混响设置"
+}

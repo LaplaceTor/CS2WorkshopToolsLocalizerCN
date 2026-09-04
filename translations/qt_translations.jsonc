@@ -1,0 +1,389 @@
+{
+  // ==============================================================================
+  // CS2 Workshop Tools 界面主要翻译字典 (jsonc)
+  // ==============================================================================
+  //
+  // 【译制提示】
+  // - 格式为标准的键值对: "原文": "译文"
+  // - 请使用 // 类型注释，避免使用 /** */ 。
+  // - 出现覆盖无效的情况，请用github仓库中的 find_dll_strings.py 尝试查询具体键。
+  //
+  // 【可翻译内容】
+  // 1. 主菜单与二级菜单项
+  // 2. 工具栏按钮与悬停提示
+  // 3. 属性面板属性名
+  // 4. 树形视图、列表与下拉框文本
+  // 5. 弹窗对话框与按钮文本
+  //
+  // 【快捷键自动适配】
+  // - 核心注入模块已内置动态快捷键识别与拆分引擎。
+  // - 遇到如 "Clipping Tool [Shift+X]"、"Undo (Ctrl+Z)"、"Save\tCtrl+S"、"Save As..."、"Name:" 等文本，
+  //   只需翻译基础英文（如 "Clipping Tool": "剪切工具"），快捷键后缀会被自动保留与拼接，无需手动输入快捷键！
+  //
+  // ==============================================================================
+  //
+  // 【译者注】
+  // - ！进行翻译工作时请注意: 您的译文应遵以“保证(相对于功能的)准确性、可读性、沟通效率的描述和转写”为哲学标准。对于原文本中语法、语义、用词等细节的还原不是第一需求。！
+  //
+  // - 部分术语、名词为保证沟通无障碍性，以括号形式包含了原文。对照表中遵循此原则的词汇，在您的译制内容中也该保持一致。
+  // - 所有窗口名词都应以括号形式包含原名。
+  //
+  // - 主译者(DramaCa)目前正在处理: Hammer 与 Asset Browser。可自行避免重复工作。
+  //
+  // 【特定字段标准对照表】 ( "原文" => "固定译文" [?注释] #s为可选复数 以/连接为可选项，优先使用最左 )
+  // - "..."                          => "…"
+  // - "Prefab#s"                     => "Prefab"
+  // - "Instance"                     => "实例(Instance)"
+  // - "Prop#s"                       => "模型(Prop#s)"
+  // - "Parent","Child"               => "父级","子级"
+  // - "Relay#s"                      => "中继(Relay)" [说明文字中使用。不要与"logic_relay"混淆]
+  // - "Workplane"                    => "工作平面(Workplane)"
+  // - "Vis"                          => "Vis"
+  // - "Vis Contributor#s"            => "Vis贡献者(Vis Contributor#s)"
+  // - "Tools Material#s"             => "工具材质(Tools Material#s)"
+  // - "Selection Set#s"              => "可选组(Selection Set#s)"
+  // - "World Layer"                  => "世界层(World Layer)"
+  // - "Selected"                     => "选中"
+  // - "Material Blend/Blend"         => "材质混合(Material Blend)"
+  // - "Global","World","Local"       => "全局","世界","本地"
+  // - "Collapse"                     => "应用/解散"
+  // - "Mesh/Meshes"                  => "网格(Mesh)"
+  // - "Pivot"                        => "轴点/轴点(Pivot)"
+  // - "Cordon#s"                     => "屏蔽区"
+  //
+  // - "Texture#s"                    => "纹理"
+  // - "Material#s"                   => "材质"
+  //
+  // ==============================================================================
+
+  // 通用 - 顶栏/标题
+  "File": "文件",
+  "Working Sets": "工作区",
+  "Tools": "工具",
+  "View": "视图",
+  "Help": "帮助",
+  "Edit": "编辑",
+  "Map": "地图",
+  "Prefabs": "Prefab",
+  "Preview Baked Lighting": "烘焙预览光照",
+  "Steam Audio": "Steam音频",
+  "Window": "窗口",
+  "Windows": "所有窗口",
+
+  // 通用 - 下拉菜单
+  "...": "…",
+  "New": "新建",
+  "Open": "打开",
+  "Save": "保存",
+  "Save As...": "另存为…",
+  "Reload From Disk": "从保存文件重载",
+  "Exit": "退出",
+  "Tabbed Mode": "启用标签栏",
+  "Cascade": "弹出视图 (层叠)",
+  "Tile": "弹出视图 (拼贴)",
+  "Close All": "关闭全部",
+  "Windows...": "所有窗口…",
+  "Selected": "选中",
+  "All": "全部",
+  "About QT...": "关于QT…",
+  "About": "关于",
+
+  // 通用 - 按钮
+  "Yes": "是",
+  "No": "否",
+  "Cancel": "取消",
+  "Browse": "浏览",
+
+  // Asset Browser
+  "Asset Browser": "资产浏览器",
+  "Hammer": "地图编辑器 (Hammer)",
+  "Hammer (Map Editor)": "地图编辑器 (Hammer)",
+  "Material Editor": "材质编辑器 (Material Editor)",
+  "ModelDoc": "模型编辑器 (ModelDoc)",
+  "ModelDoc Editor": "模型编辑器 (ModelDoc)",
+  "Image subrect editor": "图像热点编辑器 (Image Subrect Editor)",
+  "Postprocessing Editor": "后处理编辑器 (Postprocessing Editor)",
+  "Counter-Strike 2 Workshop Manager": "反恐精英2创意工坊管理器 (Counter-Strike 2 Workshop Manager)",
+  "Console": "控制台 (VConsole2)",
+  "VConsole": "控制台 (VConsole2)",
+  "VConsole2 (64-bit)": "控制台 (VConsole2) 64位",
+  "Other Tools": "其他工具",
+  "Render All Windows": "",
+  "Mute Game (In Tools)": "静音游戏 (在工具内时)",
+  "Mute Tools": "静音工具",
+  "Shutdown": "退出",
+  
+  "All Assets": "所有资产",
+  "Most Recently Used Assets": "最近使用的资产",
+  "Materials": "材质",
+  "Overlays": "贴花",
+  "Models": "模型",
+  "Particles": "粒子",
+  "Prefab": "Prefab",
+  "Smart Props": "智能模型",
+  "Used in Map": "在地图中使用",
+  "Selection": "选中",
+
+  "Filter": "过滤",
+  "List": "列表",
+  "Grid": "图标",
+  "Lock Cam": "锁定镜头",
+  "Name": "名称",
+  "Type": "类型",
+  "Tags": "标签",
+  "Mod": "模组",
+  "Mods": "模组",
+  "Asset Type": "资产类型",
+  "Asset Types": "资产类型",
+  "Size": "尺寸",
+  "Count": "数量",
+
+  "Tags + Untagged": "标签 + 无标签",
+  "+ Untagged": "+ 无标签",
+  "Untagged Only": "仅无标签",
+
+  "(Name Filter)": "(搜索)",
+  "Reset Filter": "全选",
+  "Uncheck All": "取消全选",
+  "(Only)": "(仅此项)",
+  "(Require All)": "(满足所有)",
+
+  "Untagged Assets": "无标签资产",
+  "Alpha-Tested Material": "Alpha-Test资产",
+  "Animgraph1": "", // 不要翻译
+  "Asset Without Content": "无源文件资产",
+  "Child Asset": "子资产",
+  "Compiled with Warnings": "编译存在警告",
+  "Decal Material": "贴花材质",
+  "Inherited Asset": "继承资产",
+  "Layered Material": "混合材质",
+  "Material Layer": "混合层级材质",
+  "Overridden Asset": "覆写资产",
+  "Read-Only Asset": "只读资产",
+  "Tools Nodraw Material": "隐形工具材质",
+  "Translucent Material": "半透明材质",
+
+  "Compiled Texture": "纹理",
+  "CS2 Economy Item": "CS2市场物品",
+  "EXR File": "EXR文件",
+  "JavaScript": "",
+  "JPG File": "JPG文件",
+  "Material": "材质",
+  "Model": "模型",
+  "ModelDoc Prefab": "ModelDoc Prefab",
+  "ModelDoc Template": "ModelDoc 模板",
+  "Panorama Layout": "Panorama布局",
+  "Panorama Style": "Panorama样式",
+  "PFM File": "PFM文件",
+  "Photoshop File": "Photoshop文件",
+  "PNG File": "PNG文件",
+  "Postprocessing Settings": "后处理配置",
+  "Sheetfile": "动画表",
+  "Smart Prop": "智能模型",
+  "Sound": "音频",
+  "Sound Event Script": "音频事件脚本",
+  "Sub-Rectangle Definition": "热点布局定义",
+  "TGA File": "TGA文件",
+  "TIF File": "TIF文件",
+  "TIFF File": "TIFF文件",
+  "VData Include": "VData扩展",
+  "Vector Graphic": "矢量图像",
+
+  "Fast Asset Search": "快速资产搜索",
+  "%1 Assets Visible": "显示 %1 资产",
+  "Ready": "就绪",
+  "Open the %1 tool": "启动工具 %1",
+
+  // Asset Broser - 下拉菜单
+
+  // Hammer - 下拉菜单
+  "New From Template": "从模板新建",
+  "Recent Files": "最近文件",
+  "Clear Recent File List": "清空最近文件列表",
+  "Save Copy As Text...": "保存副本为文本…",
+  "Save Active Prefab": "保存激活预制件(Prefab)",
+  "Close": "关闭",
+  "Import File...": "导入文件…",
+  "Export File...": "导出文件…",
+  "Export Selected...": "导出选中项…",
+  "Reload .FGD Files": "重载所有.FGD文件",
+  "Build map...": "编译地图…",
+  
+  "Undo": "撤销",
+  "&Undo: %s": "&撤销: %s",
+  "Redo": "重做",
+  "&Redo: %s": "&重做: %s",
+  "Disable Undo/Redo": "禁用 撤销/重做",
+  "Enable Undo/Redo": "启用 撤销/重做",
+  "Repeat Command": "重复上条指令",
+  "Find entities...": "寻找实体…",
+  "Replace...": "替换…",
+  "Cut": "剪切",
+  "Copy": "拷贝",
+  "Paste": "粘贴",
+  "Paste Special...": "高级粘贴…",
+  "Delete Selected": "删除所选",
+  "Move Props to World": "移动模型(Props)到世界",
+  "Insert New Image Plane": "插入新参考图",
+  "Clear Selection": "清除选中",
+  "Select All": "选中全部",
+  "Invert Selection": "翻转选中",
+  "Select Parent": "选中父级",
+
+  "Entity Gallery": "实体画廊",
+  "Check Map For Problems": "检查地图问题",
+  "Map Information": "地图信息",
+  "Map Properties": "地图属性",
+  "Map Variables": "地图变量",
+  "Map Relays": "地图中继(Relays)",
+  "Entity Report": "实体报告",
+  "Map Manifest": "地图明细",
+  "Load Compiled Vis Data": "加载已编译Vis数据",
+  "Clear Compiled Vis Data": "清除已编译Vis数据",
+  "Load Map In Engine": "在引擎中加载地图",
+  
+  "Toolbars": "工具窗口",
+  "Show 2D Grid": "显示2D网格",
+  "Show 3D Grid": "显示3D网格",
+  "Smaller Grid": "缩小网格",
+  "Bigger Grid": "放大网格",
+  "Center Views on Selection": "所有视图居中到选中",
+  "Center 2D Views on Selection": "2D视图居中到选中",
+  "Frame All Views on Selection": "所有视图全屏到选中",
+  "Align Active View to Selection": "对齐激活视图到选中",
+  "Align Selection to Active View": "对齐选中到激活视图",
+  "Re-orient camera to workplane": "重定向相机基准到工作平面(Workplane)",
+  "Reset camera to world orientation": "重置相机基准到世界",
+  "Go to Coordinates": "移动到坐标",
+  "Hide Entity Names": "隐藏实体名称",
+  "Show Entity Names": "显示实体名称",
+  "Show Editor Only Objects": "显示仅在编辑器存在物体(Editor Only Objects)",
+  "Show Vis Contributors Only": "仅显示Vis贡献者(Vis Contributors)",
+  "Show Tools Materials": "显示工具材质(Tools Materials)",
+  "Show Collision Models": "显示碰撞模型",
+  "Show LPV Sample Vis": "显示光照探针场(Light Probe Volume)采样",
+  "Show Light Overlap": "显示光照重叠",
+  "Quick Hide Selection": "快速隐藏选中",
+  "Quick Hide Unselected Objects": "快速隐藏未选中",
+  "Show Quick-Hide Objects": "显示快速隐藏物体",
+  "Selection set from quick hide": "从快速隐藏创建可选组(Selection Set)",
+  "Create selection set": "创建可选组(Selection Set)",
+  "Hide unselected": "隐藏未选中到可选组可选组(Selection Set)",
+  "Take Large Screenshot...": "创建超大截屏...",
+
+  "Default Layout": "重置布局",
+  "Fullscreen Layout": "全屏",
+  "Assets": "资产",
+  "Object Properties": "对象属性",
+  "Tool Properties": "工具属性",
+  "Outliner": "大纲",
+  "Selection Sets": "可选组(Selection Sets)",
+  "Auto Vis Groups": "自动可视组",
+  "Undo History": "撤销历史",
+  "Command History": "操作历史",
+  "Active Material": "活动材质",
+  "Cordons": "屏蔽区",
+  "Perf Stats": "性能统计",
+  "Floating Asset Browser": "浮动资产浏览器",
+  "Floating Map View": "浮动地图视图",
+  "Close Floating Windows": "关闭所有浮窗",
+
+  "Group": "创建组合",
+  "Ungroup": "解散组合",
+  "Ungroup All": "解散所有组合",
+  "Parent": "绑定父级",
+  "Un-parent": "解除父级",
+  "Create World Layer": "创建世界层(World Layer)",
+  "Create Lattice Deformer": "创建晶格变形器",
+  "Create Simple Deformer": "创建简单变形器",
+  "Deformer Creation Axis": "变形器基础轴",
+  "Create Instance": "创建实例(Instance)",
+  "Collapse Instance": "应用实例(Instance)",
+  "Tie To Entity": "转换到实体",
+  "Untie From Entity": "解除实体转换",
+  "Snap Selected To Grid": "吸附选中到网格",
+  "Snap Selected To Grid Individually": "逐个吸附选中到网格",
+  "Flip Selection Horizontally": "水平翻转选中",
+  "Flip Selection Vertically": "垂直翻转选中",
+  "Create Mesh Around Selection": "基于选中创建包围盒",
+  "Remap Blend Data": "重映射材质混合(Material Blend)数据",
+  "Options...": "选项…",
+  
+  "Automatic": "自动",
+  "World X": "世界X",
+  "World Y": "世界Y",
+  "World Z": "世界Z",
+  "Local X": "局部X",
+  "Local Y": "局部Y",
+  "Local Z": "局部Z",
+
+  "Import Prefab": "添加Prefab",
+  "New Prefab From Selection (Maintain World Offset)": "从选中创建Prefab(传递世界原点)",
+  "New Prefab From Selection (Center On Origin)": "从选中创建Prefab(原点居中)",
+  "Collapse prefabs": "应用Prefab",
+  "Display Prefabs": "显示Prefab",
+
+  "Bake All Lighting": "烘焙所有光照",
+  "Bake All Cubemaps": "烘焙所有Cubemap",
+  "Bake Fog Indirect Lighting": "烘焙雾间接光",
+  "Clear All Lighting": "清除所有光照",
+  "Bake Lighting On Selection": "为选中烘焙光照",
+  "Bake Selected Cubemaps": "烘焙选中Cubemap",
+  "Clear Lighting On Selection": "为选中清除光照",
+
+  "Preview Scene": "预览音频空间",
+  "Export Scene to OBJ...": "导出空间到OBJ…",
+  "Create Probe Generation Volume": "创建探针生成区域",
+  "Create Probe Exclusion Volume": "创建探针排除区域",
+  "Generate Probes...": "生成探针…",
+  "Generate Single Probe": "生成单个探针",
+  "Toggle Probe Visualization": "切换探针可视化",
+  "Change Settings...": "更改设置…",
+  "Bake Data...": "烘焙数据…",
+  "Show Key Bindings": "显示按键绑定…",
+
+  // Hammer - 工具栏
+  "Vertices": "顶点(Vertex)",
+  "Edges": "边(Edge)",
+  "Faces": "面(Face)",
+  "Meshes": "网格(Mesh)",
+  "Objects": "对象(Object)",
+  "Groups": "组(Group)",
+  "Navigation": "导航(Nav)",
+
+  "Connect": "选择相连",
+  "Boundary": "选择边界",
+  "Convert": "转换到…",
+  
+  "Select:": "选择: ",
+  "Editing:": "编辑: ",
+  "UV Set:": "UV集: ",
+  "UV Set: All": "UV集: 全部",
+  "UV Set: UV1": "UV集: UV1",
+  "UV Set: UV2": "UV集: UV2",
+
+  "Selection Tool": "选择工具",
+  "Translate Tool": "移动工具",
+  "Rotate Tool": "旋转工具",
+  "Scale Tool": "缩放工具",
+  "Pivot Tool": "轴点工具",
+  "Entity Tool": "实体工具",
+  "Block Tool": "几何体工具",
+  "Path Tool": "路径工具",
+  "Polygon Tool": "多边形工具",
+  "Clipping Tool": "切割工具",
+  "Mirror Tool": "镜像工具",
+  "Texture Projection Tool": "材质映射工具",
+  "Paint Tool": "绘制工具",
+  "Displacement Tool": "地形工具",
+  "Mesh Projection Tool": "网格(Mesh)投影工具",
+  "Physics Tool": "物理工具",
+  "Place Locator Tool": "定位器放置工具",
+  "Asset Spray Tool": "资产散布工具",
+
+  "Key": "按键",
+  "Operation": "操作",
+  
+  // ModelDoc
+  "Open ModelDoc File": "打开ModelDoc文件"
+}
