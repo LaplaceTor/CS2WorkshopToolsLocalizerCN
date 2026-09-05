@@ -29,10 +29,10 @@ struct FgdOverrideData {
 
 class FgdTranslator {
 public:
-    // 加载 JSON 字典文件 (fgd_translations.json)
-    static bool LoadDictionary(const std::wstring& jsonPath, std::unordered_map<std::string, std::string>& outDict);
+    // 加载 JSONC 字典文件 (fgd_translations.jsonc，支持可选的 fallback 兜底字典)
+    static bool LoadDictionary(const std::wstring& jsonPath, std::unordered_map<std::string, std::string>& outDict, const std::wstring& fallbackJsonPath = L"");
 
-    // 加载 FGD 覆盖字典文件 (fgd_override.json)
+    // 加载 FGD 覆盖字典文件 (fgd_override.jsonc)
     static bool LoadOverrideDictionary(const std::wstring& jsonPath, FgdOverrideData& outOverride);
 
     // 翻译单行 FGD 内容（带类状态机跟踪与跨行说明覆盖支持）
@@ -70,7 +70,8 @@ public:
         const std::wstring& jsonDictPath,
         const std::wstring& jsonOverridePath,
         std::vector<std::wstring>& outProcessedFiles,
-        std::wstring& outError
+        std::wstring& outError,
+        const std::wstring& jsonFallbackPath = L""
     );
 
     // 兼容旧重载版本

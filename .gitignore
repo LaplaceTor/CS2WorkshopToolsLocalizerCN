@@ -15,9 +15,9 @@ debug/
 # Runtime Generated & Backup Folders
 # ====================================================================
 backup/
-translations/
 mock_*/
 tools/
+subtools/
 fgd/
 
 # ====================================================================
@@ -49,6 +49,7 @@ styles/
 tls/
 qml/
 scratch/
+scripts/local/
 opengl32sw.dll
 d3dcompiler_*.dll
 dxcompiler.dll

@@ -57,7 +57,7 @@ public:
     // 从 backupDir 完整恢复所有 FGD 和 Qt5Core.dll 到 CS2 目录，并清理临时注入文件（默认带版本匹配检查）
     static bool RestoreAll(const std::wstring& cs2Root, const std::wstring& backupDir, std::wstring& outError, bool force = false);
 
-    // 检查 CS2 目录中是否存在未还原的补丁文件（如 qtcore_qm.dll / qt_translations.json）
+    // 检查 CS2 目录中是否存在未还原的补丁文件（如 qtcore_qm.dll / qt_translations.jsonc）
     static bool IsPatchDeployed(const std::wstring& cs2Root);
 
     // 检查工作目录下是否存在未正常结束的会话状态记录

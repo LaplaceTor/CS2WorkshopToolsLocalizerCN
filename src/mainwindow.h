@@ -6,6 +6,7 @@
 
 class QComboBox;
 class QLineEdit;
+class QCheckBox;
 class QPushButton;
 class QTextEdit;
 class QLabel;
@@ -70,6 +71,7 @@ private:
 
     QComboBox* m_addonCombo;
     QLineEdit* m_argsEdit;
+    QCheckBox* m_useMachineTransCheck;
 
     // 核心操作按钮
     QPushButton* m_injectBtn;

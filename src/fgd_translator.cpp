@@ -21,29 +21,42 @@ namespace fs = std::filesystem;
 // 字典加载与解析（使用 Qt 原生 QJsonDocument 解析）
 // ==============================================================================
 
-bool FgdTranslator::LoadDictionary(const std::wstring& jsonPath, std::unordered_map<std::string, std::string>& outDict) {
+bool FgdTranslator::LoadDictionary(const std::wstring& jsonPath, std::unordered_map<std::string, std::string>& outDict, const std::wstring& fallbackJsonPath) {
     outDict.clear();
-    QFile file(QString::fromStdWString(jsonPath));
-    if (!file.open(QIODevice::ReadOnly)) return false;
-    QByteArray rawData = file.readAll();
-    file.close();
 
-    std::string clean = DictionaryCompiler::StripJsonComments(rawData.constData(), rawData.size());
-    QJsonParseError err;
-    QJsonDocument doc = QJsonDocument::fromJson(QByteArray::fromRawData(clean.c_str(), clean.size()), &err);
-    if (err.error != QJsonParseError::NoError || !doc.isObject()) {
-        return false;
-    }
+    auto loadSingleJson = [&](const std::wstring& path) -> bool {
+        if (path.empty()) return false;
+        QFile file(QString::fromStdWString(path));
+        if (!file.open(QIODevice::ReadOnly)) return false;
+        QByteArray rawData = file.readAll();
+        file.close();
 
-    QJsonObject obj = doc.object();
-    for (auto it = obj.begin(); it != obj.end(); ++it) {
-        if (it.value().isString()) {
-            QString val = it.value().toString();
-            if (!val.isEmpty()) {
-                outDict[it.key().toStdString()] = val.toStdString();
+        std::string clean = DictionaryCompiler::StripJsonComments(rawData.constData(), rawData.size());
+        QJsonParseError err;
+        QJsonDocument doc = QJsonDocument::fromJson(QByteArray::fromRawData(clean.c_str(), clean.size()), &err);
+        if (err.error != QJsonParseError::NoError || !doc.isObject()) {
+            return false;
+        }
+
+        QJsonObject obj = doc.object();
+        for (auto it = obj.begin(); it != obj.end(); ++it) {
+            if (it.value().isString()) {
+                QString val = it.value().toString().trimmed();
+                if (!val.isEmpty()) {
+                    outDict[it.key().toStdString()] = val.toStdString();
+                }
             }
         }
+        return true;
+    };
+
+    // 1. 若提供了 fallback 字典，先载入作为兜底
+    if (!fallbackJsonPath.empty() && fs::exists(fallbackJsonPath)) {
+        loadSingleJson(fallbackJsonPath);
     }
+
+    // 2. 载入主字典，覆盖/补充 fallback
+    loadSingleJson(jsonPath);
 
     return !outDict.empty();
 }
@@ -483,9 +496,39 @@ std::string FgdTranslator::TranslateLine(
         return prefix + "desc = \"" + tr + "\"" + suffix + comment + lineEnding;
     }
 
+    // 3.1 属性跨行定义块内部独立组声明：group = "GroupName" (如 base.fgd useLocalOffset 属性内部)
+    std::regex standaloneGroupRegex(R"re(^\s*group(\s*=\s*)"([^"]*)")re");
+    std::smatch standMatch;
+    if (std::regex_search(code, standMatch, standaloneGroupRegex)) {
+        std::string prefix = code.substr(0, standMatch.position(0));
+        std::string eq = standMatch[1].str();
+        std::string gName = standMatch[2].str();
+        std::string suffix = code.substr(standMatch.position(0) + standMatch.length(0));
+        std::string trGroup = getTrans(gName);
+        return prefix + "group" + eq + "\"" + trGroup + "\"" + suffix + comment + lineEnding;
+    }
+
     // 4. 属性定义：prop(type) [attrs] {attrs} : "Display Name" [ : default [ : "Description" ]] [ = [ choices ] ]
     std::string propHead, propKey, propType, rest;
     if (ExtractPropertyHeader(code, propHead, propKey, propType, rest)) {
+        // 翻译属性行内部的属性组：[ group="Render Properties" ] 或 { group="Style" } 等
+        std::regex groupRegex(R"re(\bgroup(\s*=\s*)"([^"]*)")re");
+        std::smatch groupMatch;
+        std::string newPropHead = "";
+        std::string searchHead = propHead;
+        while (std::regex_search(searchHead, groupMatch, groupRegex)) {
+            std::string prefix = searchHead.substr(0, groupMatch.position(0));
+            std::string eq = groupMatch[1].str();
+            std::string groupName = groupMatch[2].str();
+            std::string trGroup = getTrans(groupName);
+            newPropHead += prefix + "group" + eq + "\"" + trGroup + "\"";
+            searchHead = searchHead.substr(groupMatch.position(0) + groupMatch.length(0));
+        }
+        if (!newPropHead.empty()) {
+            newPropHead += searchHead;
+            propHead = newPropHead;
+        }
+
         // 查找该属性是否有 override
         const FgdPropertyOverride* propOverride = nullptr;
         if (!inOutCurrentClass.empty()) {
@@ -519,9 +562,9 @@ std::string FgdTranslator::TranslateLine(
             }
         }
 
-        // 如果属性没有冒号定义（例如跨行定义的属性头部 useLocalOffset(boolean)）
+        // 如果属性没有冒号定义（例如跨行定义的属性头部 useLocalOffset(boolean) 或 spawnflags(flags) [ group="Physics Properties" ] =）
         if (TrimString(propBody).empty()) {
-            return code + comment + lineEnding;
+            return propHead + rest + comment + lineEnding;
         }
 
         // 解析 propBody 中的冒号分隔项
@@ -763,10 +806,11 @@ bool FgdTranslator::TranslateAndDeployAll(
     const std::wstring& jsonDictPath,
     const std::wstring& jsonOverridePath,
     std::vector<std::wstring>& outProcessedFiles,
-    std::wstring& outError
+    std::wstring& outError,
+    const std::wstring& jsonFallbackPath
 ) {
     std::unordered_map<std::string, std::string> dict;
-    if (!LoadDictionary(jsonDictPath, dict)) {
+    if (!LoadDictionary(jsonDictPath, dict, jsonFallbackPath)) {
         outError = L"无法加载 FGD 翻译字典: " + jsonDictPath;
         return false;
     }
@@ -840,6 +884,11 @@ bool FgdTranslator::EnsureFgdDictionaryExists(const std::wstring& jsonPath, cons
         LoadDictionary(fallbackCachePath, loaded);
     }
 
+    if (p.has_parent_path()) {
+        std::error_code ec;
+        fs::create_directories(p.parent_path(), ec);
+    }
+
     std::ofstream out(jsonPath, std::ios::binary);
     if (!out.is_open()) {
         outNotice = L"无法创建 FGD 翻译字典文件: " + jsonPath;
@@ -894,7 +943,7 @@ bool FgdTranslator::EnsureFgdDictionaryExists(const std::wstring& jsonPath, cons
     out << "}\n";
     out.close();
 
-    outNotice = L"已自动生成 fgd_translations.json 模板字典（包含详细使用说明与格式示例）。";
+    outNotice = L"已自动生成 fgd_translations.jsonc 模板字典（包含详细使用说明与格式示例）。";
     return true;
 }
 
@@ -909,6 +958,11 @@ bool FgdTranslator::EnsureFgdOverrideDictionaryExists(const std::wstring& jsonPa
         LoadOverrideDictionary(fallbackCachePath, loaded);
     }
 
+    if (p.has_parent_path()) {
+        std::error_code ec;
+        fs::create_directories(p.parent_path(), ec);
+    }
+
     std::ofstream out(jsonPath, std::ios::binary);
     if (!out.is_open()) {
         outNotice = L"无法创建 FGD 覆盖字典文件: " + jsonPath;
@@ -917,15 +971,15 @@ bool FgdTranslator::EnsureFgdOverrideDictionaryExists(const std::wstring& jsonPa
 
     out << "{\n";
     out << "  // ==============================================================================\n";
-    out << "  // CS2 FGD 实体键值描述补充与覆盖字典 (jsonc 格式)\n";
+    out << "  // CS2 FGD 实体键值描述补充与覆盖字典 (JSONC 格式)\n";
     out << "  // ==============================================================================\n";
     out << "  //\n";
     out << "  // 【作用说明】\n";
     out << "  // - 本文件用于针对 FGD 中特定的【属性名 (Key)】、【实体类名 (Class)】或【输入输出 (I/O)】\n";
     out << "  //   补充缺失的说明描述，或覆盖原版已有描述。\n";
-    out << "  // - 与 fgd_translations.json 互为补充：\n";
-    out << "  //   * fgd_translations.json: 负责已有英文字符串 -> 中文翻译。\n";
-    out << "  //   * fgd_override.json: 负责针对特定键名无描述时【自动新增描述】或【强制覆盖描述】。\n";
+    out << "  // - 与 fgd_translations.jsonc 互为补充：\n";
+    out << "  //   * fgd_translations.jsonc: 负责已有英文字符串 -> 中文翻译。\n";
+    out << "  //   * fgd_override.jsonc: 负责针对特定键名无描述时【自动新增描述】或【强制覆盖描述】。\n";
     out << "  //\n";
     out << "  // 【支持格式】\n";
     out << "  // 1. 全局属性描述补充 (properties): \"属性键名\": \"描述文本\" 或 \"属性键名\": { \"description\": \"...\", \"displayName\": \"...\" }\n";
@@ -950,6 +1004,7 @@ bool FgdTranslator::EnsureFgdOverrideDictionaryExists(const std::wstring& jsonPa
     out << "  },\n\n";
 
     out << "  \"io\": {\n";
+    out << "    \"SetParent\": \"设置该实体的父级对象。\",\n";
     out << "    \"ClearParent\": \"解除与父级实体的挂载绑定关系，使其独立运动。\",\n";
     out << "    \"FollowEntity\": \"骨骼合并 (Bone Merge) 附加到目标实体。\",\n";
     out << "    \"Kill\": \"从世界中移除此实体并释放资源。\",\n";
@@ -969,7 +1024,7 @@ bool FgdTranslator::EnsureFgdOverrideDictionaryExists(const std::wstring& jsonPa
     out << "}\n";
     out.close();
 
-    outNotice = L"已自动生成 fgd_override.json 模板字典（包含详细使用说明与格式示例）。";
+    outNotice = L"已自动生成 fgd_override.jsonc 模板字典（包含详细使用说明与格式示例）。";
     return true;
 }
 
@@ -982,6 +1037,11 @@ bool FgdTranslator::EnsureQtDictionaryExists(const std::wstring& jsonPath, const
     std::unordered_map<std::string, std::string> loaded;
     if (!fallbackCachePath.empty() && fs::exists(fallbackCachePath)) {
         LoadDictionary(fallbackCachePath, loaded);
+    }
+
+    if (p.has_parent_path()) {
+        std::error_code ec;
+        fs::create_directories(p.parent_path(), ec);
     }
 
     std::ofstream out(jsonPath, std::ios::binary);
@@ -1047,6 +1107,6 @@ bool FgdTranslator::EnsureQtDictionaryExists(const std::wstring& jsonPath, const
     out << "}\n";
     out.close();
 
-    outNotice = L"已自动生成 qt_translations.json 模板字典（包含详细使用说明与格式示例）。";
+    outNotice = L"已自动生成 qt_translations.jsonc 模板字典（包含详细使用说明与格式示例）。";
     return true;
 }

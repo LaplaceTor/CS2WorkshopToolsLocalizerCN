@@ -510,12 +510,10 @@ bool BackupManager::RestoreAll(const std::wstring& cs2Root, const std::wstring& 
         // 2. 清理临时部署的注入文件 (带重试机制)
         fs::path win64Bin = cs2Path / L"game" / L"bin" / L"win64";
         fs::path tempQmDll = win64Bin / L"qtcore_qm.dll";
-        fs::path tempJson = win64Bin / L"qt_translations.json";
-        fs::path tempOldJson = win64Bin / L"translations" / L"hammer.json";
+        fs::path tempJsonc = win64Bin / L"qt_translations.jsonc";
 
         SafeRemoveFileWithRetry(tempQmDll, 15, 100);
-        SafeRemoveFileWithRetry(tempJson, 15, 100);
-        SafeRemoveFileWithRetry(tempOldJson, 15, 100);
+        SafeRemoveFileWithRetry(tempJsonc, 15, 100);
 
         return true;
     } catch (const std::exception& e) {
@@ -528,8 +526,8 @@ bool BackupManager::IsPatchDeployed(const std::wstring& cs2Root) {
     try {
         fs::path win64Bin = fs::path(cs2Root) / L"game" / L"bin" / L"win64";
         fs::path qmDll = win64Bin / L"qtcore_qm.dll";
-        fs::path qtJson = win64Bin / L"qt_translations.json";
-        return fs::exists(qmDll) || fs::exists(qtJson);
+        fs::path qtJsonc = win64Bin / L"qt_translations.jsonc";
+        return fs::exists(qmDll) || fs::exists(qtJsonc);
     } catch (...) {
         return false;
     }

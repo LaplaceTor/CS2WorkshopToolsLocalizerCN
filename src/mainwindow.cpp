@@ -36,15 +36,37 @@
 #include <QUrl>
 #include <QFile>
 #include <QSaveFile>
-
+#include <QCheckBox>
 #include <memory>
 #include <filesystem>
 
 namespace fs = std::filesystem;
 
+static fs::path resolveJsonPath(const std::wstring& workingDir, const std::wstring& filename) {
+    fs::path workPath(workingDir);
+    fs::path inputPath(filename);
+    std::wstring baseStem = inputPath.stem().wstring();
+    std::wstring targetName = baseStem + L".jsonc";
+
+    std::vector<fs::path> baseDirs = {
+        workPath / L"translations",
+        workPath,
+        fs::current_path() / L"translations",
+        fs::current_path()
+    };
+
+    for (const auto& dir : baseDirs) {
+        fs::path p = dir / targetName;
+        if (fs::exists(p)) return p;
+    }
+
+    return workPath / L"translations" / targetName;
+}
+
 MainWindow::MainWindow(const std::wstring& cs2Root, QWidget *parent)
     : QMainWindow(parent)
     , m_cs2Root(cs2Root)
+    , m_useMachineTransCheck(nullptr)
     , m_networkManager(new QNetworkAccessManager(this))
     , m_hammerProcess(new QProcess(this))
     , m_monitorTimer(new QTimer(this))
@@ -101,6 +123,15 @@ MainWindow::MainWindow(const std::wstring& cs2Root, QWidget *parent)
         &MainWindow::saveSettings
     );
 
+    if (m_useMachineTransCheck) {
+        connect(
+            m_useMachineTransCheck,
+            &QCheckBox::toggled,
+            this,
+            &MainWindow::saveSettings
+        );
+    }
+
     connect(
         m_hammerProcess,
         &QProcess::started,
@@ -151,14 +182,9 @@ MainWindow::MainWindow(const std::wstring& cs2Root, QWidget *parent)
     );
 
     // 检查并生成翻译字典文件
-    fs::path fgdPath =
-        fs::path(m_workingDir) / L"fgd_translations.json";
-
-    fs::path fgdOverridePath =
-        fs::path(m_workingDir) / L"fgd_override.json";
-
-    fs::path qtPath =
-        fs::path(m_workingDir) / L"qt_translations.json";
+    fs::path fgdPath = resolveJsonPath(m_workingDir, L"fgd_translations.jsonc");
+    fs::path fgdOverridePath = resolveJsonPath(m_workingDir, L"fgd_override.jsonc");
+    fs::path qtPath = resolveJsonPath(m_workingDir, L"qt_translations.jsonc");
 
     std::wstring notice;
 
@@ -217,8 +243,8 @@ void MainWindow::setupUi() {
         "CS2 Workshop Tools 汉化启动器 - CS2 Workshop Tools Localizer CN"
     );
 
-    resize(460, 420);
-    setMinimumSize(460, 420);
+    resize(480, 450);
+    setMinimumSize(480, 450);
 
     QWidget* centralWidget = new QWidget(this);
     setCentralWidget(centralWidget);
@@ -317,6 +343,24 @@ void MainWindow::setupUi() {
         m_argsEdit,
         1,
         1
+    );
+
+    m_useMachineTransCheck =
+        new QCheckBox("使用机翻", configGroup);
+
+    m_useMachineTransCheck->setChecked(true);
+
+    m_useMachineTransCheck->setToolTip(
+        "勾选后将自动引入 fgd_fallback.jsonc 与 qt_fallback.jsonc 作为兜底词典。\n"
+        "未人工精翻的词条将自动显示机翻结果，已精翻词条保持最高优先级覆盖。"
+    );
+
+    configLayout->addWidget(
+        m_useMachineTransCheck,
+        2,
+        0,
+        1,
+        2
     );
 
     mainLayout->addWidget(configGroup);
@@ -624,6 +668,12 @@ void MainWindow::loadSettings() {
     // 恢复附加启动参数
     m_argsEdit->setText(savedArgs);
 
+    // 恢复使用机翻设置
+    bool savedUseMachineTrans = settings.value("Launcher/UseMachineTrans", true).toBool();
+    if (m_useMachineTransCheck) {
+        m_useMachineTransCheck->setChecked(savedUseMachineTrans);
+    }
+
     // 恢复选择的目标 Addon
     if (!savedAddon.isEmpty()) {
         int index =
@@ -688,6 +738,13 @@ void MainWindow::saveSettings() {
         "Launcher/LaunchArgs",
         m_argsEdit->text()
     );
+
+    if (m_useMachineTransCheck) {
+        settings.setValue(
+            "Launcher/UseMachineTrans",
+            m_useMachineTransCheck->isChecked()
+        );
+    }
 
     settings.sync();
 }
@@ -862,17 +919,19 @@ bool MainWindow::injectLocalization() {
         L"bin" /
         L"win64";
 
-    fs::path fgdDictPath =
-        workPath / L"fgd_translations.json";
-
-    fs::path fgdOverridePath =
-        workPath / L"fgd_override.json";
-
-    fs::path qtDictPath =
-        workPath / L"qt_translations.json";
+    fs::path fgdDictPath = resolveJsonPath(m_workingDir, L"fgd_translations.jsonc");
+    fs::path fgdFallbackPath = resolveJsonPath(m_workingDir, L"fgd_fallback.jsonc");
+    fs::path fgdOverridePath = resolveJsonPath(m_workingDir, L"fgd_override.jsonc");
+    fs::path qtDictPath = resolveJsonPath(m_workingDir, L"qt_translations.jsonc");
+    fs::path qtFallbackPath = resolveJsonPath(m_workingDir, L"qt_fallback.jsonc");
 
     fs::path qmDllSrc =
         workPath / L"qtcore_qm.dll";
+    if (!fs::exists(qmDllSrc)) {
+        if (fs::exists(fs::current_path() / L"qtcore_qm.dll")) {
+            qmDllSrc = fs::current_path() / L"qtcore_qm.dll";
+        }
+    }
 
     std::wstring notice;
 
@@ -996,6 +1055,16 @@ bool MainWindow::injectLocalization() {
 
     std::vector<std::wstring> transFgd;
 
+    bool useMachineTrans = (m_useMachineTransCheck != nullptr) ? m_useMachineTransCheck->isChecked() : true;
+    if (useMachineTrans) {
+        appendLog(
+            "[*] 已启用机翻模式：自动加载 fgd_fallback.jsonc 与 qt_fallback.jsonc 作为兜底词典",
+            "#66d9ef"
+        );
+    }
+
+    std::wstring fgdFallbackParam = (useMachineTrans && fs::exists(fgdFallbackPath)) ? fgdFallbackPath.wstring() : L"";
+
     if (!FgdTranslator::TranslateAndDeployAll(
             m_cs2Root,
             backupDir.wstring(),
@@ -1003,7 +1072,8 @@ bool MainWindow::injectLocalization() {
             fgdDictPath.wstring(),
             fgdOverridePath.wstring(),
             transFgd,
-            err)) {
+            err,
+            fgdFallbackParam)) {
 
         appendLog(
             QString(
@@ -1044,21 +1114,21 @@ bool MainWindow::injectLocalization() {
 
     try {
         fs::path destQtJson =
-            cs2Bin / L"qt_translations.json";
+            cs2Bin / L"qt_translations.jsonc";
 
         fs::path destQmDll =
             cs2Bin / L"qtcore_qm.dll";
 
         if (!fs::exists(qtDictPath)) {
             appendLog(
-                "[-] 找不到 qt_translations.json",
+                "[-] 找不到 qt_translations.jsonc",
                 "#f92672"
             );
 
             QMessageBox::critical(
                 this,
                 "错误",
-                "找不到 qt_translations.json！"
+                "找不到 qt_translations.jsonc！"
             );
 
             doRestore(false);
@@ -1082,45 +1152,31 @@ bool MainWindow::injectLocalization() {
         }
 
         fs::copy_file(
-            qtDictPath,
-            destQtJson,
-            fs::copy_options::overwrite_existing
-        );
-
-        fs::copy_file(
             qmDllSrc,
             destQmDll,
             fs::copy_options::overwrite_existing
         );
 
-        // 预编译纯 C 二进制字典 qt_translations.lcld
-        fs::path destQtLcld =
-            cs2Bin / L"qt_translations.lcld";
+        std::wstring qtFallbackParam = (useMachineTrans && fs::exists(qtFallbackPath)) ? qtFallbackPath.wstring() : L"";
 
-        std::wstring compileErr;
-
-        if (DictionaryCompiler::CompileJsonFileToLcld(
-                qtDictPath.wstring(),
-                destQtLcld.wstring(),
-                compileErr)) {
-
-            appendLog(
-                "[+] 成功编译并部署纯二进制字典 qt_translations.lcld (LCLD v1)",
-                "#a6e22e"
-            );
-
+        if (!qtFallbackParam.empty()) {
+            std::wstring mergeErr;
+            if (!DictionaryCompiler::MergeJsonFiles(
+                    qtDictPath.wstring(),
+                    qtFallbackParam,
+                    destQtJson.wstring(),
+                    mergeErr)) {
+                fs::copy_file(
+                    qtDictPath,
+                    destQtJson,
+                    fs::copy_options::overwrite_existing
+                );
+            }
         } else {
-
-            appendLog(
-                QString(
-                    "[!] 二进制字典编译提示: %1 (将回退至纯文本 JSON 模式)"
-                )
-                    .arg(
-                        QString::fromStdWString(
-                            compileErr
-                        )
-                    ),
-                "#fd971f"
+            fs::copy_file(
+                qtDictPath,
+                destQtJson,
+                fs::copy_options::overwrite_existing
             );
         }
 
@@ -1855,7 +1911,7 @@ void MainWindow::onUpdateTranslationsClicked() {
             this,
             "确认更新在线翻译",
             "是否从 GitHub 仓库获取并更新最新的汉化词典文件？\n\n"
-            "提示：此操作将使用在线最新词典覆盖本地的 qt_translations.json、fgd_translations.json 与 fgd_override.json。\n"
+            "提示：此操作将使用在线最新词典覆盖本地的 qt_translations.jsonc、fgd_translations.jsonc 与 fgd_override.jsonc。\n"
             "若您之前手动自定义过本地词典，请注意备份。",
             QMessageBox::Yes |
             QMessageBox::No,
@@ -1878,46 +1934,28 @@ void MainWindow::onUpdateTranslationsClicked() {
     );
 
     QStringList qtUrls = {
-        "https://raw.githubusercontent.com/LaplaceTor/CS2WorkshopToolsLocalizerCN/main/qt_translations.json",
-        "https://cdn.jsdelivr.net/gh/LaplaceTor/CS2WorkshopToolsLocalizerCN@main/qt_translations.json",
-        "https://raw.githubusercontent.com/LaplaceTor/CS2WorkshopToolsLocalizerCN/master/qt_translations.json",
-        "https://cdn.jsdelivr.net/gh/LaplaceTor/CS2WorkshopToolsLocalizerCN@master/qt_translations.json",
-        "https://raw.githubusercontent.com/LaplaceTor/CS2HammerTranslateCN/main/qt_translations.json",
-        "https://cdn.jsdelivr.net/gh/LaplaceTor/CS2HammerTranslateCN@main/qt_translations.json"
+        "https://raw.githubusercontent.com/LaplaceTor/CS2WorkshopToolsLocalizerCN/main/translations/qt_translations.jsonc",
+        "https://cdn.jsdelivr.net/gh/LaplaceTor/CS2WorkshopToolsLocalizerCN@main/translations/qt_translations.jsonc",
     };
 
     QStringList fgdUrls = {
-        "https://raw.githubusercontent.com/LaplaceTor/CS2WorkshopToolsLocalizerCN/main/fgd_translations.json",
-        "https://cdn.jsdelivr.net/gh/LaplaceTor/CS2WorkshopToolsLocalizerCN@main/fgd_translations.json",
-        "https://raw.githubusercontent.com/LaplaceTor/CS2WorkshopToolsLocalizerCN/master/fgd_translations.json",
-        "https://cdn.jsdelivr.net/gh/LaplaceTor/CS2WorkshopToolsLocalizerCN@master/fgd_translations.json",
-        "https://raw.githubusercontent.com/LaplaceTor/CS2HammerTranslateCN/main/fgd_translations.json",
-        "https://cdn.jsdelivr.net/gh/LaplaceTor/CS2HammerTranslateCN@main/fgd_translations.json"
+        "https://raw.githubusercontent.com/LaplaceTor/CS2WorkshopToolsLocalizerCN/main/translations/fgd_translations.jsonc",
+        "https://cdn.jsdelivr.net/gh/LaplaceTor/CS2WorkshopToolsLocalizerCN@main/translations/fgd_translations.jsonc",
     };
 
     QStringList overrideUrls = {
-        "https://raw.githubusercontent.com/LaplaceTor/CS2WorkshopToolsLocalizerCN/main/fgd_override.json",
-        "https://cdn.jsdelivr.net/gh/LaplaceTor/CS2WorkshopToolsLocalizerCN@main/fgd_override.json",
-        "https://raw.githubusercontent.com/LaplaceTor/CS2WorkshopToolsLocalizerCN/master/fgd_override.json",
-        "https://cdn.jsdelivr.net/gh/LaplaceTor/CS2WorkshopToolsLocalizerCN@master/fgd_override.json",
-        "https://raw.githubusercontent.com/LaplaceTor/CS2HammerTranslateCN/main/fgd_override.json",
-        "https://cdn.jsdelivr.net/gh/LaplaceTor/CS2HammerTranslateCN@main/fgd_override.json"
+        "https://raw.githubusercontent.com/LaplaceTor/CS2WorkshopToolsLocalizerCN/main/translations/fgd_override.jsonc",
+        "https://cdn.jsdelivr.net/gh/LaplaceTor/CS2WorkshopToolsLocalizerCN@main/translations/fgd_override.jsonc",
     };
 
     auto stripJsonc =
         [](const QByteArray& input) -> QByteArray {
 
         QByteArray output;
+        output.reserve(input.size());
 
-        output.reserve(
-            input.size()
-        );
-
-        const char* p =
-            input.constData();
-
-        const char* end =
-            p + input.size();
+        const char* p = input.constData();
+        const char* end = p + input.size();
 
         while (p < end) {
 
@@ -1925,73 +1963,58 @@ void MainWindow::onUpdateTranslationsClicked() {
 
                 output.append(*p++);
 
-                while (p < end) {
+                while (p < end && *p != '"') {
 
-                    char c =
-                        *p++;
-
-                    output.append(c);
-
-                    if (c == '"') {
-                        break;
+                    if (*p == '\\' && p + 1 < end) {
+                        output.append(*p++);
                     }
 
-                    if (
-                        c == '\\' &&
-                        p < end
-                    ) {
-                        output.append(
-                            *p++
-                        );
-                    }
+                    output.append(*p++);
                 }
 
-            } else if (
+                if (p < end) {
+                    output.append(*p++);
+                }
+            }
+            else if (
                 *p == '/' &&
-                (p + 1 < end)
+                p + 1 < end &&
+                *(p + 1) == '/'
             ) {
 
-                if (*(p + 1) == '/') {
+                p += 2;
 
-                    p += 2;
+                while (
+                    p < end &&
+                    *p != '\n' &&
+                    *p != '\r'
+                ) {
+                    p++;
+                }
+            }
+            else if (
+                *p == '/' &&
+                p + 1 < end &&
+                *(p + 1) == '*'
+            ) {
 
-                    while (
-                        p < end &&
-                        *p != '\n' &&
-                        *p != '\r'
-                    ) {
-                        p++;
-                    }
+                p += 2;
 
-                } else if (*(p + 1) == '*') {
-
-                    p += 2;
-
-                    while (
-                        p + 1 < end &&
-                        !(
-                            *p == '*' &&
-                            *(p + 1) == '/'
-                        )
-                    ) {
-                        p++;
-                    }
-
-                    if (p + 1 < end) {
-                        p += 2;
-                    } else {
-                        p = end;
-                    }
-
-                } else {
-
-                    output.append(
-                        *p++
-                    );
+                while (
+                    p + 1 < end &&
+                    !(
+                        *p == '*' &&
+                        *(p + 1) == '/'
+                    )
+                ) {
+                    p++;
                 }
 
-            } else {
-
+                if (p + 1 < end) {
+                    p += 2;
+                }
+            }
+            else {
                 output.append(
                     *p++
                 );
@@ -2001,9 +2024,9 @@ void MainWindow::onUpdateTranslationsClicked() {
         return output;
     };
 
-    // 1. Fetch qt_translations.json
+    // 1. Fetch qt_translations.jsonc
     appendLog(
-        "[1/3] 正在获取 qt_translations.json (界面词典)...",
+        "[1/3] 正在获取 qt_translations.jsonc (界面词典)...",
         "#e6db74"
     );
 
@@ -2023,14 +2046,14 @@ void MainWindow::onUpdateTranslationsClicked() {
         if (!qtOk) {
 
             appendLog(
-                "[-] 获取 qt_translations.json 失败：所有节点连接超时或不可达，请检查网络或代理设置。",
+                "[-] 获取 qt_translations.jsonc 失败：所有节点连接超时或不可达，请检查网络或代理设置。",
                 "#f92672"
             );
 
             QMessageBox::critical(
                 this,
                 "更新失败",
-                "获取 qt_translations.json 失败！\n"
+                "获取 qt_translations.jsonc 失败！\n"
                 "无法连接到 GitHub 仓库，请检查您的网络连接或代理设置。"
             );
 
@@ -2060,7 +2083,7 @@ void MainWindow::onUpdateTranslationsClicked() {
 
             appendLog(
                 QString(
-                    "[-] 解析 qt_translations.json 失败: %1"
+                    "[-] 解析 qt_translations.jsonc 失败: %1"
                 )
                     .arg(
                         qtParseErr.errorString()
@@ -2071,7 +2094,7 @@ void MainWindow::onUpdateTranslationsClicked() {
             QMessageBox::critical(
                 this,
                 "更新失败",
-                "下载的 qt_translations.json 格式异常或内容为空，已放弃更新。"
+                "下载的 qt_translations.jsonc 格式异常或内容为空，已放弃更新。"
             );
 
             setUiBusy(false);
@@ -2088,15 +2111,15 @@ void MainWindow::onUpdateTranslationsClicked() {
 
         appendLog(
             QString(
-                "[+] qt_translations.json 获取成功，有效词条: %1 条"
+                "[+] qt_translations.jsonc 获取成功，有效词条: %1 条"
             )
                 .arg(qtCount),
             "#a6e22e"
         );
 
-        // 2. Fetch fgd_translations.json
+        // 2. Fetch fgd_translations.jsonc
         appendLog(
-            "[2/3] 正在获取 fgd_translations.json (实体定义词典)...",
+            "[2/3] 正在获取 fgd_translations.jsonc (实体定义词典)...",
             "#e6db74"
         );
 
@@ -2117,14 +2140,14 @@ void MainWindow::onUpdateTranslationsClicked() {
             if (!fgdOk) {
 
                 appendLog(
-                    "[-] 获取 fgd_translations.json 失败：所有节点连接超时或不可达，请检查网络设置。",
+                    "[-] 获取 fgd_translations.jsonc 失败：所有节点连接超时或不可达，请检查网络设置。",
                     "#f92672"
                 );
 
                 QMessageBox::critical(
                     this,
                     "更新失败",
-                    "获取 fgd_translations.json 失败！\n"
+                    "获取 fgd_translations.jsonc 失败！\n"
                     "无法连接到 GitHub 仓库，请检查网络连接。"
                 );
 
@@ -2154,7 +2177,7 @@ void MainWindow::onUpdateTranslationsClicked() {
 
                 appendLog(
                     QString(
-                        "[-] 解析 fgd_translations.json 失败: %1"
+                        "[-] 解析 fgd_translations.jsonc 失败: %1"
                     )
                         .arg(
                             fgdParseErr.errorString()
@@ -2165,7 +2188,7 @@ void MainWindow::onUpdateTranslationsClicked() {
                 QMessageBox::critical(
                     this,
                     "更新失败",
-                    "下载的 fgd_translations.json 格式异常或内容为空，已放弃更新。"
+                    "下载的 fgd_translations.jsonc 格式异常或内容为空，已放弃更新。"
                 );
 
                 setUiBusy(false);
@@ -2182,15 +2205,15 @@ void MainWindow::onUpdateTranslationsClicked() {
 
             appendLog(
                 QString(
-                    "[+] fgd_translations.json 获取成功，有效词条: %1 条"
+                    "[+] fgd_translations.jsonc 获取成功，有效词条: %1 条"
                 )
                     .arg(fgdCount),
                 "#a6e22e"
             );
 
-            // 3. Fetch fgd_override.json
+            // 3. Fetch fgd_override.jsonc
             appendLog(
-                "[3/3] 正在获取 fgd_override.json (实体覆盖词典)...",
+                "[3/3] 正在获取 fgd_override.jsonc (实体覆盖词典)...",
                 "#e6db74"
             );
 
@@ -2212,14 +2235,14 @@ void MainWindow::onUpdateTranslationsClicked() {
                 if (!overrideOk) {
 
                     appendLog(
-                        "[-] 获取 fgd_override.json 失败：所有节点连接超时或不可达，请检查网络设置。",
+                        "[-] 获取 fgd_override.jsonc 失败：所有节点连接超时或不可达，请检查网络设置。",
                         "#f92672"
                     );
 
                     QMessageBox::critical(
                         this,
                         "更新失败",
-                        "获取 fgd_override.json 失败！\n"
+                        "获取 fgd_override.jsonc 失败！\n"
                         "无法连接到 GitHub 仓库，请检查网络设置。"
                     );
 
@@ -2249,7 +2272,7 @@ void MainWindow::onUpdateTranslationsClicked() {
 
                     appendLog(
                         QString(
-                            "[-] 解析 fgd_override.json 失败: %1"
+                            "[-] 解析 fgd_override.jsonc 失败: %1"
                         )
                             .arg(
                                 overrideParseErr.errorString()
@@ -2260,7 +2283,7 @@ void MainWindow::onUpdateTranslationsClicked() {
                     QMessageBox::critical(
                         this,
                         "更新失败",
-                        "下载的 fgd_override.json 格式异常或内容为空，已放弃更新。"
+                        "下载的 fgd_override.jsonc 格式异常或内容为空，已放弃更新。"
                     );
 
                     setUiBusy(false);
@@ -2333,7 +2356,7 @@ void MainWindow::onUpdateTranslationsClicked() {
 
                 appendLog(
                     QString(
-                        "[+] fgd_override.json 获取成功，有效规则: %1 条"
+                        "[+] fgd_override.jsonc 获取成功，有效规则: %1 条"
                     )
                         .arg(overrideCount),
                     "#a6e22e"
@@ -2354,132 +2377,84 @@ void MainWindow::onUpdateTranslationsClicked() {
                         );
 
                     QJsonParseError parseErr;
-
                     QJsonDocument doc =
                         QJsonDocument::fromJson(
-                            QByteArray::fromRawData(
-                                clean.c_str(),
-                                clean.size()
-                            ),
+                            QByteArray(clean.data(), static_cast<qsizetype>(clean.size())),
                             &parseErr
                         );
 
-                    if (
-                        parseErr.error !=
-                            QJsonParseError::NoError ||
-                        !doc.isObject()
-                    ) {
-
+                    if (parseErr.error != QJsonParseError::NoError || doc.isNull() || !doc.isObject()) {
                         appendLog(
-                            QString(
-                                "[-] %1 校验失败: %2"
-                            )
-                                .arg(
-                                    name,
-                                    parseErr.errorString()
-                                ),
+                            QString("[-] 词典数据校验未通过，已放弃写入 %1: %2").arg(name, parseErr.errorString()),
                             "#f92672"
                         );
-
                         return false;
                     }
 
                     QSaveFile saveFile(localPath);
-
-                    if (!saveFile.open(
-                            QIODevice::WriteOnly
-                        )) {
-
+                    if (!saveFile.open(QIODevice::WriteOnly | QIODevice::Truncate)) {
                         appendLog(
-                            QString(
-                                "[-] 无法创建文件 %1: %2"
-                            )
-                                .arg(
-                                    name,
-                                    saveFile.errorString()
-                                ),
+                            QString("[-] 无法以安全原子模式打开文件 %1: %2").arg(localPath, saveFile.errorString()),
                             "#f92672"
                         );
-
                         return false;
                     }
 
-                    if (
-                        saveFile.write(data) !=
-                        data.size()
-                    ) {
-
+                    qint64 written = saveFile.write(data);
+                    if (written != data.size()) {
                         saveFile.cancelWriting();
-
                         appendLog(
-                            QString(
-                                "[-] 写入 %1 数据不完整"
-                            )
-                                .arg(name),
+                            QString("[-] 写入数据不完整 (%1): 预期 %2 字节，实际写入 %3 字节").arg(localPath).arg(data.size()).arg(written),
                             "#f92672"
                         );
-
                         return false;
                     }
 
                     if (!saveFile.commit()) {
-
                         appendLog(
-                            QString(
-                                "[-] 原子提交 %1 失败: %2"
-                            )
-                                .arg(
-                                    name,
-                                    saveFile.errorString()
-                                ),
+                            QString("[-] 提交安全写入失败 (%1): %2").arg(localPath, saveFile.errorString()),
                             "#f92672"
                         );
-
                         return false;
                     }
 
                     return true;
                 };
 
+                fs::path transDir = fs::path(m_workingDir) / L"translations";
+                std::error_code ec;
+                fs::create_directories(transDir, ec);
+
                 QString qtLocalPath =
                     QString::fromStdWString(
-                        (
-                            fs::path(m_workingDir) /
-                            L"qt_translations.json"
-                        ).wstring()
+                        (transDir / L"qt_translations.jsonc").wstring()
                     );
 
                 QString fgdLocalPath =
                     QString::fromStdWString(
-                        (
-                            fs::path(m_workingDir) /
-                            L"fgd_translations.json"
-                        ).wstring()
+                        (transDir / L"fgd_translations.jsonc").wstring()
                     );
 
                 QString overrideLocalPath =
                     QString::fromStdWString(
-                        (
-                            fs::path(m_workingDir) /
-                            L"fgd_override.json"
-                        ).wstring()
+                        (transDir / L"fgd_override.jsonc").wstring()
                     );
 
                 if (
                     !atomicSave(
                         qtLocalPath,
                         qtData,
-                        "qt_translations.json"
+                        "qt_translations.jsonc"
                     ) ||
                     !atomicSave(
                         fgdLocalPath,
                         fgdData,
-                        "fgd_translations.json"
+                        "fgd_translations.jsonc"
                     ) ||
                     !atomicSave(
                         overrideLocalPath,
                         overrideData,
-                        "fgd_override.json"
+                        "fgd_override.jsonc"
                     )
                 ) {
 
@@ -2525,9 +2500,9 @@ void MainWindow::onUpdateTranslationsClicked() {
                     "更新成功",
                     QString(
                         "已成功从 GitHub 获取并更新最新汉化词典！\n\n"
-                        "- 界面词典 (qt_translations.json): %1 条\n"
-                        "- 实体词典 (fgd_translations.json): %2 条\n"
-                        "- 覆盖词典 (fgd_override.json): %3 条\n\n"
+                        "- 界面词典 (qt_translations.jsonc): %1 条\n"
+                        "- 实体词典 (fgd_translations.jsonc): %2 条\n"
+                        "- 覆盖词典 (fgd_override.jsonc): %3 条\n\n"
                         "当前可使用“仅注入”或“启动 HAMMER”应用最新汉化。"
                     )
                         .arg(qtCount)
@@ -2798,13 +2773,13 @@ void MainWindow::onHelpClicked() {
         "<h3>📚 CS2 Workshop Tools 汉化字典格式与编写指南</h3>"
 
         "<p>所有翻译字典均采用标准 "
-        "<b>UTF-8 JSON / JSONC</b> 键值对格式："
+        "<b>UTF-8 JSONC</b> 键值对格式："
         "<code>\"英文原词\": \"中文翻译\"</code></p>"
 
         "<hr/>"
 
         "<h4>1. 实体定义翻译字典 "
-        "(<code>fgd_translations.json</code>)</h4>"
+        "(<code>fgd_translations.jsonc</code>)</h4>"
 
         "<ul>"
 
@@ -2832,7 +2807,7 @@ void MainWindow::onHelpClicked() {
         "<hr/>"
 
         "<h4>2. 实体键值描述补充与覆盖字典 "
-        "(<code>fgd_override.json</code>)</h4>"
+        "(<code>fgd_override.jsonc</code>)</h4>"
 
         "<ul>"
 
@@ -2856,7 +2831,7 @@ void MainWindow::onHelpClicked() {
         "<hr/>"
 
         "<h4>3. 界面核心字典 "
-        "(<code>qt_translations.json</code>)</h4>"
+        "(<code>qt_translations.jsonc</code>)</h4>"
 
         "<ul>"
 
@@ -2882,7 +2857,7 @@ void MainWindow::onHelpClicked() {
         "<hr/>"
 
         "<p>💡 <b>修改即生效</b>："
-        "直接用文本编辑器编辑上述 JSON 文件并保存，"
+        "直接用文本编辑器编辑上述 JSONC 文件并保存，"
         "之后点击“仅注入”或“启动 HAMMER”即可应用最新汉化。</p>"
     );
 

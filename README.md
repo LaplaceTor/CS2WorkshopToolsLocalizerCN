@@ -28,26 +28,29 @@
 
 ## ✍️ 如何参与完善汉化？（只需修改三个文本文件）
 
-本项目的所有汉化词条与实体覆盖均保存在程序同目录下的三个 `.json` 文件中：
+本项目的所有汉化词条与实体覆盖均保存在 `translations/` 目录下的 `.jsonc` 文件中：
 
 ```text
 CS2WorkshopToolsLocalizerCN/
-├── qt_translations.json    # 1. 软件界面与菜单翻译字典 (支持模块子块与注释)
-├── fgd_translations.json   # 2. 地图实体与属性已有字符串翻译字典 (精确匹配替换)
-└── fgd_override.json       # 3. 地图实体键值描述补充与覆盖字典 (针对特定 Key 新增/覆盖说明)
+├── translations/
+│   ├── qt_translations.jsonc   # 1. 软件界面与菜单精翻字典 (支持模块子块与注释)
+│   ├── qt_fallback.jsonc       # 2. 软件界面机翻兜底字典 (勾选“使用机翻”时自动生效)
+│   ├── fgd_translations.jsonc  # 3. 地图实体与属性精翻字典 (精确匹配替换)
+│   ├── fgd_fallback.jsonc      # 4. 地图实体与属性机翻兜底字典 (勾选“使用机翻”时自动生效)
+│   └── fgd_override.jsonc      # 5. 地图实体键值描述补充与覆盖字典 (针对特定 Key 新增/覆盖说明)
 ```
 
 > **⚠️ 译者提醒**：
 > 1. 请尽量**不要**直接使用未经校对的 AI 翻译批量提交！地图工具中含有大量领域专有名词，需要人工结合上下文核对。
-> 2. 所有字典文件均采用标准 JSON / JSONC 格式，支持 `//` 单行注释与 `/* */` 块注释，方便对词条做批注说明。
+> 2. 所有字典文件均采用标准 JSONC 格式，支持 `//` 单行注释与 `/* */` 块注释，方便对词条做批注说明。
 
 **当前主译者正在完善HAMMER以及ASSET BROWSER，如有贡献想法，请自行规避**
 
 ---
 
-### 1️⃣ `qt_translations.json`（界面、菜单与工具栏多子块编写规范）
+### 1️⃣ `qt_translations.jsonc`（界面、菜单与工具栏多子块编写规范）
 
-`qt_translations.json` 采用了**单文件多子块（Sectioned）**结构。每个子块对应一个工具 DLL 的名称（不含 `.dll` 扩展名）：
+`qt_translations.jsonc` 采用了**单文件多子块（Sectioned）**结构。每个子块对应一个工具 DLL 的名称（不含 `.dll` 扩展名）：
 
 ```jsonc
 {
@@ -115,12 +118,12 @@ CS2WorkshopToolsLocalizerCN/
 
 ---
 
-### 2️⃣ `fgd_translations.json`（实体与属性说明）
+### 2️⃣ `fgd_translations.jsonc`（实体与属性说明）
 
 用于翻译地图中各类实体、灯光、物理属性、触发器、输入输出 (I/O) 的显示名称与悬停中文说明。
 
 - **常见可翻译内容示例**：
-  ```json
+  ```jsonc
   {
     "Omnidirectional point light": "全向点光源",
     "Light Source": "光源",
@@ -137,13 +140,13 @@ CS2WorkshopToolsLocalizerCN/
 
 ---
 
-### 3️⃣ `fgd_override.json`（实体键值描述补充与覆盖字典）
+### 3️⃣ `fgd_override.jsonc`（实体键值描述补充与覆盖字典）
 
 用于针对 Valve 原版 FGD 实体定义中**缺失悬停描述**或**需要个性化说明**的特定属性 (Key)、实体类 (Class) 或输入输出 (I/O) 进行描述补充与覆盖。
 
-- **与 `fgd_translations.json` 的区别**：
-  - `fgd_translations.json`：根据已有英文原文进行精确匹配翻译（无法给原版无描述的属性补充中文）。
-  - `fgd_override.json`：根据属性键名、类名或 I/O 名称直接**新增悬停描述**或**强制替换说明**。
+- **与 `fgd_translations.jsonc` 的区别**：
+  - `fgd_translations.jsonc`：根据已有英文原文进行精确匹配翻译（无法给原版无描述的属性补充中文）。
+  - `fgd_override.jsonc`：根据属性键名、类名或 I/O 名称直接**新增悬停描述**或**强制替换说明**。
 
 - **格式与配置示例**：
   ```jsonc
@@ -184,10 +187,10 @@ CS2WorkshopToolsLocalizerCN/
 
 ## 🔍 遇到修改汉化词条无效？如何获取完整原文字符串
 
-有时候在 `qt_translations.json` 中添加了某个单词的翻译，但进入 Hammer 后发现界面依然显示英文。  
+有时候在 `qt_translations.jsonc` 中添加了某个单词的翻译，但进入 Hammer 后发现界面依然显示英文。  
 这通常是因为该界面的英文文本**并不是一个孤立的单词**，而是包含在一段更长的完整字符串、格式化占位符、特殊前缀（如 `&` 快捷键前缀、`...` 省略号、`%s` 占位符等）中。
 
-本项目提供了辅助脚本 [`find_dll_strings.py`](./find_dll_strings.py)，用于直接从 CS2 的 DLL 库中扫描并提取匹配指定关键字或正则表达式的**完整原始字符串**。
+本项目提供了辅助脚本 [`find_dll_strings.py`](./scripts/find_dll_strings.py)，用于直接从 CS2 的 DLL 库中扫描并提取匹配指定关键字或正则表达式的**完整原始字符串**。
 
 ### 🛠️ 辅助脚本使用指南 (`find_dll_strings.py`)
 
@@ -235,10 +238,10 @@ CS2WorkshopToolsLocalizerCN/
 | `--open` | 搜索完成后自动使用记事本/默认文本编辑器打开结果文件 |
 
 #### 4. 填入词典生效
-在输出的 `.txt` 文本文件中找到对应的完整英文原文后，将完整的原文本复制并填入 `qt_translations.json` 对应模块的子块中即可成功汉化。
+在输出的 `.txt` 文本文件中找到对应的完整英文原文后，将完整的原文本复制并填入 `qt_translations.jsonc` 对应模块的子块中即可成功汉化。
 
 ---
 
 ### 💡 提交你的翻译与覆盖说明
 
-如果你翻译或修正了新的词条，欢迎将修改后的 `qt_translations.json`、`fgd_translations.json` 或 `fgd_override.json` 提交 Pull Request，或者在 Issues 中分享，共同完善 CS2 中文地图与模组制作生态！
+如果你翻译或修正了新的词条，欢迎将修改后的 `qt_translations.jsonc`、`fgd_translations.jsonc` 或 `fgd_override.jsonc` 提交 Pull Request，或者在 Issues 中分享，共同完善 CS2 中文地图与模组制作生态！
