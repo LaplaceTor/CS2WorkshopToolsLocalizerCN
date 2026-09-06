@@ -208,7 +208,8 @@ bool PePatcher::PatchQtCore(const std::wstring& srcDllPath, const std::wstring& 
             auto optEpOff = RvaToFileOffset(ntHeadersConst, origEntryPointRva, buffer.size(), 64);
             if (optEpOff) {
                 size_t epOff = *optEpOff;
-                for (size_t k = 0; k < 64; ++k) {
+                // k+5 <= 64 确保跳转位移字段 (0xe9 + 4 字节) 完整落在已读入的 64 字节窗口内
+                for (size_t k = 0; k + 5 <= 64 && epOff + k + 5 <= buffer.size(); ++k) {
                     if (buffer[epOff + k] == 0xe9) {
                         int32_t jmpDisp = *reinterpret_cast<const int32_t*>(&buffer[epOff + k + 1]);
                         int64_t targetRva64 = static_cast<int64_t>(origEntryPointRva) + k + 5 + jmpDisp;
@@ -662,18 +663,28 @@ bool PePatcher::PatchQtCore(const std::wstring& srcDllPath, const std::wstring& 
     // 13. 注意：.text 节严格保持原生 RX 属性 (IMAGE_SCN_MEM_EXECUTE | IMAGE_SCN_MEM_READ)，绝不赋予写权限！
     // 所有可变状态（initFlag, trHookedFlag, detourPtr）均已安全安置于 .data 节区中。
 
-    // 写入目标文件
-    std::ofstream outFile(dstDllPath, std::ios::binary);
-    if (!outFile.is_open()) {
-        outError = L"无法写入目标文件: " + dstDllPath;
-        return false;
+    // 写入目标文件：先写临时文件再整体替换，避免中断产生半写损坏
+    std::wstring tmpDllPath = dstDllPath + L".tmp";
+    {
+        std::ofstream outFile(tmpDllPath, std::ios::binary);
+        if (!outFile.is_open()) {
+            outError = L"无法写入临时文件: " + tmpDllPath;
+            return false;
+        }
+
+        if (!outFile.write(reinterpret_cast<const char*>(buffer.data()), buffer.size())) {
+            outError = L"写入目标文件数据失败";
+            outFile.close();
+            DeleteFileW(tmpDllPath.c_str());
+            return false;
+        }
     }
 
-    if (!outFile.write(reinterpret_cast<const char*>(buffer.data()), buffer.size())) {
-        outError = L"写入目标文件数据失败";
+    if (!MoveFileExW(tmpDllPath.c_str(), dstDllPath.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
+        outError = L"提交目标文件失败: " + dstDllPath;
+        DeleteFileW(tmpDllPath.c_str());
         return false;
     }
-    outFile.close();
 
     return true;
 }

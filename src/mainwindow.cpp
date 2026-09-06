@@ -37,6 +37,9 @@
 #include <QFile>
 #include <QSaveFile>
 #include <QCheckBox>
+#include <QtConcurrent>
+#include <QFutureWatcher>
+#include <QEventLoop>
 #include <memory>
 #include <filesystem>
 
@@ -753,6 +756,18 @@ void MainWindow::appendLog(
     const QString& msg,
     const QString& color
 ) {
+    if (QThread::currentThread() != this->thread()) {
+        // worker 线程调用：封送至 UI 线程执行（若窗口已销毁则自动丢弃）
+        QMetaObject::invokeMethod(
+            this,
+            [this, msg, color]() {
+                appendLog(msg, color);
+            },
+            Qt::QueuedConnection
+        );
+        return;
+    }
+
     QString timeStr =
         QDateTime::currentDateTime()
             .toString("HH:mm:ss");
@@ -769,6 +784,36 @@ void MainWindow::appendLog(
             );
 
     m_logEdit->append(formattedMsg);
+}
+
+bool MainWindow::runHeavyInWorker(const std::function<bool()>& task) {
+    if (m_workerBusy) {
+        appendLog(
+            "[-] 已有后台操作正在进行，已忽略并发请求",
+            "#f92672"
+        );
+        return false;
+    }
+
+    m_workerBusy = true;
+
+    // QtConcurrent + QFutureWatcher + QEventLoop：
+    // 任务在全局线程池执行，UI 线程事件循环保持响应，完成后再取回结果
+    QFutureWatcher<bool> watcher;
+    QEventLoop loop;
+    QObject::connect(
+        &watcher,
+        &QFutureWatcher<bool>::finished,
+        &loop,
+        &QEventLoop::quit
+    );
+
+    watcher.setFuture(QtConcurrent::run(task));
+    loop.exec();
+
+    m_workerBusy = false;
+
+    return watcher.future().result();
 }
 
 void MainWindow::setUiBusy(bool busy) {
@@ -808,17 +853,6 @@ bool MainWindow::isPatchDeployedAndValid() {
             m_workingDir
         );
 
-    // backup_manifest 必须匹配当前 CS2
-    auto validation =
-        BackupManager::BackupMatchesCurrentGame(
-            m_cs2Root,
-            backupDir.wstring()
-        );
-
-    if (validation.status != BackupMatchStatus::Matches) {
-        return false;
-    }
-
     /*
      * 正常状态：
      *
@@ -831,7 +865,51 @@ bool MainWindow::isPatchDeployedAndValid() {
      * 即使 session_state 被破坏，只要补丁文件仍存在，
      * 也继续认为当前目录处于注入状态。
      */
-    return sessionPatched || patchFilesPresent;
+    if (!sessionPatched && !patchFilesPresent) {
+        return false;
+    }
+
+    /*
+     * BackupMatchesCurrentGame 内含 4 次全文件 SHA256（cs2.exe / Qt5Core / 备份 Qt5Core），
+     * 属于重 IO：这里仅做轻量判断，重量级校验放后台异步执行并缓存结果（15 秒有效期），
+     * 校验完成后再刷新一次按钮状态。校验未到达期间沿用缓存值（初始为 false，保守视为未注入）。
+     */
+    qint64 nowMs = QDateTime::currentMSecsSinceEpoch();
+    if (!m_validationPending &&
+        (m_lastValidationMs == 0 || nowMs - m_lastValidationMs > 15000)) {
+
+        m_validationPending = true;
+
+        std::wstring cs2Root = m_cs2Root;
+        std::wstring workingDir = m_workingDir;
+
+        auto* watcher = new QFutureWatcher<bool>(this);
+        QObject::connect(
+            watcher,
+            &QFutureWatcher<bool>::finished,
+            this,
+            [this, watcher]() {
+                m_cachedValidationValid = watcher->result();
+                m_validationPending = false;
+                m_lastValidationMs = QDateTime::currentMSecsSinceEpoch();
+                watcher->deleteLater();
+
+                // 校验结果到达后刷新按钮状态
+                updateActionButtonState();
+            }
+        );
+
+        watcher->setFuture(
+            QtConcurrent::run([cs2Root, workingDir]() -> bool {
+                auto validation = BackupManager::BackupMatchesCurrentGame(
+                    cs2Root,
+                    (fs::path(workingDir) / L"backup").wstring());
+                return validation.status == BackupMatchStatus::Matches;
+            })
+        );
+    }
+
+    return (sessionPatched || patchFilesPresent) && m_cachedValidationValid;
 }
 
 void MainWindow::updateActionButtonState() {
@@ -905,6 +983,16 @@ void MainWindow::updateRestoreButtonState() {
 }
 
 bool MainWindow::injectLocalization() {
+    // 在 UI 线程读取控件状态，随后转入后台线程执行核心流程（核心流程禁止访问任何 UI 控件）
+    bool useMachineTrans =
+        (m_useMachineTransCheck != nullptr) ? m_useMachineTransCheck->isChecked() : true;
+
+    return runHeavyInWorker([this, useMachineTrans]() {
+        return injectLocalizationCore(useMachineTrans);
+    });
+}
+
+bool MainWindow::injectLocalizationCore(bool useMachineTrans) {
     fs::path workPath(m_workingDir);
 
     fs::path backupDir =
@@ -999,12 +1087,48 @@ bool MainWindow::injectLocalization() {
             "#fd971f"
         );
 
+        // 二次哈希确认：Steam 更新进行中时文件哈希会不稳定，
+        // 避免把半更新状态的游戏文件定格为"纯净原版备份"（此时运行于 worker 线程，可安全等待）
         appendLog(
-            "[*] 当前旧备份已失效，将重新建立当前版本原版备份...",
+            "[*] 疑似游戏更新，2 秒后进行二次哈希确认...",
             "#66d9ef"
         );
 
-        forceRecreate = true;
+        QThread::msleep(2000);
+
+        auto reconfirm =
+            BackupManager::BackupMatchesCurrentGame(
+                m_cs2Root,
+                backupDir.wstring()
+            );
+
+        if (reconfirm.status == BackupMatchStatus::Matches) {
+            appendLog(
+                "[+] 二次校验显示备份与当前版本一致（此前可能正处于 Steam 更新过程中），继续使用现有备份。",
+                "#a6e22e"
+            );
+        } else if (reconfirm.status == BackupMatchStatus::GameUpdated) {
+            appendLog(
+                "[*] 二次校验仍检测到版本变化，确认游戏已更新，旧备份已失效，将重新建立当前版本原版备份...",
+                "#66d9ef"
+            );
+
+            forceRecreate = true;
+        } else {
+            appendLog(
+                QString(
+                    "[-] 二次版本校验失败，已中止注入: %1"
+                )
+                    .arg(
+                        QString::fromStdWString(
+                            reconfirm.reason
+                        )
+                    ),
+                "#f92672"
+            );
+
+            return false;
+        }
     }
 
     std::vector<std::wstring> backedFgd;
@@ -1025,13 +1149,6 @@ bool MainWindow::injectLocalization() {
                     QString::fromStdWString(err)
                 ),
             "#f92672"
-        );
-
-        QMessageBox::critical(
-            this,
-            "错误",
-            "备份 CS2 原版文件失败，已中止注入！\n" +
-            QString::fromStdWString(err)
         );
 
         return false;
@@ -1055,7 +1172,6 @@ bool MainWindow::injectLocalization() {
 
     std::vector<std::wstring> transFgd;
 
-    bool useMachineTrans = (m_useMachineTransCheck != nullptr) ? m_useMachineTransCheck->isChecked() : true;
     if (useMachineTrans) {
         appendLog(
             "[*] 已启用机翻模式：自动加载 fgd_fallback.jsonc 与 qt_fallback.jsonc 作为兜底词典",
@@ -1083,13 +1199,6 @@ bool MainWindow::injectLocalization() {
                     QString::fromStdWString(err)
                 ),
             "#f92672"
-        );
-
-        QMessageBox::critical(
-            this,
-            "错误",
-            "汉化 FGD 文件失败，注入已中止！\n" +
-            QString::fromStdWString(err)
         );
 
         doRestore(false);
@@ -1125,12 +1234,6 @@ bool MainWindow::injectLocalization() {
                 "#f92672"
             );
 
-            QMessageBox::critical(
-                this,
-                "错误",
-                "找不到 qt_translations.jsonc！"
-            );
-
             doRestore(false);
             return false;
         }
@@ -1141,43 +1244,43 @@ bool MainWindow::injectLocalization() {
                 "#f92672"
             );
 
-            QMessageBox::critical(
-                this,
-                "错误",
-                "找不到 qtcore_qm.dll！"
+            doRestore(false);
+            return false;
+        }
+
+        if (!BackupManager::SafeCopyFileWithRetry(qmDllSrc, destQmDll)) {
+            appendLog(
+                "[-] 部署 qtcore_qm.dll 失败 (目标被占用或无写权限)",
+                "#f92672"
             );
 
             doRestore(false);
             return false;
         }
 
-        fs::copy_file(
-            qmDllSrc,
-            destQmDll,
-            fs::copy_options::overwrite_existing
-        );
-
         std::wstring qtFallbackParam = (useMachineTrans && fs::exists(qtFallbackPath)) ? qtFallbackPath.wstring() : L"";
 
+        // 优先合并主词典与机翻兜底词典；合并失败或未启用机翻时直接部署主词典
+        bool qtJsonMerged = false;
         if (!qtFallbackParam.empty()) {
             std::wstring mergeErr;
-            if (!DictionaryCompiler::MergeJsonFiles(
+            qtJsonMerged = DictionaryCompiler::MergeJsonFiles(
                     qtDictPath.wstring(),
                     qtFallbackParam,
                     destQtJson.wstring(),
-                    mergeErr)) {
-                fs::copy_file(
-                    qtDictPath,
-                    destQtJson,
-                    fs::copy_options::overwrite_existing
+                    mergeErr);
+        }
+
+        if (!qtJsonMerged) {
+            if (!BackupManager::SafeCopyFileWithRetry(qtDictPath, destQtJson)) {
+                appendLog(
+                    "[-] 部署 qt_translations.jsonc 失败 (目标被占用或无写权限)",
+                    "#f92672"
                 );
+
+                doRestore(false);
+                return false;
             }
-        } else {
-            fs::copy_file(
-                qtDictPath,
-                destQtJson,
-                fs::copy_options::overwrite_existing
-            );
         }
 
         // 修补 Qt5Core.dll
@@ -1206,13 +1309,6 @@ bool MainWindow::injectLocalization() {
                 "#f92672"
             );
 
-            QMessageBox::critical(
-                this,
-                "错误",
-                "修补 Qt5Core.dll 失败！\n" +
-                QString::fromStdWString(err)
-            );
-
             doRestore(false);
             return false;
         }
@@ -1232,15 +1328,6 @@ bool MainWindow::injectLocalization() {
             "#f92672"
         );
 
-        QMessageBox::critical(
-            this,
-            "错误",
-            QString(
-                "部署补丁异常: %1"
-            )
-                .arg(e.what())
-        );
-
         doRestore(false);
         return false;
     }
@@ -1251,21 +1338,20 @@ bool MainWindow::injectLocalization() {
      * 这样即使用户之后直接关闭启动器，
      * 下次启动依然可以知道当前目录没有被还原。
      */
-    BackupManager::SaveSessionState(
-        m_workingDir,
-        true
-    );
+    if (!BackupManager::SaveSessionState(
+            m_workingDir,
+            true
+        )) {
+        appendLog(
+            "[-] 会话状态写入失败 (session_state.json)，异常退出后的自动恢复可能失效",
+            "#f92672"
+        );
+    }
 
     appendLog(
         "[SUCCESS] 汉化补丁注入完成，当前处于“已注入”状态。",
         "#a6e22e"
     );
-
-    m_statusLabel->setText(
-        "状态: 已注入，等待启动 HAMMER"
-    );
-
-    updateActionButtonState();
 
     return true;
 }
@@ -1276,6 +1362,15 @@ void MainWindow::onInjectClicked() {
             this,
             "警告",
             "Hammer 正在运行中，不能进行注入！"
+        );
+        return;
+    }
+
+    if (m_workerBusy) {
+        QMessageBox::information(
+            this,
+            "提示",
+            "后台操作正在进行中，请稍候再试。"
         );
         return;
     }
@@ -1326,6 +1421,10 @@ void MainWindow::onInjectClicked() {
     setUiBusy(false);
 
     if (ok) {
+        m_statusLabel->setText(
+            "状态: 已注入，等待启动 HAMMER"
+        );
+
         QMessageBox::information(
             this,
             "注入成功",
@@ -1336,6 +1435,12 @@ void MainWindow::onInjectClicked() {
     } else {
         m_statusLabel->setText(
             "状态: 注入失败"
+        );
+
+        QMessageBox::critical(
+            this,
+            "错误",
+            "汉化补丁注入失败，已自动回滚，请查看执行日志了解详细原因。"
         );
     }
 
@@ -1428,10 +1533,15 @@ bool MainWindow::startHammerProcess() {
     );
 
     // 保持 session_state 为已注入
-    BackupManager::SaveSessionState(
-        m_workingDir,
-        true
-    );
+    if (!BackupManager::SaveSessionState(
+            m_workingDir,
+            true
+        )) {
+        appendLog(
+            "[-] 会话状态写入失败 (session_state.json)，异常退出后的自动恢复可能失效",
+            "#f92672"
+        );
+    }
 
     m_isHammerRunning = true;
     m_notRunningCount = 0;
@@ -1462,6 +1572,16 @@ void MainWindow::onLaunchClicked() {
             this,
             "提示",
             "Hammer 已经在运行中，请勿重复启动！"
+        );
+
+        return;
+    }
+
+    if (m_workerBusy) {
+        QMessageBox::information(
+            this,
+            "提示",
+            "后台操作正在进行中，请稍候再试。"
         );
 
         return;
@@ -1674,12 +1794,21 @@ void MainWindow::handleHammerProcessTerminated() {
     );
 
     bool restoreOk =
-        doRestore(true);
+        runHeavyInWorker(
+            [this]() {
+                return doRestore(true);
+            }
+        );
 
     if (restoreOk) {
-        BackupManager::ClearSessionState(
-            m_workingDir
-        );
+        if (!BackupManager::ClearSessionState(
+                m_workingDir
+            )) {
+            appendLog(
+                "[-] 清除会话状态失败 (session_state.json)，下次启动可能重复执行自动恢复",
+                "#f92672"
+            );
+        }
 
         m_statusLabel->setText(
             "状态: 就绪（未注入）"
@@ -1717,10 +1846,17 @@ void MainWindow::handleHammerProcessTerminated() {
 void MainWindow::onHammerError(
     QProcess::ProcessError error
 ) {
-    if (!m_isHammerRunning) {
+    if (error == QProcess::FailedToStart) {
+        // startHammerProcess 在 start() 前已置 m_isHammerRunning = true，
+        // 而 FailedToStart 只触发 errorOccurred、不触发 finished，
+        // 必须在此立即回滚，否则只能依赖 1 秒轮询兜底
+        m_isHammerRunning = false;
+        m_monitorTimer->stop();
+        m_hammerPid = 0;
+
         appendLog(
             QString(
-                "[-] 启动 Hammer 进程出错 (错误码: %1)"
+                "[-] 无法启动 Hammer 进程 (cs2.exe)，错误码: %1"
             )
                 .arg(error),
             "#f92672"
@@ -1733,22 +1869,38 @@ void MainWindow::onHammerError(
         );
 
         bool restored =
-            doRestore(true);
+            runHeavyInWorker(
+                [this]() {
+                    return doRestore(true);
+                }
+            );
 
         if (restored) {
-            BackupManager::ClearSessionState(
-                m_workingDir
-            );
+            if (!BackupManager::ClearSessionState(
+                    m_workingDir
+                )) {
+                appendLog(
+                    "[-] 清除会话状态失败 (session_state.json)，下次启动可能重复执行自动恢复",
+                    "#f92672"
+                );
+            }
         }
 
         setUiBusy(false);
+
+        m_launchBtn->setText(
+            "启动 HAMMER"
+        );
 
         m_statusLabel->setText(
             "状态: 启动出错"
         );
 
         updateActionButtonState();
+        return;
     }
+
+    // 其他错误 (Crashed / TimedError 等)：交由 finished / 监控定时器路径统一处理，避免双重恢复
 }
 
 bool MainWindow::doRestore(bool showLog) {
@@ -2550,55 +2702,6 @@ void MainWindow::onRestoreClicked() {
         return;
     }
 
-    fs::path backupDir =
-        fs::path(m_workingDir) / L"backup";
-
-    auto val =
-        BackupManager::BackupMatchesCurrentGame(
-            m_cs2Root,
-            backupDir.wstring()
-        );
-
-    if (val.status ==
-        BackupMatchStatus::GameUpdated) {
-
-        QMessageBox::warning(
-            this,
-            "拒绝恢复旧版备份",
-            "检测到 CS2 游戏已经更新，备份版本与当前游戏不一致！\n\n" +
-            QString::fromStdWString(
-                val.reason
-            ) +
-            "\n\n"
-            "为防止旧版本文件覆盖破坏新版 CS2，已拒绝还原。\n"
-            "请先处理当前游戏版本，再重新建立对应版本的备份。"
-        );
-
-        updateActionButtonState();
-        return;
-    }
-
-    if (
-        val.status != BackupMatchStatus::Matches
-    ) {
-
-        QMessageBox::warning(
-            this,
-            "无法还原",
-            QString(
-                "当前备份状态不允许安全还原。\n\n%1"
-            )
-                .arg(
-                    QString::fromStdWString(
-                        val.reason
-                    )
-                )
-        );
-
-        updateActionButtonState();
-        return;
-    }
-
     int ret =
         QMessageBox::question(
             this,
@@ -2620,14 +2723,75 @@ void MainWindow::onRestoreClicked() {
         "状态: 正在还原原版文件..."
     );
 
+    // 版本校验（含多次全文件 SHA256）与还原一并放入后台线程，避免 UI 冻结；
+    // 校验被拒绝时通过 rejectReason/rejected 回传具体原因
+    QString rejectReason;
+    bool rejected = false;
     bool restoreOk =
-        doRestore(true);
+        runHeavyInWorker(
+            [this, &rejectReason, &rejected]() -> bool {
+                auto val =
+                    BackupManager::BackupMatchesCurrentGame(
+                        m_cs2Root,
+                        (fs::path(m_workingDir) / L"backup").wstring()
+                    );
+
+                if (val.status != BackupMatchStatus::Matches) {
+                    rejectReason = QString::fromStdWString(val.reason);
+                    rejected = (val.status == BackupMatchStatus::GameUpdated);
+                    return false;
+                }
+
+                return doRestore(true);
+            }
+        );
+
+    if (!restoreOk && rejected) {
+        m_statusLabel->setText(
+            "状态: 还原被拒绝"
+        );
+
+        QMessageBox::warning(
+            this,
+            "拒绝恢复旧版备份",
+            "检测到 CS2 游戏已经更新，备份版本与当前游戏不一致！\n\n" +
+            rejectReason +
+            "\n\n"
+            "为防止旧版本文件覆盖破坏新版 CS2，已拒绝还原。\n"
+            "请先处理当前游戏版本，再重新建立对应版本的备份。"
+        );
+
+        updateActionButtonState();
+        setUiBusy(false);
+        return;
+    }
+
+    if (!restoreOk && !rejectReason.isEmpty()) {
+        // 备份状态不允许安全还原（无清单/读取失败等）
+        QMessageBox::warning(
+            this,
+            "无法还原",
+            QString(
+                "当前备份状态不允许安全还原。\n\n%1"
+            )
+                .arg(rejectReason)
+        );
+
+        updateActionButtonState();
+        setUiBusy(false);
+        return;
+    }
 
     if (restoreOk) {
 
-        BackupManager::ClearSessionState(
-            m_workingDir
-        );
+        if (!BackupManager::ClearSessionState(
+                m_workingDir
+            )) {
+            appendLog(
+                "[-] 清除会话状态失败 (session_state.json)，下次启动可能重复执行自动恢复",
+                "#f92672"
+            );
+        }
 
         m_statusLabel->setText(
             "状态: 就绪（未注入）"
@@ -2727,11 +2891,20 @@ void MainWindow::checkAndRecoverAbnormalExit() {
         "#66d9ef"
     );
 
-    if (doRestore(true)) {
+    if (runHeavyInWorker(
+            [this]() {
+                return doRestore(true);
+            }
+        )) {
 
-        BackupManager::ClearSessionState(
-            m_workingDir
-        );
+        if (!BackupManager::ClearSessionState(
+                m_workingDir
+            )) {
+            appendLog(
+                "[-] 清除会话状态失败 (session_state.json)，下次启动可能重复执行自动恢复",
+                "#f92672"
+            );
+        }
 
         appendLog(
             "[SUCCESS] 上次异常退出遗留的文件已成功还原为纯净原版备份！",
@@ -2879,6 +3052,19 @@ void MainWindow::closeEvent(
             "本启动器启动的 CS2 / Hammer 编辑器正在运行中！\n\n"
             "为防止 CS2 原版文件损坏或丢失，在运行期间严禁关闭本启动器。\n"
             "请先在 CS2 / Hammer 中正常退出，启动器将在退出后自动恢复原版文件并允许安全关闭。"
+        );
+
+        event->ignore();
+
+        return;
+    }
+
+    if (m_workerBusy) {
+        // 后台正在执行备份/还原/注入等 IO 操作，此时销毁窗口会导致任务中断
+        QMessageBox::warning(
+            this,
+            "请稍候",
+            "后台操作正在进行中，请等待其完成后再关闭启动器。"
         );
 
         event->ignore();
