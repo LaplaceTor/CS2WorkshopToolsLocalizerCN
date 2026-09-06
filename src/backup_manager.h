@@ -3,6 +3,7 @@
 #include <string>
 #include <vector>
 #include <cstdint>
+#include <filesystem>
 
 struct GameVersionSignature {
     std::string cs2ProductVersion;
@@ -63,17 +64,21 @@ public:
     // 检查工作目录下是否存在未正常结束的会话状态记录
     static bool HasUnrestoredSession(const std::wstring& workingDir);
 
-    // 保存运行会话状态 (isPatched = true 表示补丁已部署且未还原)
-    static void SaveSessionState(const std::wstring& workingDir, bool isPatched);
+    // 保存运行会话状态 (isPatched = true 表示补丁已部署且未还原)，写入失败返回 false
+    static bool SaveSessionState(const std::wstring& workingDir, bool isPatched);
 
-    // 清除运行会话状态记录
-    static void ClearSessionState(const std::wstring& workingDir);
+    // 清除运行会话状态记录（文件本就不存在视为成功），失败返回 false
+    static bool ClearSessionState(const std::wstring& workingDir);
 
     // 计算文件 SHA-256 哈希值
     static std::string ComputeFileSha256(const std::wstring& filePath);
 
     // 获取文件 ProductVersion 字符串 (如 "1.40.8.2")
     static std::string GetFileProductVersion(const std::wstring& filePath);
+
+    // 带重试的文件复制/删除（目标被占用时按固定间隔重试，供部署/还原链路共用）
+    static bool SafeCopyFileWithRetry(const std::filesystem::path& src, const std::filesystem::path& dst, int maxRetries = 25, int sleepMs = 150);
+    static bool SafeRemoveFileWithRetry(const std::filesystem::path& path, int maxRetries = 15, int sleepMs = 100);
 };
 
 

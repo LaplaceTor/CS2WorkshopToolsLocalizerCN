@@ -17,6 +17,7 @@
 #include <QDateTime>
 #include <QByteArray>
 #include <QString>
+#include <QDebug>
 
 namespace fs = std::filesystem;
 
@@ -56,7 +57,7 @@ std::string BackupManager::GetFileProductVersion(const std::wstring& filePath) {
     return "0.0.0.0";
 }
 
-static bool SafeCopyFileWithRetry(const fs::path& src, const fs::path& dst, int maxRetries = 25, int sleepMs = 150) {
+bool BackupManager::SafeCopyFileWithRetry(const fs::path& src, const fs::path& dst, int maxRetries, int sleepMs) {
     for (int i = 0; i < maxRetries; ++i) {
         std::error_code ec;
         fs::copy_file(src, dst, fs::copy_options::overwrite_existing, ec);
@@ -68,7 +69,7 @@ static bool SafeCopyFileWithRetry(const fs::path& src, const fs::path& dst, int 
     return false;
 }
 
-static bool SafeRemoveFileWithRetry(const fs::path& path, int maxRetries = 15, int sleepMs = 100) {
+bool BackupManager::SafeRemoveFileWithRetry(const fs::path& path, int maxRetries, int sleepMs) {
     for (int i = 0; i < maxRetries; ++i) {
         std::error_code ec;
         if (!fs::exists(path, ec)) {
@@ -118,7 +119,7 @@ bool BackupManager::GetCurrentGameSignature(const std::wstring& cs2Root, GameVer
         outSig.qt5WidgetsSha256 = fs::exists(qt5Widgets) ? ComputeFileSha256(qt5Widgets.wstring()) : "";
         return true;
     } catch (const std::exception& e) {
-        outError = L"获取当前游戏版本签名异常: " + std::wstring(e.what(), e.what() + strlen(e.what()));
+        outError = L"获取当前游戏版本签名异常: " + QString::fromUtf8(e.what()).toStdWString();
         return false;
     }
 }
@@ -160,7 +161,7 @@ bool BackupManager::ReadBackupManifest(const std::wstring& backupDir, GameVersio
 
         return !outSig.cs2ProductVersion.empty() && !outSig.qt5CoreSha256.empty();
     } catch (const std::exception& e) {
-        outError = L"解析备份元数据异常: " + std::wstring(e.what(), e.what() + strlen(e.what()));
+        outError = L"解析备份元数据异常: " + QString::fromUtf8(e.what()).toStdWString();
         return false;
     }
 }
@@ -202,7 +203,7 @@ bool BackupManager::WriteBackupManifest(const std::wstring& backupDir, const Gam
 
         return true;
     } catch (const std::exception& e) {
-        outError = L"写入备份元数据异常: " + std::wstring(e.what(), e.what() + strlen(e.what()));
+        outError = L"写入备份元数据异常: " + QString::fromUtf8(e.what()).toStdWString();
         return false;
     }
 }
@@ -232,10 +233,10 @@ BackupValidationResult BackupManager::BackupMatchesCurrentGame(const std::wstrin
     // 1. 严格校验 cs2.exe 的 ProductVersion
     if (res.backupSig.cs2ProductVersion != res.currentSig.cs2ProductVersion) {
         res.status = BackupMatchStatus::GameUpdated;
-        res.reason = L"检测到 CS2 版本已更新！备份版本为 [" + 
-            std::wstring(res.backupSig.cs2ProductVersion.begin(), res.backupSig.cs2ProductVersion.end()) + 
-            L"]，当前游戏版本为 [" + 
-            std::wstring(res.currentSig.cs2ProductVersion.begin(), res.currentSig.cs2ProductVersion.end()) + 
+        res.reason = L"检测到 CS2 版本已更新！备份版本为 [" +
+            QString::fromStdString(res.backupSig.cs2ProductVersion).toStdWString() +
+            L"]，当前游戏版本为 [" +
+            QString::fromStdString(res.currentSig.cs2ProductVersion).toStdWString() +
             L"]。";
         return res;
     }
@@ -415,7 +416,10 @@ bool BackupManager::BackupFgdFiles(const std::wstring& cs2Root, const std::wstri
                 // 安全策略：如果 backup 目录中已有该原版文件，则保留现有备份，防止已汉化文件覆盖纯净原版
                 if (!fs::exists(dstPath)) {
                     fs::create_directories(dstPath.parent_path());
-                    fs::copy_file(entry.path(), dstPath, fs::copy_options::overwrite_existing);
+                    if (!SafeCopyFileWithRetry(entry.path(), dstPath)) {
+                        outError = L"复制原版 FGD 失败 (文件被占用或无写权限): " + dstPath.wstring();
+                        return false;
+                    }
                 }
 
                 outBackedUpFiles.push_back(relPath.wstring());
@@ -423,7 +427,7 @@ bool BackupManager::BackupFgdFiles(const std::wstring& cs2Root, const std::wstri
         }
         return !outBackedUpFiles.empty();
     } catch (const std::exception& e) {
-        outError = L"备份 FGD 发生异常: " + std::wstring(e.what(), e.what() + strlen(e.what()));
+        outError = L"备份 FGD 发生异常: " + QString::fromUtf8(e.what()).toStdWString();
         return false;
     }
 }
@@ -462,10 +466,13 @@ bool BackupManager::BackupQtCore(const std::wstring& cs2Root, const std::wstring
         }
 
         fs::create_directories(dstQtCore.parent_path());
-        fs::copy_file(srcQtCore, dstQtCore, fs::copy_options::overwrite_existing);
+        if (!SafeCopyFileWithRetry(srcQtCore, dstQtCore)) {
+            outError = L"复制 Qt5Core.dll 失败 (文件被占用或无写权限): " + dstQtCore.wstring();
+            return false;
+        }
         return true;
     } catch (const std::exception& e) {
-        outError = L"备份 Qt5Core.dll 异常: " + std::wstring(e.what(), e.what() + strlen(e.what()));
+        outError = L"备份 Qt5Core.dll 异常: " + QString::fromUtf8(e.what()).toStdWString();
         return false;
     }
 }
@@ -517,7 +524,7 @@ bool BackupManager::RestoreAll(const std::wstring& cs2Root, const std::wstring& 
 
         return true;
     } catch (const std::exception& e) {
-        outError = L"还原文件异常: " + std::wstring(e.what(), e.what() + strlen(e.what()));
+        outError = L"还原文件异常: " + QString::fromUtf8(e.what()).toStdWString();
         return false;
     }
 }
@@ -539,41 +546,88 @@ bool BackupManager::HasUnrestoredSession(const std::wstring& workingDir) {
         if (!fs::exists(statePath)) {
             return false;
         }
-        std::ifstream ifs(statePath);
-        if (!ifs.is_open()) return false;
-        std::stringstream ss;
-        ss << ifs.rdbuf();
-        std::string content = ss.str();
-        return content.find("\"is_patched\": true") != std::string::npos;
+
+        QFile file(QString::fromStdWString(statePath.wstring()));
+        if (!file.open(QIODevice::ReadOnly)) {
+            return false;
+        }
+
+        QJsonParseError parseError;
+        QJsonDocument doc = QJsonDocument::fromJson(file.readAll(), &parseError);
+        file.close();
+
+        if (parseError.error != QJsonParseError::NoError || !doc.isObject()) {
+            return false;
+        }
+
+        return doc.object().value("is_patched").toBool();
     } catch (...) {
         return false;
     }
 }
 
-void BackupManager::SaveSessionState(const std::wstring& workingDir, bool isPatched) {
+bool BackupManager::SaveSessionState(const std::wstring& workingDir, bool isPatched) {
     try {
         fs::path statePath = fs::path(workingDir) / L"session_state.json";
         if (!isPatched) {
             std::error_code ec;
             fs::remove(statePath, ec);
-            return;
+            if (ec) {
+                qWarning() << "SaveSessionState: 移除会话状态文件失败:"
+                           << QString::fromStdWString(statePath.wstring());
+                return false;
+            }
+            return true;
         }
-        std::ofstream ofs(statePath);
-        if (ofs.is_open()) {
-            ofs << "{\n";
-            ofs << "  \"is_patched\": true\n";
-            ofs << "}\n";
-            ofs.flush();
+
+        QJsonObject root;
+        root["is_patched"] = true;
+        QByteArray jsonBytes = QJsonDocument(root).toJson(QJsonDocument::Indented);
+
+        QSaveFile saveFile(QString::fromStdWString(statePath.wstring()));
+        if (!saveFile.open(QIODevice::WriteOnly)) {
+            qWarning() << "SaveSessionState: 无法创建 session_state.json:"
+                       << saveFile.errorString();
+            return false;
         }
-    } catch (...) {}
+
+        if (saveFile.write(jsonBytes) != jsonBytes.size()) {
+            saveFile.cancelWriting();
+            qWarning() << "SaveSessionState: 写入 session_state.json 数据不完整";
+            return false;
+        }
+
+        if (!saveFile.commit()) {
+            qWarning() << "SaveSessionState: 提交 session_state.json 失败:"
+                       << saveFile.errorString();
+            return false;
+        }
+
+        return true;
+    } catch (const std::exception& e) {
+        qWarning() << "SaveSessionState 异常:" << QString::fromUtf8(e.what());
+        return false;
+    } catch (...) {
+        qWarning() << "SaveSessionState 未知异常";
+        return false;
+    }
 }
 
-void BackupManager::ClearSessionState(const std::wstring& workingDir) {
+bool BackupManager::ClearSessionState(const std::wstring& workingDir) {
     try {
         fs::path statePath = fs::path(workingDir) / L"session_state.json";
         std::error_code ec;
         fs::remove(statePath, ec);
-    } catch (...) {}
+        if (ec) {
+            qWarning() << "ClearSessionState: 清除会话状态文件失败:"
+                       << QString::fromStdWString(statePath.wstring());
+            return false;
+        }
+        return true;
+    } catch (...) {
+        qWarning() << "ClearSessionState 未知异常";
+        return false;
+    }
 }
 
 

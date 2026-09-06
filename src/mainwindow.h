@@ -51,11 +51,18 @@ private:
     // 判断当前是否处于有效的“已注入”状态
     bool isPatchDeployedAndValid();
 
-    // 执行注入，但不启动 HAMMER
+    // 执行注入，但不启动 HAMMER（UI 线程包装：读取 UI 状态后转后台执行核心流程）
     bool injectLocalization();
+
+    // 注入核心流程（备份 → FGD 汉化 → PE 补丁），仅做 IO 与日志（appendLog 自行封送），运行于 worker 线程
+    bool injectLocalizationCore(bool useMachineTrans);
 
     // 启动 HAMMER
     bool startHammerProcess();
+
+    // 将耗时任务放入后台线程执行，UI 线程以事件循环等待（保持界面响应），返回任务结果；
+    // 期间 m_workerBusy 置位，阻止并发注入/还原
+    bool runHeavyInWorker(const std::function<bool()>& task);
 
     bool doRestore(bool showLog = true);
     void checkAndRecoverAbnormalExit();
@@ -94,4 +101,12 @@ private:
     bool m_isHammerRunning;
     qint64 m_hammerPid;
     void* m_hammerProcessHandle;
+
+    // 后台任务互斥标志
+    bool m_workerBusy = false;
+
+    // 备份一致性校验（含多次全文件 SHA256）异步缓存，避免按钮状态刷新阻塞 UI
+    bool m_cachedValidationValid = false;
+    bool m_validationPending = false;
+    qint64 m_lastValidationMs = 0;
 };

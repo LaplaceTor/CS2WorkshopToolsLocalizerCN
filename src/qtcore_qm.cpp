@@ -114,7 +114,15 @@ static std::mutex g_DictMutex;
 static std::once_flag g_dictInitFlag;
 static std::atomic<bool> g_bDictLoaded{false};
 static std::atomic<bool> g_bTranslatorInitialized{false};
+static std::atomic<bool> g_bTranslatorInitFailed{false}; // 初始化失败后置位，避免每次 tr() 重试完整初始化
 static std::mutex g_TranslatorInitMutex;
+
+// VEH 空写跳过守卫计数（100% 原子操作，保持 VEH 内 0 锁 0 IO）：
+// 10 秒滑动窗口内跳过 ≥1000 次判定为异常风暴，熔断后不再跳过、异常正常传播
+static std::atomic<uint32_t> g_NullGuardSkipCount{0};    // 累计跳过次数（供后台线程汇总记录）
+static std::atomic<uint32_t> g_NullGuardWindowCount{0};  // 当前窗口内次数
+static std::atomic<ULONGLONG> g_NullGuardWindowStart{0}; // 窗口起始 tick (ms)
+static std::atomic<bool> g_NullGuardTripped{false};      // 熔断标志
 
 // ==============================================================================
 // 预扫描调用者模块地址区间快照（100% 纯无锁 Lock-Free Snapshot，VEH / Hook 绝对安全）
@@ -180,15 +188,33 @@ static bool IsVerboseLogEnabled() {
     return enabled;
 }
 
-static void LogHook(const char* fmt, ...) {
+static void LogHookV(const char* fmt, va_list args) {
+    if (!IsVerboseLogEnabled()) return; // 非 DEBUG 状态完全不创建/写 hook_runtime.log
+
     static std::mutex s_logMtx;
     std::lock_guard<std::mutex> lock(s_logMtx);
+
     std::wstring binDir = GetBinDirectory();
     std::wstring logPath = binDir + L"hook_runtime.log";
+
+    // DEBUG 模式下限制日志体积：每 256 次写入抽查一次，超过 8MB 轮转为 .old，避免无限增长
+    static std::atomic<int> s_writeCount{0};
+    if ((s_writeCount.fetch_add(1, std::memory_order_relaxed) & 0xFF) == 0) {
+        WIN32_FILE_ATTRIBUTE_DATA fad;
+        if (GetFileAttributesExW(logPath.c_str(), GetFileExInfoStandard, &fad)) {
+            ULONGLONG size = (static_cast<ULONGLONG>(fad.nFileSizeHigh) << 32) | fad.nFileSizeLow;
+            if (size > 8ull * 1024 * 1024) {
+                std::wstring oldPath = logPath + L".old";
+                DeleteFileW(oldPath.c_str());
+                MoveFileW(logPath.c_str(), oldPath.c_str());
+            }
+        }
+    }
+
     FILE* fp = _wfopen(logPath.c_str(), L"a");
     if (!fp) return;
     va_list va;
-    va_start(va, fmt);
+    va_copy(va, args);
     vfprintf(fp, fmt, va);
     va_end(va);
     fprintf(fp, "\n");
@@ -196,21 +222,18 @@ static void LogHook(const char* fmt, ...) {
     fclose(fp);
 }
 
+static void LogHook(const char* fmt, ...) {
+    va_list args;
+    va_start(args, fmt);
+    LogHookV(fmt, args);
+    va_end(args);
+}
+
 static inline void LogVerboseTr(const char* fmt, ...) {
-    if (!IsVerboseLogEnabled()) return;
-    static std::mutex s_logMtx;
-    std::lock_guard<std::mutex> lock(s_logMtx);
-    std::wstring binDir = GetBinDirectory();
-    std::wstring logPath = binDir + L"hook_runtime.log";
-    FILE* fp = _wfopen(logPath.c_str(), L"a");
-    if (!fp) return;
-    va_list va;
-    va_start(va, fmt);
-    vfprintf(fp, fmt, va);
-    va_end(va);
-    fprintf(fp, "\n");
-    fflush(fp);
-    fclose(fp);
+    va_list args;
+    va_start(args, fmt);
+    LogHookV(fmt, args);
+    va_end(args);
 }
 
 // 提取 DLL 路径中的文件名 stem（小写，不带扩展名，如 "tools\hammer.dll" -> "hammer"）
@@ -1537,7 +1560,7 @@ static bool InstallHookBatch(const std::vector<HookRequest>& requests, const cha
             allOk = false;
             break;
         }
-        if (!*req.ppOriginal) {
+        if (req.ppOriginal && !*req.ppOriginal) {
             LogHook("[HOOK] [%s] Calling InstallHook for %s (target=%p, detour=%p)...", batchName, req.name, req.pTarget, req.pDetour);
             bool ok = HookManager::Instance().InstallHook(req.pTarget, req.pDetour, req.ppOriginal, req.name);
             if (!ok) {
@@ -1811,6 +1834,24 @@ static DWORD WINAPI ToolsHookThread(LPVOID lpParam) {
         }
         ScanKnownToolModules();
 
+        // 汇总记录 VEH 空写守卫跳过情况（写盘仅在 DEBUG 日志开启时发生）
+        {
+            static uint32_t s_lastReported = 0;
+            static bool s_trippedLogged = false;
+            uint32_t skipTotal = g_NullGuardSkipCount.load(std::memory_order_relaxed);
+            if (skipTotal != s_lastReported) {
+                LogHook("[GUARD] null-write guard skip count: %lu (+%lu this session, tripped=%d)",
+                    (unsigned long)skipTotal,
+                    (unsigned long)(skipTotal - s_lastReported),
+                    (int)g_NullGuardTripped.load(std::memory_order_relaxed));
+                s_lastReported = skipTotal;
+            }
+            if (!s_trippedLogged && g_NullGuardTripped.load(std::memory_order_relaxed)) {
+                LogHook("[GUARD] FATAL: null-write guard tripped (>=1000 skips within 10s window) — further access violations will propagate to the host!");
+                s_trippedLogged = true;
+            }
+        }
+
         // 检查是否有崩溃报告待异步处理
         if (g_CrashSnapshot.captured.load(std::memory_order_acquire)) {
             ProcessCrashReportAsync();
@@ -1864,11 +1905,26 @@ static LONG WINAPI DiagnosticCrashLoggerVEH(PEXCEPTION_POINTERS pExceptionInfo) 
         void* rip = (void*)pExceptionInfo->ContextRecord->Rip;
 
         if (faultAddr < 0x10000 && IsToolAddress(rip)) {
-            hde64s hs;
-            unsigned int len = hde64_disasm(rip, &hs);
-            if (!(hs.flags & F_ERROR) && len > 0 && len <= 15) {
-                pExceptionInfo->ContextRecord->Rip += len;
-                return EXCEPTION_CONTINUE_EXECUTION;
+            if (!g_NullGuardTripped.load(std::memory_order_relaxed)) {
+                ULONGLONG now = GetTickCount64();
+                ULONGLONG windowStart = g_NullGuardWindowStart.load(std::memory_order_relaxed);
+                if (windowStart == 0 || now - windowStart >= 10000) {
+                    g_NullGuardWindowStart.store(now, std::memory_order_relaxed);
+                    g_NullGuardWindowCount.store(0, std::memory_order_relaxed);
+                }
+                uint32_t windowCount = g_NullGuardWindowCount.fetch_add(1, std::memory_order_relaxed) + 1;
+                if (windowCount < 1000) {
+                    hde64s hs;
+                    unsigned int len = hde64_disasm(rip, &hs);
+                    if (!(hs.flags & F_ERROR) && len > 0 && len <= 15) {
+                        pExceptionInfo->ContextRecord->Rip += len;
+                        g_NullGuardSkipCount.fetch_add(1, std::memory_order_relaxed);
+                        return EXCEPTION_CONTINUE_EXECUTION;
+                    }
+                } else {
+                    // 短时 K 级爆发：熔断，后续异常放行交还宿主/调试器
+                    g_NullGuardTripped.store(true, std::memory_order_relaxed);
+                }
             }
         }
     }
@@ -1915,10 +1971,17 @@ extern "C" __declspec(dllexport) bool InitializeTranslator() {
     if (g_bTranslatorInitialized.load(std::memory_order_acquire)) {
         return true;
     }
+    if (g_bTranslatorInitFailed.load(std::memory_order_relaxed)) {
+        // 已失败过：直接返回，避免每次 tr() 都重试完整初始化流程并刷日志
+        return false;
+    }
 
     std::lock_guard<std::mutex> lock(g_TranslatorInitMutex);
     if (g_bTranslatorInitialized.load(std::memory_order_relaxed)) {
         return true;
+    }
+    if (g_bTranslatorInitFailed.load(std::memory_order_relaxed)) {
+        return false;
     }
 
     LogHook("[INIT] InitializeTranslator invoked outside Loader Lock");
@@ -1926,12 +1989,14 @@ extern "C" __declspec(dllexport) bool InitializeTranslator() {
     // 1. 统一由 HookManager 管理 MinHook 初始化与 VEH 异常守卫
     if (!HookManager::Instance().Initialize(DiagnosticCrashLoggerVEH)) {
         LogHook("[INIT] HookManager::Initialize failed!");
+        g_bTranslatorInitFailed.store(true, std::memory_order_release);
         return false;
     }
 
     HMODULE hQtCore = GetModuleHandleW(L"Qt5Core.dll");
     if (!hQtCore) {
         LogHook("[INIT] GetModuleHandleW(Qt5Core.dll) failed!");
+        g_bTranslatorInitFailed.store(true, std::memory_order_release);
         return false;
     }
 
@@ -1968,6 +2033,7 @@ extern "C" __declspec(dllexport) bool InitializeTranslator() {
         g_hToolsHookThread = CreateThread(NULL, 0, ToolsHookThread, NULL, 0, NULL);
         if (!g_hToolsHookThread) {
             LogHook("[INIT] CreateThread for ToolsHookThread failed!");
+            g_bTranslatorInitFailed.store(true, std::memory_order_release);
             return false;
         }
         LogHook("[INIT] ToolsHookThread spawned successfully");

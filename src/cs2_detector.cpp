@@ -2,12 +2,13 @@
 #include <windows.h>
 #include <tlhelp32.h>
 #include <filesystem>
-#include <fstream>
-#include <regex>
 #include <algorithm>
 #include <QSettings>
 #include <QDir>
 #include <QFileInfo>
+#include <QFileInfoList>
+#include <QFile>
+#include <QRegularExpression>
 #include <QString>
 #include <QStringList>
 
@@ -99,43 +100,26 @@ bool Cs2Detector::CheckRegistryUninstall(std::wstring& outPath) {
 }
 
 bool Cs2Detector::ParseSteamLibraryFolders(const std::wstring& vdfPath, std::vector<std::wstring>& outLibraries) {
-    try {
-        std::ifstream file(fs::path(vdfPath), std::ios::binary);
-        if (!file.is_open()) return false;
-        std::string content((std::istreambuf_iterator<char>(file)), std::istreambuf_iterator<char>());
-        file.close();
+    // Steam VDF 为 UTF-8 文本
+    QFile file(QString::fromStdWString(vdfPath));
+    if (!file.open(QIODevice::ReadOnly)) return false;
+    QString content = QString::fromUtf8(file.readAll());
+    file.close();
 
-        // 匹配 "path" "..."
-        std::regex pathRegex(R"re("path"\s+"([^"]+)")re");
-        auto words_begin = std::sregex_iterator(content.begin(), content.end(), pathRegex);
-        auto words_end = std::sregex_iterator();
-
-        for (std::sregex_iterator i = words_begin; i != words_end; ++i) {
-            std::smatch match = *i;
-            std::string pStr = match[1].str();
-            // 替换双反斜杠 \\ 为 单反斜杠
-            std::string cleanPath;
-            for (size_t k = 0; k < pStr.length(); ++k) {
-                if (pStr[k] == '\\' && k + 1 < pStr.length() && pStr[k+1] == '\\') {
-                    cleanPath.push_back('\\');
-                    k++;
-                } else {
-                    cleanPath.push_back(pStr[k]);
-                }
-            }
-            // 转换为 wstring
-            int wlen = MultiByteToWideChar(CP_UTF8, 0, cleanPath.c_str(), -1, NULL, 0);
-            if (wlen > 0) {
-                std::wstring wpath(wlen, 0);
-                MultiByteToWideChar(CP_UTF8, 0, cleanPath.c_str(), -1, &wpath[0], wlen);
-                while (!wpath.empty() && wpath.back() == L'\0') wpath.pop_back();
-                outLibraries.push_back(wpath);
-            }
+    // 匹配 "path" "..."
+    static const QRegularExpression pathRegex(
+        QStringLiteral("\"path\"\\s+\"([^\"]+)\""));
+    QRegularExpressionMatchIterator it = pathRegex.globalMatch(content);
+    while (it.hasNext()) {
+        // VDF 中路径分隔符写作转义的双反斜杠
+        QString p = it.next().captured(1).replace(
+            QStringLiteral("\\\\"),
+            QStringLiteral("\\"));
+        if (!p.isEmpty()) {
+            outLibraries.push_back(p.toStdWString());
         }
-        return !outLibraries.empty();
-    } catch (...) {
-        return false;
     }
+    return !outLibraries.empty();
 }
 
 bool Cs2Detector::CheckRegistrySteam(std::wstring& outPath) {
@@ -181,7 +165,6 @@ bool Cs2Detector::CheckRegistrySteam(std::wstring& outPath) {
 }
 
 bool Cs2Detector::CheckCommonDrivePaths(std::wstring& outPath) {
-    const wchar_t* drives[] = { L"C:", L"D:", L"E:", L"F:", L"G:", L"H:" };
     const wchar_t* prefixes[] = {
         L"SteamLibrary\\steamapps\\common\\Counter-Strike Global Offensive",
         L"Program Files (x86)\\Steam\\steamapps\\common\\Counter-Strike Global Offensive",
@@ -190,9 +173,15 @@ bool Cs2Detector::CheckCommonDrivePaths(std::wstring& outPath) {
         L"Games\\SteamLibrary\\steamapps\\common\\Counter-Strike Global Offensive"
     };
 
-    for (const wchar_t* drive : drives) {
+    // 枚举系统全部盘符，替代硬编码的 C:~H:
+    const QFileInfoList drives = QDir::drives();
+    for (const QFileInfo& drive : drives) {
+        QString drivePath = drive.absoluteFilePath();
+        if (!drivePath.endsWith('/')) {
+            drivePath += '/';
+        }
         for (const wchar_t* prefix : prefixes) {
-            fs::path cand = fs::path(drive) / L"\\" / prefix;
+            fs::path cand = fs::path(drivePath.toStdWString()) / prefix;
             if (IsValidCs2Root(cand.wstring())) {
                 outPath = cand.wstring();
                 return true;

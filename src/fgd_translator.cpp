@@ -1,5 +1,6 @@
 #include "fgd_translator.h"
 #include "dictionary_compiler.h"
+#include "backup_manager.h"
 #include <windows.h>
 #include <fstream>
 #include <sstream>
@@ -775,16 +776,25 @@ bool FgdTranslator::TranslateFile(
         fs::create_directories(outDir);
     }
 
-    std::ofstream outFile(dstPath, std::ios::binary);
-    if (!outFile.is_open()) return false;
+    // QSaveFile 原子写入：先写临时文件，commit 时整体替换，避免中断产生半写文件
+    QSaveFile outFile(QString::fromStdWString(dstPath));
+    if (!outFile.open(QIODevice::WriteOnly)) {
+        return false;
+    }
 
     std::string currentClassName = "";
     std::string pendingClassDesc = "";
     for (const auto& l : lines) {
         std::string transLine = TranslateLine(l, dict, overrideData, currentClassName, pendingClassDesc);
-        outFile.write(transLine.data(), transLine.length());
+        if (outFile.write(transLine.data(), static_cast<qint64>(transLine.size())) < 0) {
+            outFile.cancelWriting();
+            return false;
+        }
     }
-    outFile.close();
+
+    if (!outFile.commit()) {
+        return false;
+    }
     return true;
 }
 
@@ -826,6 +836,7 @@ bool FgdTranslator::TranslateAndDeployAll(
         return false;
     }
 
+    std::vector<std::wstring> failedFiles;
     try {
         for (const auto& entry : fs::recursive_directory_iterator(backupRoot)) {
             if (entry.is_regular_file() && entry.path().extension() == L".fgd") {
@@ -833,40 +844,50 @@ bool FgdTranslator::TranslateAndDeployAll(
                 fs::path transDst = fs::path(translationsDir) / relPath;
                 fs::path cs2Dst = fs::path(cs2Root) / relPath;
 
-                // 翻译至 translationsDir
+                // 翻译至 translationsDir；单个文件失败记录后继续，最后统一汇总
                 if (!TranslateFile(entry.path().wstring(), transDst.wstring(), dict, overrideData)) {
-                    outError = L"翻译 FGD 失败: " + entry.path().wstring();
-                    return false;
+                    failedFiles.push_back(relPath.wstring());
+                    continue;
                 }
 
-                // 覆盖复制到 CS2 对应目录
+                // 覆盖复制到 CS2 对应目录（先拷贝到临时名再整体替换，避免半写；被占用时自动重试）
                 fs::create_directories(cs2Dst.parent_path());
-                fs::copy_file(transDst, cs2Dst, fs::copy_options::overwrite_existing);
+                fs::path cs2Tmp = cs2Dst;
+                cs2Tmp += L".tmp";
+                if (!BackupManager::SafeCopyFileWithRetry(transDst, cs2Tmp)) {
+                    failedFiles.push_back(relPath.wstring());
+                    continue;
+                }
+                std::error_code replaceEc;
+                fs::rename(cs2Tmp, cs2Dst, replaceEc);
+                if (replaceEc) {
+                    fs::remove(cs2Tmp, replaceEc);
+                    failedFiles.push_back(relPath.wstring());
+                    continue;
+                }
 
                 outProcessedFiles.push_back(relPath.wstring());
             }
         }
-        return !outProcessedFiles.empty();
+
+        if (!failedFiles.empty()) {
+            std::wstring failedList;
+            for (const auto& f : failedFiles) {
+                failedList += L"\n  - " + f;
+            }
+            outError = L"有 " + std::to_wstring(failedFiles.size()) + L" 个 FGD 文件处理失败:" + failedList;
+            return false;
+        }
     } catch (const std::exception& e) {
-        outError = L"处理 FGD 异常: " + std::wstring(e.what(), e.what() + strlen(e.what()));
+        outError = L"处理 FGD 异常: " + QString::fromUtf8(e.what()).toStdWString();
         return false;
     }
-}
 
-static std::string EscapeJsonString(const std::string& str) {
-    std::string out;
-    out.reserve(str.size() + 16);
-    for (char c : str) {
-        if (c == '"') out += "\\\"";
-        else if (c == '\\') out += "\\\\";
-        else if (c == '\b') out += "\\b";
-        else if (c == '\f') out += "\\f";
-        else if (c == '\n') out += "\\n";
-        else if (c == '\r') out += "\\r";
-        else if (c == '\t') out += "\\t";
-        else out += c;
+    if (outProcessedFiles.empty()) {
+        outError = L"backup 目录中未找到任何 FGD 文件: " + backupDir;
+        return false;
     }
-    return out;
+    return true;
 }
 
 // ==============================================================================
@@ -889,59 +910,58 @@ bool FgdTranslator::EnsureFgdDictionaryExists(const std::wstring& jsonPath, cons
         fs::create_directories(p.parent_path(), ec);
     }
 
-    std::ofstream out(jsonPath, std::ios::binary);
-    if (!out.is_open()) {
+    // 数据体由 QJsonDocument 组装输出，转义交给 Qt 处理
+    QJsonObject entries;
+    if (loaded.empty()) {
+        entries["Omnidirectional point light"] = "全向点光源";
+        entries["Light Source"] = "光源";
+        entries["Name"] = "名称";
+        entries["The name that other entities use to refer to this entity."] = "其他实体用于引用此实体的名称。";
+        entries["Removes this entity from the world."] = "从世界中移除此实体。";
+        entries["Enabled"] = "已启用";
+        entries["Disabled"] = "已禁用";
+    } else {
+        for (const auto& kv : loaded) {
+            if (kv.first.rfind("_说明", 0) == 0) continue;
+            entries[QString::fromStdString(kv.first)] = QString::fromStdString(kv.second);
+        }
+    }
+
+    QSaveFile out(QString::fromStdWString(jsonPath));
+    if (!out.open(QIODevice::WriteOnly)) {
         outNotice = L"无法创建 FGD 翻译字典文件: " + jsonPath;
         return false;
     }
 
-    out << "// ==============================================================================\n";
-    out << "// CS2 Hammer FGD 实体定义翻译字典 (JSONC 格式)\n";
-    out << "// ==============================================================================\n";
-    out << "// \n";
-    out << "// 【使用指南】\n";
-    out << "// - 格式为标准的键值对：\"英文原词\": \"中文翻译\"\n";
-    out << "// - 支持 // 单行注释 与 /* 块注释 */\n";
-    out << "// \n";
-    out << "// 【可翻译内容】\n";
-    out << "// 1. 实体类说明 (@PointClass ... = name : \"Description\")\n";
-    out << "// 2. 属性显示名称 (targetname : \"Name\" : : \"...\")\n";
-    out << "// 3. 属性悬停描述 (... : \"Name\" : default : \"Description\")\n";
-    out << "// 4. 选项与标记 (\"0\" : \"Enabled\" : \"Option Desc\")\n";
-    out << "// 5. 输入输出 (input Kill : \"Description\")\n";
-    out << "// 6. 绑定按钮说明 (desc = \"Description\")\n";
-    out << "// \n";
-    out << "// 【格式与安全】\n";
-    out << "// - 所有底层 RAW 标识符（如 targetname、angles、thinkalways、io 类型与默认值）引擎会自动保护，请仅翻译双引号内的文本。\n";
-    out << "// - 修改保存后重新在启动器点击启动即可自动重新编译部署。\n";
-    out << "// ==============================================================================\n";
-    out << "{\n";
+    // 注释版使用指南作为字面量直接写出（QJsonDocument 仅负责数据体）
+    static const char kGuideHeader[] = R"(// ==============================================================================
+// CS2 Hammer FGD 实体定义翻译字典 (JSONC 格式)
+// ==============================================================================
+//
+// 【使用指南】
+// - 格式为标准的键值对："英文原词": "中文翻译"
+// - 支持 // 单行注释 与 /* 块注释 */
+//
+// 【可翻译内容】
+// 1. 实体类说明 (@PointClass ... = name : "Description")
+// 2. 属性显示名称 (targetname : "Name" : : "...")
+// 3. 属性悬停描述 (... : "Name" : default : "Description")
+// 4. 选项与标记 ("0" : "Enabled" : "Option Desc")
+// 5. 输入输出 (input Kill : "Description")
+// 6. 绑定按钮说明 (desc = "Description")
+//
+// 【格式与安全】
+// - 所有底层 RAW 标识符（如 targetname、angles、thinkalways、io 类型与默认值）引擎会自动保护，请仅翻译双引号内的文本。
+// - 修改保存后重新在启动器点击启动即可自动重新编译部署。
+// ==============================================================================
+)";
+    out.write(kGuideHeader);
+    out.write(QJsonDocument(entries).toJson(QJsonDocument::Indented));
 
-    if (loaded.empty()) {
-        out << "  \"Omnidirectional point light\": \"全向点光源\",\n";
-        out << "  \"Light Source\": \"光源\",\n";
-        out << "  \"Name\": \"名称\",\n";
-        out << "  \"The name that other entities use to refer to this entity.\": \"其他实体用于引用此实体的名称。\",\n";
-        out << "  \"Removes this entity from the world.\": \"从世界中移除此实体。\",\n";
-        out << "  \"Enabled\": \"已启用\",\n";
-        out << "  \"Disabled\": \"已禁用\"\n";
-    } else {
-        std::vector<std::pair<std::string, std::string>> validEntries;
-        for (const auto& kv : loaded) {
-            if (kv.first.rfind("_说明", 0) == 0) continue;
-            validEntries.push_back(kv);
-        }
-        for (size_t i = 0; i < validEntries.size(); ++i) {
-            out << "  \"" << EscapeJsonString(validEntries[i].first) << "\": \"" << EscapeJsonString(validEntries[i].second) << "\"";
-            if (i + 1 < validEntries.size()) {
-                out << ",\n";
-            } else {
-                out << "\n";
-            }
-        }
+    if (!out.commit()) {
+        outNotice = L"写入 FGD 翻译字典文件失败: " + jsonPath;
+        return false;
     }
-    out << "}\n";
-    out.close();
 
     outNotice = L"已自动生成 fgd_translations.jsonc 模板字典（包含详细使用说明与格式示例）。";
     return true;
@@ -963,66 +983,78 @@ bool FgdTranslator::EnsureFgdOverrideDictionaryExists(const std::wstring& jsonPa
         fs::create_directories(p.parent_path(), ec);
     }
 
-    std::ofstream out(jsonPath, std::ios::binary);
-    if (!out.is_open()) {
+    // 示例数据由 QJsonDocument 组装输出
+    QJsonObject properties;
+    properties["bodygroups"] = "设置模型的子部件与可选身体部件网格组合。";
+    properties["vscripts"] = "实体生成后自动加载并执行的 VScript 脚本文件列表。";
+    properties["clientSideEntity"] = "是否仅在客户端创建并运行此实体（不向服务器同步）。";
+    properties["TeamNum"] = "所属队伍编号（0: 任意/无队伍, 2: T 阵营, 3: CT 阵营）。";
+    properties["box_mins"] = "包围盒/光照探针体积的最小边界坐标 (X Y Z)。";
+    properties["box_maxs"] = "包围盒/光照探针体积的最大边界坐标 (X Y Z)。";
+    properties["flood_fill"] = "忽略玩家不可达的空间，加快光照烘焙速度并节省显存。";
+    properties["voxelize"] = "忽略已体素化的实体空间，优化光照探针计算。";
+    properties["light_probe_volume_from_cubemap"] = "是否使用立方体贴图 (Cubemap) 计算漫反射光照探针。";
+    properties["moveable"] = "是否允许在游戏运行时移动、绑定父级、启用或禁用此对象。";
+    properties["edge_fade_dist"] = "反射或光照边界平滑淡出过渡距离。";
+    properties["max_lightmap_resolution"] = "限制此对象在烘焙时的最大光照贴图分辨率（0 为默认）。";
+
+    QJsonObject io;
+    io["SetParent"] = "设置该实体的父级对象。";
+    io["ClearParent"] = "解除与父级实体的挂载绑定关系，使其独立运动。";
+    io["FollowEntity"] = "骨骼合并 (Bone Merge) 附加到目标实体。";
+    io["Kill"] = "从世界中移除此实体并释放资源。";
+    io["SetHealth"] = "设置该实体的当前生命值。";
+
+    QJsonObject envCubemapProps;
+    envCubemapProps["influenceradius"] = "当前立方体贴图的生效影响半径（单位：英寸）。";
+
+    QJsonObject envCubemap;
+    envCubemap["description"] = "用于采样环境间接镜面反射的高动态范围立方体贴图实体。";
+    envCubemap["properties"] = envCubemapProps;
+
+    QJsonObject classes;
+    classes["info_node"] = "AI 地面导航节点，供 NPC 寻路与路径规划计算使用。";
+    classes["csm_fov_override"] = "级联阴影贴图 (CSM) 视场角覆盖控制器。";
+    classes["env_cubemap"] = envCubemap;
+
+    QJsonObject root;
+    root["properties"] = properties;
+    root["io"] = io;
+    root["classes"] = classes;
+
+    QSaveFile out(QString::fromStdWString(jsonPath));
+    if (!out.open(QIODevice::WriteOnly)) {
         outNotice = L"无法创建 FGD 覆盖字典文件: " + jsonPath;
         return false;
     }
 
-    out << "{\n";
-    out << "  // ==============================================================================\n";
-    out << "  // CS2 FGD 实体键值描述补充与覆盖字典 (JSONC 格式)\n";
-    out << "  // ==============================================================================\n";
-    out << "  //\n";
-    out << "  // 【作用说明】\n";
-    out << "  // - 本文件用于针对 FGD 中特定的【属性名 (Key)】、【实体类名 (Class)】或【输入输出 (I/O)】\n";
-    out << "  //   补充缺失的说明描述，或覆盖原版已有描述。\n";
-    out << "  // - 与 fgd_translations.jsonc 互为补充：\n";
-    out << "  //   * fgd_translations.jsonc: 负责已有英文字符串 -> 中文翻译。\n";
-    out << "  //   * fgd_override.jsonc: 负责针对特定键名无描述时【自动新增描述】或【强制覆盖描述】。\n";
-    out << "  //\n";
-    out << "  // 【支持格式】\n";
-    out << "  // 1. 全局属性描述补充 (properties): \"属性键名\": \"描述文本\" 或 \"属性键名\": { \"description\": \"...\", \"displayName\": \"...\" }\n";
-    out << "  // 2. 输入输出说明补充 (io): \"IOName\": \"说明文本\"\n";
-    out << "  // 3. 实体类说明补充 (classes): \"classname\": \"说明文本\" 或 \"classname\": { \"description\": \"...\", \"properties\": { ... } }\n";
-    out << "  // 4. 顶层快速简写: \"键名\": \"描述文本\"\n";
-    out << "  // ==============================================================================\n\n";
+    // 注释版使用指南作为字面量直接写出（QJsonDocument 仅负责数据体）
+    static const char kGuideHeader[] = R"(// ==============================================================================
+// CS2 FGD 实体键值描述补充与覆盖字典 (JSONC 格式)
+// ==============================================================================
+//
+// 【作用说明】
+// - 本文件用于针对 FGD 中特定的【属性名 (Key)】、【实体类名 (Class)】或【输入输出 (I/O)】
+//   补充缺失的说明描述，或覆盖原版已有描述。
+// - 与 fgd_translations.jsonc 互为补充：
+//   * fgd_translations.jsonc: 负责已有英文字符串 -> 中文翻译。
+//   * fgd_override.jsonc: 负责针对特定键名无描述时【自动新增描述】或【强制覆盖描述】。
+//
+// 【支持格式】
+// 1. 全局属性描述补充 (properties): "属性键名": "描述文本" 或 "属性键名": { "description": "...", "displayName": "..." }
+// 2. 输入输出说明补充 (io): "IOName": "说明文本"
+// 3. 实体类说明补充 (classes): "classname": "说明文本" 或 "classname": { "description": "...", "properties": { ... } }
+// 4. 顶层快速简写: "键名": "描述文本"
+// ==============================================================================
 
-    out << "  \"properties\": {\n";
-    out << "    \"bodygroups\": \"设置模型的子部件与可选身体部件网格组合。\",\n";
-    out << "    \"vscripts\": \"实体生成后自动加载并执行的 VScript 脚本文件列表。\",\n";
-    out << "    \"clientSideEntity\": \"是否仅在客户端创建并运行此实体（不向服务器同步）。\",\n";
-    out << "    \"TeamNum\": \"所属队伍编号（0: 任意/无队伍, 2: T 阵营, 3: CT 阵营）。\",\n";
-    out << "    \"box_mins\": \"包围盒/光照探针体积的最小边界坐标 (X Y Z)。\",\n";
-    out << "    \"box_maxs\": \"包围盒/光照探针体积的最大边界坐标 (X Y Z)。\",\n";
-    out << "    \"flood_fill\": \"忽略玩家不可达的空间，加快光照烘焙速度并节省显存。\",\n";
-    out << "    \"voxelize\": \"忽略已体素化的实体空间，优化光照探针计算。\",\n";
-    out << "    \"light_probe_volume_from_cubemap\": \"是否使用立方体贴图 (Cubemap) 计算漫反射光照探针。\",\n";
-    out << "    \"moveable\": \"是否允许在游戏运行时移动、绑定父级、启用或禁用此对象。\",\n";
-    out << "    \"edge_fade_dist\": \"反射或光照边界平滑淡出过渡距离。\",\n";
-    out << "    \"max_lightmap_resolution\": \"限制此对象在烘焙时的最大光照贴图分辨率（0 为默认）。\"\n";
-    out << "  },\n\n";
+)";
+    out.write(kGuideHeader);
+    out.write(QJsonDocument(root).toJson(QJsonDocument::Indented));
 
-    out << "  \"io\": {\n";
-    out << "    \"SetParent\": \"设置该实体的父级对象。\",\n";
-    out << "    \"ClearParent\": \"解除与父级实体的挂载绑定关系，使其独立运动。\",\n";
-    out << "    \"FollowEntity\": \"骨骼合并 (Bone Merge) 附加到目标实体。\",\n";
-    out << "    \"Kill\": \"从世界中移除此实体并释放资源。\",\n";
-    out << "    \"SetHealth\": \"设置该实体的当前生命值。\"\n";
-    out << "  },\n\n";
-
-    out << "  \"classes\": {\n";
-    out << "    \"info_node\": \"AI 地面导航节点，供 NPC 寻路与路径规划计算使用。\",\n";
-    out << "    \"csm_fov_override\": \"级联阴影贴图 (CSM) 视场角覆盖控制器。\",\n";
-    out << "    \"env_cubemap\": {\n";
-    out << "      \"description\": \"用于采样环境间接镜面反射的高动态范围立方体贴图实体。\",\n";
-    out << "      \"properties\": {\n";
-    out << "        \"influenceradius\": \"当前立方体贴图的生效影响半径（单位：英寸）。\"\n";
-    out << "      }\n";
-    out << "    }\n";
-    out << "  }\n";
-    out << "}\n";
-    out.close();
+    if (!out.commit()) {
+        outNotice = L"写入 FGD 覆盖字典文件失败: " + jsonPath;
+        return false;
+    }
 
     outNotice = L"已自动生成 fgd_override.jsonc 模板字典（包含详细使用说明与格式示例）。";
     return true;
@@ -1044,68 +1076,67 @@ bool FgdTranslator::EnsureQtDictionaryExists(const std::wstring& jsonPath, const
         fs::create_directories(p.parent_path(), ec);
     }
 
-    std::ofstream out(jsonPath, std::ios::binary);
-    if (!out.is_open()) {
+    // 数据体由 QJsonDocument 组装输出，转义交给 Qt 处理
+    QJsonObject entries;
+    if (loaded.empty()) {
+        entries["File"] = "文件";
+        entries["Edit"] = "编辑";
+        entries["View"] = "视图";
+        entries["Tools"] = "工具";
+        entries["New"] = "新建";
+        entries["Open"] = "打开";
+        entries["Save"] = "保存";
+        entries["Save As..."] = "另存为...";
+        entries["Close"] = "关闭";
+        entries["Exit"] = "退出";
+        entries["Undo"] = "撤销";
+        entries["Redo"] = "重做";
+        entries["Clipping Tool"] = "剪切工具";
+        entries["Transform Locked"] = "变换锁定";
+        entries["Pinned To"] = "固定至";
+        entries["Force Hidden"] = "强制隐藏";
+    } else {
+        for (const auto& kv : loaded) {
+            if (kv.first.rfind("_说明", 0) == 0) continue;
+            entries[QString::fromStdString(kv.first)] = QString::fromStdString(kv.second);
+        }
+    }
+
+    QSaveFile out(QString::fromStdWString(jsonPath));
+    if (!out.open(QIODevice::WriteOnly)) {
         outNotice = L"无法创建 Qt 界面翻译字典文件: " + jsonPath;
         return false;
     }
 
-    out << "// ==============================================================================\n";
-    out << "// CS2 Hammer 界面与菜单核心翻译字典 (JSONC 格式)\n";
-    out << "// ==============================================================================\n";
-    out << "// \n";
-    out << "// 【使用指南】\n";
-    out << "// - 格式为标准的键值对：\"英文原词\": \"中文翻译\"\n";
-    out << "// - 支持 // 单行注释 与 /* 块注释 */\n";
-    out << "// \n";
-    out << "// 【可翻译内容】\n";
-    out << "// 1. 主菜单与二级菜单项\n";
-    out << "// 2. 工具栏按钮与悬停提示\n";
-    out << "// 3. 属性面板属性名\n";
-    out << "// 4. 树形视图、列表与下拉框文本\n";
-    out << "// 5. 弹窗对话框与按钮文本\n";
-    out << "// \n";
-    out << "// 【快捷键自动适配】\n";
-    out << "// - 核心注入模块已内置动态快捷键识别与拆分引擎。\n";
-    out << "// - 遇到如 'Clipping Tool [Shift+X]'、'Undo (Ctrl+Z)'、'Save\\tCtrl+S'、'Save As...'、'Name:' 等文本，\n";
-    out << "//   只需翻译基础英文（如 \"Clipping Tool\": \"剪切工具\"），快捷键后缀会被自动保留与拼接，无需手动输入快捷键！\n";
-    out << "// ==============================================================================\n";
-    out << "{\n";
+    // 注释版使用指南作为字面量直接写出（QJsonDocument 仅负责数据体）
+    static const char kGuideHeader[] = R"(// ==============================================================================
+// CS2 Hammer 界面与菜单核心翻译字典 (JSONC 格式)
+// ==============================================================================
+//
+// 【使用指南】
+// - 格式为标准的键值对："英文原词": "中文翻译"
+// - 支持 // 单行注释 与 /* 块注释 */
+//
+// 【可翻译内容】
+// 1. 主菜单与二级菜单项
+// 2. 工具栏按钮与悬停提示
+// 3. 属性面板属性名
+// 4. 树形视图、列表与下拉框文本
+// 5. 弹窗对话框与按钮文本
+//
+// 【快捷键自动适配】
+// - 核心注入模块已内置动态快捷键识别与拆分引擎。
+// - 遇到如 'Clipping Tool [Shift+X]'、'Undo (Ctrl+Z)'、'Save\tCtrl+S'、'Save As...'、'Name:' 等文本，
+//   只需翻译基础英文（如 "Clipping Tool": "剪切工具"），快捷键后缀会被自动保留与拼接，无需手动输入快捷键！
+// ==============================================================================
+)";
+    out.write(kGuideHeader);
+    out.write(QJsonDocument(entries).toJson(QJsonDocument::Indented));
 
-    if (loaded.empty()) {
-        out << "  \"File\": \"文件\",\n";
-        out << "  \"Edit\": \"编辑\",\n";
-        out << "  \"View\": \"视图\",\n";
-        out << "  \"Tools\": \"工具\",\n";
-        out << "  \"New\": \"新建\",\n";
-        out << "  \"Open\": \"打开\",\n";
-        out << "  \"Save\": \"保存\",\n";
-        out << "  \"Save As...\": \"另存为...\",\n";
-        out << "  \"Close\": \"关闭\",\n";
-        out << "  \"Exit\": \"退出\",\n";
-        out << "  \"Undo\": \"撤销\",\n";
-        out << "  \"Redo\": \"重做\",\n";
-        out << "  \"Clipping Tool\": \"剪切工具\",\n";
-        out << "  \"Transform Locked\": \"变换锁定\",\n";
-        out << "  \"Pinned To\": \"固定至\",\n";
-        out << "  \"Force Hidden\": \"强制隐藏\"\n";
-    } else {
-        std::vector<std::pair<std::string, std::string>> validEntries;
-        for (const auto& kv : loaded) {
-            if (kv.first.rfind("_说明", 0) == 0) continue;
-            validEntries.push_back(kv);
-        }
-        for (size_t i = 0; i < validEntries.size(); ++i) {
-            out << "  \"" << EscapeJsonString(validEntries[i].first) << "\": \"" << EscapeJsonString(validEntries[i].second) << "\"";
-            if (i + 1 < validEntries.size()) {
-                out << ",\n";
-            } else {
-                out << "\n";
-            }
-        }
+    if (!out.commit()) {
+        outNotice = L"写入 Qt 界面翻译字典文件失败: " + jsonPath;
+        return false;
     }
-    out << "}\n";
-    out.close();
 
     outNotice = L"已自动生成 qt_translations.jsonc 模板字典（包含详细使用说明与格式示例）。";
     return true;

@@ -1,4 +1,8 @@
 #include "dictionary_compiler.h"
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
 #include <fstream>
 #include <sstream>
 #include <algorithm>
@@ -234,14 +238,48 @@ private:
                                 return false;
                             }
                         }
-                        // Encode codePoint to UTF-8
-                        if (codePoint <= 0x7F) {
+
+                        // 高代理：尝试与紧随的 \uXXXX 低代理组合为完整码点（UTF-16 代理对）
+                        if (codePoint >= 0xD800 && codePoint <= 0xDBFF) {
+                            if (m_idx + 6 <= m_len && m_str[m_idx] == '\\' && m_str[m_idx + 1] == 'u') {
+                                size_t lowIdx = m_idx + 2;
+                                unsigned int low = 0;
+                                bool lowOk = true;
+                                for (int k = 0; k < 4; ++k) {
+                                    char h = m_str[lowIdx + k];
+                                    low <<= 4;
+                                    if (h >= '0' && h <= '9') low |= (h - '0');
+                                    else if (h >= 'a' && h <= 'f') low |= (h - 'a' + 10);
+                                    else if (h >= 'A' && h <= 'F') low |= (h - 'A' + 10);
+                                    else {
+                                        lowOk = false;
+                                        break;
+                                    }
+                                }
+                                if (lowOk && low >= 0xDC00 && low <= 0xDFFF) {
+                                    m_idx = lowIdx + 4;
+                                    codePoint = 0x10000 + ((codePoint - 0xD800) << 10) + (low - 0xDC00);
+                                }
+                            }
+                        }
+
+                        // Encode codePoint to UTF-8；非法孤立代理替换为 U+FFFD，避免产出非法 UTF-8
+                        if (codePoint >= 0xD800 && codePoint <= 0xDFFF) {
+                            outStr.push_back(static_cast<char>(0xEF));
+                            outStr.push_back(static_cast<char>(0xBF));
+                            outStr.push_back(static_cast<char>(0xBD));
+                        } else if (codePoint <= 0x7F) {
                             outStr.push_back(static_cast<char>(codePoint));
                         } else if (codePoint <= 0x7FF) {
                             outStr.push_back(static_cast<char>(0xC0 | ((codePoint >> 6) & 0x1F)));
                             outStr.push_back(static_cast<char>(0x80 | (codePoint & 0x3F)));
-                        } else {
+                        } else if (codePoint <= 0xFFFF) {
                             outStr.push_back(static_cast<char>(0xE0 | ((codePoint >> 12) & 0x0F)));
+                            outStr.push_back(static_cast<char>(0x80 | ((codePoint >> 6) & 0x3F)));
+                            outStr.push_back(static_cast<char>(0x80 | (codePoint & 0x3F)));
+                        } else {
+                            outStr.push_back(static_cast<char>(0xF0 | ((codePoint >> 18) & 0x07)));
+                            outStr.push_back(static_cast<char>(0x80 | ((codePoint >> 12) & 0x3F)));
                             outStr.push_back(static_cast<char>(0x80 | ((codePoint >> 6) & 0x3F)));
                             outStr.push_back(static_cast<char>(0x80 | (codePoint & 0x3F)));
                         }
@@ -328,14 +366,17 @@ bool DictionaryCompiler::ParseJsoncFileToMaps(
             fseek(fbFp, 0, SEEK_SET);
             if (fbSize > 0 && fbSize <= static_cast<long>(MAX_JSON_FILE_SIZE)) {
                 std::string fbStr(static_cast<size_t>(fbSize), '\0');
-                fread(fbStr.data(), 1, fbSize, fbFp);
+                size_t fbRead = fread(fbStr.data(), 1, static_cast<size_t>(fbSize), fbFp);
                 fclose(fbFp);
                 fbFp = nullptr;
 
-                std::string cleanFb = StripJsonComments(fbStr.data(), fbStr.size());
-                std::wstring fbErr;
-                SimpleJsonParser fbParser(cleanFb);
-                fbParser.Parse(outCommon, outScoped, fbErr);
+                // 短读视为 fallback 字典无效，跳过解析，继续加载主字典
+                if (fbRead == static_cast<size_t>(fbSize)) {
+                    std::string cleanFb = StripJsonComments(fbStr.data(), fbStr.size());
+                    std::wstring fbErr;
+                    SimpleJsonParser fbParser(cleanFb);
+                    fbParser.Parse(outCommon, outScoped, fbErr);
+                }
             } else {
                 fclose(fbFp);
             }
@@ -365,8 +406,17 @@ bool DictionaryCompiler::ParseJsoncFileToMaps(
     }
 
     std::string jsonStr(static_cast<size_t>(fsize), '\0');
-    fread(jsonStr.data(), 1, fsize, fp);
+    size_t fRead = fread(jsonStr.data(), 1, static_cast<size_t>(fsize), fp);
     fclose(fp);
+
+    if (fRead != static_cast<size_t>(fsize)) {
+        // 短读：源文件内容不完整
+        if (!outCommon.empty() || !outScoped.empty()) {
+            return true;
+        }
+        outError = L"读取源 JSONC 文件失败 (读取不完整): " + jsonPath;
+        return false;
+    }
 
     std::string cleanPrimary = StripJsonComments(jsonStr.data(), jsonStr.size());
     SimpleJsonParser primaryParser(cleanPrimary);
@@ -410,9 +460,11 @@ bool DictionaryCompiler::MergeJsonFiles(
         return false;
     }
 
-    FILE* outFp = _wfopen(outJsonPath.c_str(), L"wb");
+    // 写入临时文件，成功后整体替换目标，避免中断产生半写文件
+    std::wstring tmpOutPath = outJsonPath + L".tmp";
+    FILE* outFp = _wfopen(tmpOutPath.c_str(), L"wb");
     if (!outFp) {
-        outError = L"无法创建目标 JSONC 文件: " + outJsonPath;
+        outError = L"无法创建目标 JSONC 临时文件: " + tmpOutPath;
         return false;
     }
 
@@ -444,6 +496,12 @@ bool DictionaryCompiler::MergeJsonFiles(
     }
     fputs("\n}\n", outFp);
     fclose(outFp);
+
+    if (!MoveFileExW(tmpOutPath.c_str(), outJsonPath.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
+        outError = L"提交合并词典文件失败: " + outJsonPath;
+        DeleteFileW(tmpOutPath.c_str());
+        return false;
+    }
     return true;
 }
 
