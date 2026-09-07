@@ -419,13 +419,78 @@ static bool GetCallerModuleName(void* callerAddr, wchar_t* outBuf, size_t maxLen
 static void LoadMasterTranslations() {
     std::wstring binDir = GetBinDirectory();
     std::wstring jsoncPath = binDir + L"qt_translations.jsonc";
-    std::wstring err;
+    std::wstring fallbackPath = L"";
+    std::wstring sourceOrigin = L"local game directory";
+    bool useMachineTrans = true;
 
-    if (DictionaryCompiler::ParseJsoncFileToMaps(jsoncPath, g_CommonDict, g_ScopedDicts, err)) {
-        LogHook("[DICT] Loaded JSONC dictionary via pure C++ parser: %zu common, %zu scoped modules",
+    // 优先尝试从 localizer_appdir.txt 读取启动器程序目录与机翻兜底选项，实现程序目录直读
+    std::wstring appDirPointerPath = binDir + L"localizer_appdir.txt";
+    FILE* fpPointer = _wfopen(appDirPointerPath.c_str(), L"r, ccs=UTF-8");
+    if (!fpPointer) {
+        fpPointer = _wfopen(appDirPointerPath.c_str(), L"r");
+    }
+    std::wstring appDir = L"";
+    if (fpPointer) {
+        wchar_t lineBuf[MAX_PATH] = {0};
+        if (fgetws(lineBuf, MAX_PATH, fpPointer)) {
+            // 第一行：启动器程序目录
+            size_t len = wcslen(lineBuf);
+            while (len > 0 && (lineBuf[len - 1] == L'\r' || lineBuf[len - 1] == L'\n' || lineBuf[len - 1] == L' ' || lineBuf[len - 1] == L'\t')) {
+                lineBuf[--len] = L'\0';
+            }
+            if (len > 0 && (lineBuf[len - 1] == L'\\' || lineBuf[len - 1] == L'/')) {
+                lineBuf[--len] = L'\0';
+            }
+            if (len > 0) {
+                appDir = lineBuf;
+            }
+        }
+        while (fgetws(lineBuf, MAX_PATH, fpPointer)) {
+            // 后续行：可选运行配置标志
+            std::wstring opt = lineBuf;
+            if (opt.find(L"use_machine_trans=0") != std::wstring::npos) {
+                useMachineTrans = false;
+            } else if (opt.find(L"use_machine_trans=1") != std::wstring::npos) {
+                useMachineTrans = true;
+            }
+        }
+        fclose(fpPointer);
+    }
+
+    if (!appDir.empty()) {
+        std::wstring launcherJsonc = appDir + L"\\translations\\qt_translations.jsonc";
+        DWORD dwAttrib = GetFileAttributesW(launcherJsonc.c_str());
+        if (dwAttrib != INVALID_FILE_ATTRIBUTES && !(dwAttrib & FILE_ATTRIBUTE_DIRECTORY)) {
+            jsoncPath = launcherJsonc;
+            sourceOrigin = L"launcher program directory";
+        }
+    }
+
+    if (useMachineTrans) {
+        // 查找 qt_fallback.jsonc 兜底词典（优先从启动器目录获取，其次从游戏目录回退）
+        if (!appDir.empty()) {
+            std::wstring launcherFallback = appDir + L"\\translations\\qt_fallback.jsonc";
+            DWORD dwAttrib = GetFileAttributesW(launcherFallback.c_str());
+            if (dwAttrib != INVALID_FILE_ATTRIBUTES && !(dwAttrib & FILE_ATTRIBUTE_DIRECTORY)) {
+                fallbackPath = launcherFallback;
+            }
+        }
+        if (fallbackPath.empty()) {
+            std::wstring localFallback = binDir + L"qt_fallback.jsonc";
+            DWORD dwAttrib = GetFileAttributesW(localFallback.c_str());
+            if (dwAttrib != INVALID_FILE_ATTRIBUTES && !(dwAttrib & FILE_ATTRIBUTE_DIRECTORY)) {
+                fallbackPath = localFallback;
+            }
+        }
+    }
+
+    std::wstring err;
+    if (DictionaryCompiler::ParseJsoncFileToMaps(jsoncPath, g_CommonDict, g_ScopedDicts, err, fallbackPath)) {
+        LogHook("[DICT] Loaded JSONC dictionary from %ls (%ls, fallback: %ls): %zu common, %zu scoped modules",
+            sourceOrigin.c_str(), jsoncPath.c_str(), fallbackPath.empty() ? L"none" : fallbackPath.c_str(),
             g_CommonDict.size(), g_ScopedDicts.size());
     } else {
-        LogHook("[DICT] Failed to load JSONC dictionary: %ls", err.c_str());
+        LogHook("[DICT] Failed to load JSONC dictionary from %ls: %ls", jsoncPath.c_str(), err.c_str());
     }
 
     // 同步构建反向字典（用于一键切回英文与控件还原）

@@ -31,6 +31,8 @@ private slots:
     void onToggleLangClicked();
     void onHotReloadClicked();
     void onDebugClicked();
+    void onWatchedFileChanged(const QString& path);
+    void onDebouncedHotReload();
     void onHammerStarted();
     void onHammerFinished(int exitCode, QProcess::ExitStatus exitStatus);
     void onHammerError(QProcess::ProcessError error);
@@ -97,9 +99,15 @@ private:
 
 public:
     void openDebugWindow();
+    bool performHotReload(bool silent = false);
+    void writeAppDirPointer();
 
 private:
+    void setupFileWatcher();
     bool sendIpcCommandToHammer(unsigned int msgId);
+
+    class QFileSystemWatcher* m_fileWatcher;
+    class QTimer* m_hotReloadDebounceTimer;
 
     QTextEdit* m_logEdit;
     QLabel* m_statusLabel;

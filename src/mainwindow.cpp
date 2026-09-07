@@ -9,6 +9,8 @@
 #include <windows.h>
 #include <psapi.h>
 #include <thread>
+#include <fstream>
+#include <QFileSystemWatcher>
 
 #include <QVBoxLayout>
 #include <QHBoxLayout>
@@ -55,8 +57,10 @@ static fs::path resolveJsonPath(const std::wstring& workingDir, const std::wstri
     std::vector<fs::path> baseDirs = {
         workPath / L"translations",
         workPath,
+        workPath / L".." / L"translations",
         fs::current_path() / L"translations",
-        fs::current_path()
+        fs::current_path(),
+        fs::current_path() / L".." / L"translations"
     };
 
     for (const auto& dir : baseDirs) {
@@ -81,6 +85,8 @@ MainWindow::MainWindow(const std::wstring& cs2Root, QWidget *parent)
     , m_toggleLangBtn(nullptr)
     , m_hotReloadBtn(nullptr)
     , m_debugBtn(nullptr)
+    , m_fileWatcher(nullptr)
+    , m_hotReloadDebounceTimer(nullptr)
 {
     // 获取程序所在目录作为工作目录
     QString appDir = QApplication::applicationDirPath();
@@ -150,7 +156,13 @@ MainWindow::MainWindow(const std::wstring& cs2Root, QWidget *parent)
             m_useMachineTransCheck,
             &QCheckBox::toggled,
             this,
-            &MainWindow::saveSettings
+            [this](bool) {
+                saveSettings();
+                writeAppDirPointer();
+                if (m_isHammerRunning) {
+                    performHotReload(false);
+                }
+            }
         );
     }
 
@@ -245,6 +257,10 @@ MainWindow::MainWindow(const std::wstring& cs2Root, QWidget *parent)
 
     // 检查上一次是否异常退出并执行安全恢复
     checkAndRecoverAbnormalExit();
+
+    // 写入程序目录指针供注入模块直读，并挂载词典文件自动热重载监听
+    writeAppDirPointer();
+    setupFileWatcher();
 
     // 根据恢复后的实际状态刷新按钮
     updateActionButtonState();
@@ -3236,12 +3252,194 @@ void MainWindow::onToggleLangClicked() {
     }
 }
 
-void MainWindow::onHotReloadClicked() {
-    if (sendIpcCommandToHammer(WM_LOCALIZER_RELOAD_DICT)) {
-        appendLog("[⚡] 已向运行中的 Hammer 发送【热重载翻译词典】指令", "#a6e22e");
-    } else {
-        appendLog("[!] 未检测到运行中的 Hammer 汉化模块 IPC 窗口（请确保 Hammer 正在运行）", "#f92672");
+void MainWindow::writeAppDirPointer() {
+    if (m_cs2Root.empty()) return;
+    fs::path cs2Bin = fs::path(m_cs2Root) / L"game" / L"bin" / L"win64";
+    if (!fs::exists(cs2Bin)) return;
+    fs::path pointerFile = cs2Bin / L"localizer_appdir.txt";
+    bool useMachineTrans = (m_useMachineTransCheck != nullptr) ? m_useMachineTransCheck->isChecked() : true;
+    try {
+        std::wofstream ofs(pointerFile, std::ios::trunc);
+        if (ofs.is_open()) {
+            ofs << m_workingDir << L"\n";
+            ofs << L"use_machine_trans=" << (useMachineTrans ? 1 : 0) << L"\n";
+        }
+    } catch (...) {}
+}
+
+void MainWindow::setupFileWatcher() {
+    m_fileWatcher = new QFileSystemWatcher(this);
+    m_hotReloadDebounceTimer = new QTimer(this);
+    m_hotReloadDebounceTimer->setSingleShot(true);
+    m_hotReloadDebounceTimer->setInterval(300); // 300ms 防抖
+
+    connect(m_fileWatcher, &QFileSystemWatcher::fileChanged,
+            this, &MainWindow::onWatchedFileChanged);
+    connect(m_hotReloadDebounceTimer, &QTimer::timeout,
+            this, &MainWindow::onDebouncedHotReload);
+
+    fs::path transDir = fs::path(m_workingDir) / L"translations";
+    fs::path parentTransDir = fs::path(m_workingDir) / L".." / L"translations";
+
+    QStringList filesToWatch;
+    auto addDictFiles = [&](const fs::path& dir) {
+        filesToWatch << QString::fromStdWString((dir / L"qt_translations.jsonc").wstring());
+        filesToWatch << QString::fromStdWString((dir / L"qt_fallback.jsonc").wstring());
+        filesToWatch << QString::fromStdWString((dir / L"fgd_translations.jsonc").wstring());
+        filesToWatch << QString::fromStdWString((dir / L"fgd_override.jsonc").wstring());
+        filesToWatch << QString::fromStdWString((dir / L"fgd_fallback.jsonc").wstring());
+    };
+    addDictFiles(transDir);
+    if (fs::exists(parentTransDir)) {
+        addDictFiles(parentTransDir);
     }
+
+    for (const QString& f : filesToWatch) {
+        if (QFile::exists(f)) {
+            m_fileWatcher->addPath(f);
+        }
+    }
+}
+
+void MainWindow::onWatchedFileChanged(const QString& path) {
+    // 编辑器（如 VSCode/Notepad++）保存时可能采用原子替换机制，重新挂载监视路径
+    if (m_fileWatcher && !m_fileWatcher->files().contains(path) && QFile::exists(path)) {
+        m_fileWatcher->addPath(path);
+    }
+    if (m_hotReloadDebounceTimer) {
+        m_hotReloadDebounceTimer->start(); // 重启 300ms 防抖计时
+    }
+}
+
+void MainWindow::onDebouncedHotReload() {
+    fs::path transDir = fs::path(m_workingDir) / L"translations";
+    fs::path parentTransDir = fs::path(m_workingDir) / L".." / L"translations";
+
+    // 若在源码/开发目录中编辑了上层 translations，自动同步至当前程序运行目录
+    if (fs::exists(parentTransDir)) {
+        for (const auto& name : { L"qt_translations.jsonc", L"qt_fallback.jsonc", L"fgd_translations.jsonc", L"fgd_override.jsonc", L"fgd_fallback.jsonc" }) {
+            fs::path pSrc = parentTransDir / name;
+            fs::path pDst = transDir / name;
+            if (fs::exists(pSrc)) {
+                try {
+                    if (!fs::exists(pDst) || fs::last_write_time(pSrc) > fs::last_write_time(pDst)) {
+                        fs::copy_file(pSrc, pDst, fs::copy_options::overwrite_existing);
+                    }
+                } catch (...) {}
+            }
+        }
+    }
+
+    // 重新挂载可能因原子写入丢失的监视路径
+    QStringList filesToWatch;
+    auto addDictFiles = [&](const fs::path& dir) {
+        filesToWatch << QString::fromStdWString((dir / L"qt_translations.jsonc").wstring());
+        filesToWatch << QString::fromStdWString((dir / L"qt_fallback.jsonc").wstring());
+        filesToWatch << QString::fromStdWString((dir / L"fgd_translations.jsonc").wstring());
+        filesToWatch << QString::fromStdWString((dir / L"fgd_override.jsonc").wstring());
+        filesToWatch << QString::fromStdWString((dir / L"fgd_fallback.jsonc").wstring());
+    };
+    addDictFiles(transDir);
+    if (fs::exists(parentTransDir)) {
+        addDictFiles(parentTransDir);
+    }
+
+    for (const QString& f : filesToWatch) {
+        if (m_fileWatcher && !m_fileWatcher->files().contains(f) && QFile::exists(f)) {
+            m_fileWatcher->addPath(f);
+        }
+    }
+
+    HWND hWnd = FindWindowExW(HWND_MESSAGE, NULL, L"CS2_HAMMER_LOCALIZER_IPC", L"CS2_Hammer_Localizer_MsgWnd");
+    if (!hWnd) hWnd = FindWindowW(L"CS2_HAMMER_LOCALIZER_IPC", L"CS2_Hammer_Localizer_MsgWnd");
+
+    if (!m_isHammerRunning && !hWnd) {
+        appendLog("[📝] 检测到程序目录词典保存更新（已就绪，将在 Hammer 运行时即刻生效）", "#8b949e");
+        return;
+    }
+
+    appendLog("[⚡] 检测到程序目录词典更新，自动执行 FGD + Qt 全量热重载...", "#58a6ff");
+    performHotReload(true);
+}
+
+bool MainWindow::performHotReload(bool silent) {
+    // 1. 刷新路径指针（同步机翻兜底标志）
+    writeAppDirPointer();
+
+    bool useMachineTrans = (m_useMachineTransCheck != nullptr) ? m_useMachineTransCheck->isChecked() : true;
+
+    // 2. 镜像同步与合并 qt_translations.jsonc 到游戏目录（保障本地 fallback 完整）
+    fs::path srcQtJson = resolveJsonPath(m_workingDir, L"qt_translations.jsonc");
+    fs::path srcQtFallback = resolveJsonPath(m_workingDir, L"qt_fallback.jsonc");
+    fs::path cs2Bin = fs::path(m_cs2Root) / L"game" / L"bin" / L"win64";
+    fs::path destQtJson = cs2Bin / L"qt_translations.jsonc";
+    fs::path destQtFallback = cs2Bin / L"qt_fallback.jsonc";
+
+    if (fs::exists(cs2Bin)) {
+        // 同步 fallback 字典到游戏目录备份（如果存在）
+        if (fs::exists(srcQtFallback)) {
+            try {
+                fs::copy_file(srcQtFallback, destQtFallback, fs::copy_options::overwrite_existing);
+            } catch (...) {}
+        }
+        // 优先合并主词典与机翻兜底词典部署到游戏目录
+        std::wstring qtFallbackParam = (useMachineTrans && fs::exists(srcQtFallback)) ? srcQtFallback.wstring() : L"";
+        bool merged = false;
+        if (!qtFallbackParam.empty() && fs::exists(srcQtJson)) {
+            std::wstring mergeErr;
+            merged = DictionaryCompiler::MergeJsonFiles(srcQtJson.wstring(), qtFallbackParam, destQtJson.wstring(), mergeErr);
+        }
+        if (!merged && fs::exists(srcQtJson)) {
+            try {
+                fs::copy_file(srcQtJson, destQtJson, fs::copy_options::overwrite_existing);
+            } catch (...) {}
+        }
+    }
+
+    // 3. 联动重新编译并部署 FGD（引入 fgd_fallback 兜底）
+    fs::path transDir = fs::path(m_workingDir) / L"translations";
+    fs::path backupDir = fs::path(m_workingDir) / L"backup";
+    fs::path fgdDictPath = resolveJsonPath(m_workingDir, L"fgd_translations.jsonc");
+    fs::path fgdOverridePath = resolveJsonPath(m_workingDir, L"fgd_override.jsonc");
+    fs::path fgdFallbackPath = resolveJsonPath(m_workingDir, L"fgd_fallback.jsonc");
+
+    std::wstring fgdFallbackParam = (useMachineTrans && fs::exists(fgdFallbackPath)) ? fgdFallbackPath.wstring() : L"";
+
+    std::vector<std::wstring> transFgd;
+    std::wstring err;
+    bool fgdOk = FgdTranslator::TranslateAndDeployAll(
+        m_cs2Root,
+        backupDir.wstring(),
+        transDir.wstring(),
+        fgdDictPath.wstring(),
+        fgdOverridePath.wstring(),
+        transFgd,
+        err,
+        fgdFallbackParam
+    );
+
+    // 4. 发送 IPC 消息给 Hammer
+    bool ipcOk = sendIpcCommandToHammer(WM_LOCALIZER_RELOAD_DICT);
+
+    if (ipcOk) {
+        if (fgdOk) {
+            appendLog(QString("[⚡] 全量热重载成功！已重新编译覆盖 %1 个 FGD 实体文件，并刷新 Hammer 界面翻译%2")
+                .arg(transFgd.size())
+                .arg(useMachineTrans ? " (已载入机翻兜底)" : ""), "#a6e22e");
+        } else {
+            appendLog(QString("[⚡] Qt 界面翻译已热重载生效（FGD 重新部署提示: %1）").arg(QString::fromStdWString(err)), "#e6db74");
+        }
+        return true;
+    } else {
+        if (!silent) {
+            appendLog("[!] 未检测到运行中的 Hammer 汉化模块 IPC 窗口（已在磁盘完成 FGD 重新编译与词典同步）", "#d29922");
+        }
+        return false;
+    }
+}
+
+void MainWindow::onHotReloadClicked() {
+    performHotReload(false);
 }
 
 void MainWindow::onDebugClicked() {

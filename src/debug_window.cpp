@@ -1,4 +1,5 @@
 #include "debug_window.h"
+#include "mainwindow.h"
 #include <windows.h>
 #include <psapi.h>
 #include <tlhelp32.h>
@@ -398,6 +399,17 @@ void DebugWindow::onToggleLangClicked() {
 }
 
 void DebugWindow::onHotReloadClicked() {
+    MainWindow* mainWin = qobject_cast<MainWindow*>(parentWidget());
+    if (mainWin) {
+        bool ok = mainWin->performHotReload(false);
+        if (ok) {
+            m_txtHookLog->appendPlainText("[CLIENT] ⚡ FGD + Qt 词典全量热重载成功！无需重启 Hammer 即可渲染新翻译");
+        } else {
+            m_txtHookLog->appendPlainText("[CLIENT] ⚠️ 全量热重载执行完成（请检查启动器日志输出）");
+        }
+        return;
+    }
+
     HWND hIpc = FindHammerIpcWindow();
     if (!hIpc) {
         m_txtHookLog->appendPlainText("[CLIENT] 错误: 未检测到 Hammer IPC 窗口，无法热重载");
