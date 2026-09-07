@@ -54,6 +54,7 @@ set_target_properties(qtcore_qm PROPERTIES
 add_executable(CS2WorkshopToolsLocalizerCN WIN32
     src/main.cpp
     src/mainwindow.cpp
+    src/debug_window.cpp
     src/cs2_detector.cpp
     src/pe_patcher.cpp
     src/fgd_translator.cpp
@@ -81,6 +82,7 @@ target_link_libraries(CS2WorkshopToolsLocalizerCN PRIVATE
     user32
     shell32
     version
+    psapi
 )
 
 # 复制字典文件目录和 DLL 到输出目录方便调试运行

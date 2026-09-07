@@ -71,6 +71,10 @@ static fnQAction_setText g_o_QAction_setText = nullptr;
 static fnQAction_setToolTip g_o_QAction_setToolTip = nullptr;
 static fnQAction_setStatusTip g_o_QAction_setStatusTip = nullptr;
 static fnQAction_setWhatsThis g_o_QAction_setWhatsThis = nullptr;
+
+// 安全探测/更新标记：处于安全探测期间发生的异常属于预期的 SEH 捕获，VEH 绝对不应判定为崩溃或停用 Hook
+static std::atomic<bool> g_bInSafeProbe{false};
+
 static fnQAbstractButton_setText g_o_QAbstractButton_setText = nullptr;
 static fnQLabel_setText g_o_QLabel_setText = nullptr;
 static fnQWidget_setWindowTitle g_o_QWidget_setWindowTitle = nullptr;
@@ -106,13 +110,18 @@ static fnQString_dtor g_pfn_QString_dtor = nullptr;
 // ==============================================================================
 // 2. 单文件多子块字典存储与管理（Single-File Multi-Section Dict Manager）
 // ==============================================================================
+static std::atomic<bool> g_bTranslationEnabled{true};
+
 static std::unordered_map<std::string, std::string> g_CommonDict;
 static std::unordered_map<std::string, std::string> g_CommonCache;
+static std::unordered_map<std::string, std::string> g_CommonReverseDict;
 static std::unordered_map<std::wstring, std::unordered_map<std::string, std::string>> g_ScopedDicts;
 static std::unordered_map<std::wstring, std::unordered_map<std::string, std::string>> g_ScopedCaches;
+static std::unordered_map<std::wstring, std::unordered_map<std::string, std::string>> g_ScopedReverseDicts;
 static std::mutex g_DictMutex;
 static std::once_flag g_dictInitFlag;
 static std::atomic<bool> g_bDictLoaded{false};
+
 static std::atomic<bool> g_bTranslatorInitialized{false};
 static std::atomic<bool> g_bTranslatorInitFailed{false}; // 初始化失败后置位，避免每次 tr() 重试完整初始化
 static std::mutex g_TranslatorInitMutex;
@@ -417,6 +426,23 @@ static void LoadMasterTranslations() {
             g_CommonDict.size(), g_ScopedDicts.size());
     } else {
         LogHook("[DICT] Failed to load JSONC dictionary: %ls", err.c_str());
+    }
+
+    // 同步构建反向字典（用于一键切回英文与控件还原）
+    g_CommonReverseDict.clear();
+    for (const auto& kv : g_CommonDict) {
+        if (!kv.first.empty() && !kv.second.empty()) {
+            g_CommonReverseDict[kv.second] = kv.first;
+        }
+    }
+    g_ScopedReverseDicts.clear();
+    for (const auto& sec : g_ScopedDicts) {
+        auto& revMap = g_ScopedReverseDicts[sec.first];
+        for (const auto& kv : sec.second) {
+            if (!kv.first.empty() && !kv.second.empty()) {
+                revMap[kv.second] = kv.first;
+            }
+        }
     }
 }
 
@@ -765,6 +791,11 @@ static bool IsFilePathOrIdentifier(const std::string& s) {
 static bool FindTranslationScoped(void* callerAddr, const char* text, std::string& outResult, TranslationSource source = TranslationSource::StaticUI) {
     if (!text || text[0] == '\0') return false;
 
+    // 全局语言开关：若处于英文原生模式，直接放行英文原文
+    if (!g_bTranslationEnabled.load(std::memory_order_relaxed)) {
+        return false;
+    }
+
     // 若字典尚未由后台 Worker 线程加载完毕，绝不在此同步阻塞业务线程，直接返回 false
     if (!g_bDictLoaded.load(std::memory_order_acquire)) {
         return false;
@@ -1006,6 +1037,129 @@ static inline void SafeDestroyQString(fnQString_dtor pfn, void* pQString) {
     }
 }
 
+// ==============================================================================
+// 4.1 核心反向字典查找函数（用于英文模式下将已存在的中文即时还原回英文原文）
+// ==============================================================================
+static bool FindReverseTranslationScoped(void* callerAddr, const char* text, std::string& outResult) {
+    if (!text || text[0] == '\0') return false;
+    if (!g_bDictLoaded.load(std::memory_order_acquire)) return false;
+
+    // 极速 ASCII 守卫短路：如果不包含任何非 ASCII 字符 (byte >= 0x80)，绝不可能是中文字符串，直接 0 微秒返回
+    bool hasNonAscii = false;
+    for (const char* p = text; *p; ++p) {
+        if (static_cast<unsigned char>(*p) >= 0x80) {
+            hasNonAscii = true;
+            break;
+        }
+    }
+    if (!hasNonAscii) return false;
+
+    std::string textStr(text);
+    wchar_t callerStemBuf[64] = {0};
+    bool hasCaller = (callerAddr != nullptr && GetCallerModuleName(callerAddr, callerStemBuf, 64));
+    std::wstring callerStem = hasCaller ? callerStemBuf : L"";
+
+    std::lock_guard<std::mutex> lock(g_DictMutex);
+
+    // 1. 优先在 Caller 对应的 Scoped 反向字典中查找
+    if (hasCaller) {
+        auto itSec = g_ScopedReverseDicts.find(callerStem);
+        if (itSec != g_ScopedReverseDicts.end()) {
+            auto it = itSec->second.find(textStr);
+            if (it != itSec->second.end()) {
+                outResult = it->second;
+                return true;
+            }
+        }
+        if (callerStem != L"hammer") {
+            auto itHammer = g_ScopedReverseDicts.find(L"hammer");
+            if (itHammer != g_ScopedReverseDicts.end()) {
+                auto it = itHammer->second.find(textStr);
+                if (it != itHammer->second.end()) {
+                    outResult = it->second;
+                    return true;
+                }
+            }
+        }
+    }
+
+    // 2. 在公共反向字典中查找
+    auto itCommon = g_CommonReverseDict.find(textStr);
+    if (itCommon != g_CommonReverseDict.end()) {
+        outResult = itCommon->second;
+        return true;
+    }
+
+    return false;
+}
+
+static bool FindReverseTranslationScopedW(void* callerAddr, const wchar_t* wstr, std::string& outResult) {
+    if (!wstr || wstr[0] == L'\0') return false;
+    // 极速短路：如果所有字符都在 ASCII 范围内 (< 128)，直接返回 false
+    bool hasNonAscii = false;
+    for (const wchar_t* p = wstr; *p; ++p) {
+        if (*p >= 128) {
+            hasNonAscii = true;
+            break;
+        }
+    }
+    if (!hasNonAscii) return false;
+
+    char utf8Stack[1024] = {0};
+    int written = WideCharToMultiByte(CP_UTF8, 0, wstr, -1, utf8Stack, sizeof(utf8Stack), NULL, NULL);
+    if (written > 0) {
+        return FindReverseTranslationScoped(callerAddr, utf8Stack, outResult);
+    }
+    std::string dynamicUtf8 = WStringToUtf8(wstr);
+    if (!dynamicUtf8.empty()) {
+        return FindReverseTranslationScoped(callerAddr, dynamicUtf8.c_str(), outResult);
+    }
+    return false;
+}
+
+static void ToggleLanguage() {
+    bool current = g_bTranslationEnabled.load(std::memory_order_acquire);
+    bool next = !current;
+    g_bTranslationEnabled.store(next, std::memory_order_release);
+    LogHook("[LANG] Translation toggled: %s", next ? "ENABLED (Chinese)" : "DISABLED (English)");
+
+    // 广播重绘所有 CS2/Hammer 窗口，触发 QPainter 毫秒级双向无伤重绘，0 跨线程调用，0 堆踩踏风险
+    EnumWindows([](HWND hwnd, LPARAM lParam) -> BOOL {
+        DWORD pid = 0;
+        GetWindowThreadProcessId(hwnd, &pid);
+        if (pid == GetCurrentProcessId()) {
+            RedrawWindow(hwnd, NULL, NULL, RDW_INVALIDATE | RDW_ALLCHILDREN | RDW_ERASE | RDW_FRAME | RDW_UPDATENOW);
+        }
+        return TRUE;
+    }, 0);
+}
+
+static void ReloadTranslations() {
+    LogHook("[RELOAD] Reloading translations from disk...");
+    {
+        std::lock_guard<std::mutex> lock(g_DictMutex);
+        g_CommonDict.clear();
+        g_CommonCache.clear();
+        g_ScopedDicts.clear();
+        g_ScopedCaches.clear();
+        g_CommonReverseDict.clear();
+        g_ScopedReverseDicts.clear();
+        LoadMasterTranslations();
+    }
+
+    // 广播重绘所有 CS2/Hammer 窗口，使最新词典即刻渲染
+    EnumWindows([](HWND hwnd, LPARAM lParam) -> BOOL {
+        DWORD pid = 0;
+        GetWindowThreadProcessId(hwnd, &pid);
+        if (pid == GetCurrentProcessId()) {
+            RedrawWindow(hwnd, NULL, NULL, RDW_INVALIDATE | RDW_ALLCHILDREN | RDW_ERASE | RDW_FRAME | RDW_UPDATENOW);
+        }
+        return TRUE;
+    }, 0);
+
+    LogHook("[RELOAD] Translations reloaded successfully");
+}
+
 extern "C" __declspec(dllexport) bool InitializeTranslator();
 static inline void EnsureInitialized() {
     if (!g_bTranslatorInitialized.load(std::memory_order_acquire)) {
@@ -1036,13 +1190,19 @@ extern "C" __declspec(dllexport) void* __fastcall tr(const void* pMetaObject, vo
     return hk_QMetaObject_tr(pMetaObject, pOutQString, sourceText, disambiguation, n);
 }
 
-// 2. QPainter::drawText (全面覆盖 PropertyEditor 属性面板与树形表格渲染)
+// 2. QPainter::drawText (全面覆盖 PropertyEditor 属性面板与树形表格渲染，支持双向即时无损渲染)
 static void __fastcall hk_QPainter_drawText_Rect(void* pPainter, const void* pRect, int flags, const void* pQString, void* pBoundingRect) {
     void* caller = _ReturnAddress();
     const wchar_t* wstr = nullptr;
     if (SafeGetUtf16(g_pfn_utf16, pQString, wstr)) {
         std::string trans;
-        if (FindTranslationScopedW(caller, wstr, trans, TranslationSource::Painter)) {
+        bool found = false;
+        if (g_bTranslationEnabled.load(std::memory_order_relaxed)) {
+            found = FindTranslationScopedW(caller, wstr, trans, TranslationSource::Painter);
+        } else {
+            found = FindReverseTranslationScopedW(caller, wstr, trans);
+        }
+        if (found) {
             void* qstr[1] = {0};
             if (SafeCreateQString(g_pfn_fromUtf8, qstr, trans.c_str(), (int)trans.length())) {
                 if (g_o_QPainter_drawText_Rect) g_o_QPainter_drawText_Rect(pPainter, pRect, flags, qstr, pBoundingRect);
@@ -1059,7 +1219,13 @@ static void __fastcall hk_QPainter_drawText_RectF(void* pPainter, const void* pR
     const wchar_t* wstr = nullptr;
     if (SafeGetUtf16(g_pfn_utf16, pQString, wstr)) {
         std::string trans;
-        if (FindTranslationScopedW(caller, wstr, trans, TranslationSource::Painter)) {
+        bool found = false;
+        if (g_bTranslationEnabled.load(std::memory_order_relaxed)) {
+            found = FindTranslationScopedW(caller, wstr, trans, TranslationSource::Painter);
+        } else {
+            found = FindReverseTranslationScopedW(caller, wstr, trans);
+        }
+        if (found) {
             void* qstr[1] = {0};
             if (SafeCreateQString(g_pfn_fromUtf8, qstr, trans.c_str(), (int)trans.length())) {
                 if (g_o_QPainter_drawText_RectF) g_o_QPainter_drawText_RectF(pPainter, pRectF, flags, qstr, pBoundingRect);
@@ -1076,7 +1242,13 @@ static void __fastcall hk_QPainter_drawText_PointF(void* pPainter, const void* p
     const wchar_t* wstr = nullptr;
     if (SafeGetUtf16(g_pfn_utf16, pQString, wstr)) {
         std::string trans;
-        if (FindTranslationScopedW(caller, wstr, trans, TranslationSource::Painter)) {
+        bool found = false;
+        if (g_bTranslationEnabled.load(std::memory_order_relaxed)) {
+            found = FindTranslationScopedW(caller, wstr, trans, TranslationSource::Painter);
+        } else {
+            found = FindReverseTranslationScopedW(caller, wstr, trans);
+        }
+        if (found) {
             void* qstr[1] = {0};
             if (SafeCreateQString(g_pfn_fromUtf8, qstr, trans.c_str(), (int)trans.length())) {
                 if (g_o_QPainter_drawText_PointF) g_o_QPainter_drawText_PointF(pPainter, pPointF, qstr);
@@ -1093,7 +1265,13 @@ static void __fastcall hk_QPainter_drawText_RectF_Option(void* pPainter, const v
     const wchar_t* wstr = nullptr;
     if (SafeGetUtf16(g_pfn_utf16, pQString, wstr)) {
         std::string trans;
-        if (FindTranslationScopedW(caller, wstr, trans, TranslationSource::Painter)) {
+        bool found = false;
+        if (g_bTranslationEnabled.load(std::memory_order_relaxed)) {
+            found = FindTranslationScopedW(caller, wstr, trans, TranslationSource::Painter);
+        } else {
+            found = FindReverseTranslationScopedW(caller, wstr, trans);
+        }
+        if (found) {
             void* qstr[1] = {0};
             if (SafeCreateQString(g_pfn_fromUtf8, qstr, trans.c_str(), (int)trans.length())) {
                 if (g_o_QPainter_drawText_RectF_Option) g_o_QPainter_drawText_RectF_Option(pPainter, pRectF, qstr, pOption);
@@ -1110,7 +1288,13 @@ static void __fastcall hk_QPainter_drawText_Point(void* pPainter, const void* pP
     const wchar_t* wstr = nullptr;
     if (SafeGetUtf16(g_pfn_utf16, pQString, wstr)) {
         std::string trans;
-        if (FindTranslationScopedW(caller, wstr, trans, TranslationSource::Painter)) {
+        bool found = false;
+        if (g_bTranslationEnabled.load(std::memory_order_relaxed)) {
+            found = FindTranslationScopedW(caller, wstr, trans, TranslationSource::Painter);
+        } else {
+            found = FindReverseTranslationScopedW(caller, wstr, trans);
+        }
+        if (found) {
             void* qstr[1] = {0};
             if (SafeCreateQString(g_pfn_fromUtf8, qstr, trans.c_str(), (int)trans.length())) {
                 if (g_o_QPainter_drawText_Point) g_o_QPainter_drawText_Point(pPainter, pPoint, qstr);
@@ -1127,7 +1311,13 @@ static void __fastcall hk_QPainter_drawText_xy(void* pPainter, int x, int y, con
     const wchar_t* wstr = nullptr;
     if (SafeGetUtf16(g_pfn_utf16, pQString, wstr)) {
         std::string trans;
-        if (FindTranslationScopedW(caller, wstr, trans, TranslationSource::Painter)) {
+        bool found = false;
+        if (g_bTranslationEnabled.load(std::memory_order_relaxed)) {
+            found = FindTranslationScopedW(caller, wstr, trans, TranslationSource::Painter);
+        } else {
+            found = FindReverseTranslationScopedW(caller, wstr, trans);
+        }
+        if (found) {
             void* qstr[1] = {0};
             if (SafeCreateQString(g_pfn_fromUtf8, qstr, trans.c_str(), (int)trans.length())) {
                 if (g_o_QPainter_drawText_xy) g_o_QPainter_drawText_xy(pPainter, x, y, qstr);
@@ -1145,7 +1335,13 @@ static void __fastcall hk_QTextDocument_setPlainText(void* pDoc, const void* pQS
     const wchar_t* wstr = nullptr;
     if (SafeGetUtf16(g_pfn_utf16, pQString, wstr)) {
         std::string trans;
-        if (FindTranslationScopedW(caller, wstr, trans, TranslationSource::StaticUI)) {
+        bool found = false;
+        if (g_bTranslationEnabled.load(std::memory_order_relaxed)) {
+            found = FindTranslationScopedW(caller, wstr, trans, TranslationSource::StaticUI);
+        } else {
+            found = FindReverseTranslationScopedW(caller, wstr, trans);
+        }
+        if (found) {
             void* qstr[1] = {0};
             if (SafeCreateQString(g_pfn_fromUtf8, qstr, trans.c_str(), (int)trans.length())) {
                 if (g_o_QTextDocument_setPlainText) g_o_QTextDocument_setPlainText(pDoc, qstr);
@@ -1162,7 +1358,13 @@ static void __fastcall hk_QTextDocument_setHtml(void* pDoc, const void* pQString
     const wchar_t* wstr = nullptr;
     if (SafeGetUtf16(g_pfn_utf16, pQString, wstr)) {
         std::string trans;
-        if (FindTranslationScopedW(caller, wstr, trans, TranslationSource::StaticUI)) {
+        bool found = false;
+        if (g_bTranslationEnabled.load(std::memory_order_relaxed)) {
+            found = FindTranslationScopedW(caller, wstr, trans, TranslationSource::StaticUI);
+        } else {
+            found = FindReverseTranslationScopedW(caller, wstr, trans);
+        }
+        if (found) {
             void* qstr[1] = {0};
             if (SafeCreateQString(g_pfn_fromUtf8, qstr, trans.c_str(), (int)trans.length())) {
                 if (g_o_QTextDocument_setHtml) g_o_QTextDocument_setHtml(pDoc, qstr);
@@ -1180,7 +1382,13 @@ static void* __fastcall hk_QAction_ctor(void* pAction, const void* pQString, voi
     const wchar_t* wstr = nullptr;
     if (SafeGetUtf16(g_pfn_utf16, pQString, wstr)) {
         std::string trans;
-        if (FindTranslationScopedW(caller, wstr, trans)) {
+        bool found = false;
+        if (g_bTranslationEnabled.load(std::memory_order_relaxed)) {
+            found = FindTranslationScopedW(caller, wstr, trans);
+        } else {
+            found = FindReverseTranslationScopedW(caller, wstr, trans);
+        }
+        if (found) {
             void* qstr[1] = {0};
             if (SafeCreateQString(g_pfn_fromUtf8, qstr, trans.c_str(), (int)trans.length())) {
                 void* res = g_o_QAction_ctor(pAction, qstr, pParent);
@@ -1197,7 +1405,13 @@ static void* __fastcall hk_QAction_ctor_icon(void* pAction, const void* pIcon, c
     const wchar_t* wstr = nullptr;
     if (SafeGetUtf16(g_pfn_utf16, pQString, wstr)) {
         std::string trans;
-        if (FindTranslationScopedW(caller, wstr, trans)) {
+        bool found = false;
+        if (g_bTranslationEnabled.load(std::memory_order_relaxed)) {
+            found = FindTranslationScopedW(caller, wstr, trans);
+        } else {
+            found = FindReverseTranslationScopedW(caller, wstr, trans);
+        }
+        if (found) {
             void* qstr[1] = {0};
             if (SafeCreateQString(g_pfn_fromUtf8, qstr, trans.c_str(), (int)trans.length())) {
                 void* res = g_o_QAction_ctor_icon(pAction, pIcon, qstr, pParent);
@@ -1208,12 +1422,19 @@ static void* __fastcall hk_QAction_ctor_icon(void* pAction, const void* pIcon, c
     }
     return g_o_QAction_ctor_icon(pAction, pIcon, pQString, pParent);
 }
+
 static void __fastcall hk_QAction_setText(void* pAction, const void* pQString) {
     void* caller = _ReturnAddress();
     const wchar_t* wstr = nullptr;
     if (SafeGetUtf16(g_pfn_utf16, pQString, wstr)) {
         std::string trans;
-        if (FindTranslationScopedW(caller, wstr, trans)) {
+        bool found = false;
+        if (g_bTranslationEnabled.load(std::memory_order_relaxed)) {
+            found = FindTranslationScopedW(caller, wstr, trans);
+        } else {
+            found = FindReverseTranslationScopedW(caller, wstr, trans);
+        }
+        if (found) {
             void* qstr[1] = {0};
             if (SafeCreateQString(g_pfn_fromUtf8, qstr, trans.c_str(), (int)trans.length())) {
                 if (g_o_QAction_setText) g_o_QAction_setText(pAction, qstr);
@@ -1230,7 +1451,13 @@ static void __fastcall hk_QAction_setToolTip(void* pAction, const void* pQString
     const wchar_t* wstr = nullptr;
     if (SafeGetUtf16(g_pfn_utf16, pQString, wstr)) {
         std::string trans;
-        if (FindTranslationScopedW(caller, wstr, trans)) {
+        bool found = false;
+        if (g_bTranslationEnabled.load(std::memory_order_relaxed)) {
+            found = FindTranslationScopedW(caller, wstr, trans);
+        } else {
+            found = FindReverseTranslationScopedW(caller, wstr, trans);
+        }
+        if (found) {
             void* qstr[1] = {0};
             if (SafeCreateQString(g_pfn_fromUtf8, qstr, trans.c_str(), (int)trans.length())) {
                 if (g_o_QAction_setToolTip) g_o_QAction_setToolTip(pAction, qstr);
@@ -1247,7 +1474,13 @@ static void __fastcall hk_QAction_setStatusTip(void* pAction, const void* pQStri
     const wchar_t* wstr = nullptr;
     if (SafeGetUtf16(g_pfn_utf16, pQString, wstr)) {
         std::string trans;
-        if (FindTranslationScopedW(caller, wstr, trans)) {
+        bool found = false;
+        if (g_bTranslationEnabled.load(std::memory_order_relaxed)) {
+            found = FindTranslationScopedW(caller, wstr, trans);
+        } else {
+            found = FindReverseTranslationScopedW(caller, wstr, trans);
+        }
+        if (found) {
             void* qstr[1] = {0};
             if (SafeCreateQString(g_pfn_fromUtf8, qstr, trans.c_str(), (int)trans.length())) {
                 if (g_o_QAction_setStatusTip) g_o_QAction_setStatusTip(pAction, qstr);
@@ -1264,7 +1497,13 @@ static void __fastcall hk_QAction_setWhatsThis(void* pAction, const void* pQStri
     const wchar_t* wstr = nullptr;
     if (SafeGetUtf16(g_pfn_utf16, pQString, wstr)) {
         std::string trans;
-        if (FindTranslationScopedW(caller, wstr, trans)) {
+        bool found = false;
+        if (g_bTranslationEnabled.load(std::memory_order_relaxed)) {
+            found = FindTranslationScopedW(caller, wstr, trans);
+        } else {
+            found = FindReverseTranslationScopedW(caller, wstr, trans);
+        }
+        if (found) {
             void* qstr[1] = {0};
             if (SafeCreateQString(g_pfn_fromUtf8, qstr, trans.c_str(), (int)trans.length())) {
                 if (g_o_QAction_setWhatsThis) g_o_QAction_setWhatsThis(pAction, qstr);
@@ -1282,7 +1521,13 @@ static void __fastcall hk_QAbstractButton_setText(void* pButton, const void* pQS
     const wchar_t* wstr = nullptr;
     if (SafeGetUtf16(g_pfn_utf16, pQString, wstr)) {
         std::string trans;
-        if (FindTranslationScopedW(caller, wstr, trans)) {
+        bool found = false;
+        if (g_bTranslationEnabled.load(std::memory_order_relaxed)) {
+            found = FindTranslationScopedW(caller, wstr, trans);
+        } else {
+            found = FindReverseTranslationScopedW(caller, wstr, trans);
+        }
+        if (found) {
             void* qstr[1] = {0};
             if (SafeCreateQString(g_pfn_fromUtf8, qstr, trans.c_str(), (int)trans.length())) {
                 if (g_o_QAbstractButton_setText) g_o_QAbstractButton_setText(pButton, qstr);
@@ -1299,7 +1544,13 @@ static void __fastcall hk_QLabel_setText(void* pLabel, const void* pQString) {
     const wchar_t* wstr = nullptr;
     if (SafeGetUtf16(g_pfn_utf16, pQString, wstr)) {
         std::string trans;
-        if (FindTranslationScopedW(caller, wstr, trans)) {
+        bool found = false;
+        if (g_bTranslationEnabled.load(std::memory_order_relaxed)) {
+            found = FindTranslationScopedW(caller, wstr, trans);
+        } else {
+            found = FindReverseTranslationScopedW(caller, wstr, trans);
+        }
+        if (found) {
             void* qstr[1] = {0};
             if (SafeCreateQString(g_pfn_fromUtf8, qstr, trans.c_str(), (int)trans.length())) {
                 if (g_o_QLabel_setText) g_o_QLabel_setText(pLabel, qstr);
@@ -1316,7 +1567,13 @@ static void __fastcall hk_QWidget_setWindowTitle(void* pWidget, const void* pQSt
     const wchar_t* wstr = nullptr;
     if (SafeGetUtf16(g_pfn_utf16, pQString, wstr)) {
         std::string trans;
-        if (FindTranslationScopedW(caller, wstr, trans)) {
+        bool found = false;
+        if (g_bTranslationEnabled.load(std::memory_order_relaxed)) {
+            found = FindTranslationScopedW(caller, wstr, trans);
+        } else {
+            found = FindReverseTranslationScopedW(caller, wstr, trans);
+        }
+        if (found) {
             void* qstr[1] = {0};
             if (SafeCreateQString(g_pfn_fromUtf8, qstr, trans.c_str(), (int)trans.length())) {
                 if (g_o_QWidget_setWindowTitle) g_o_QWidget_setWindowTitle(pWidget, qstr);
@@ -1333,7 +1590,13 @@ static void __fastcall hk_QGroupBox_setTitle(void* pBox, const void* pQString) {
     const wchar_t* wstr = nullptr;
     if (SafeGetUtf16(g_pfn_utf16, pQString, wstr)) {
         std::string trans;
-        if (FindTranslationScopedW(caller, wstr, trans)) {
+        bool found = false;
+        if (g_bTranslationEnabled.load(std::memory_order_relaxed)) {
+            found = FindTranslationScopedW(caller, wstr, trans);
+        } else {
+            found = FindReverseTranslationScopedW(caller, wstr, trans);
+        }
+        if (found) {
             void* qstr[1] = {0};
             if (SafeCreateQString(g_pfn_fromUtf8, qstr, trans.c_str(), (int)trans.length())) {
                 if (g_o_QGroupBox_setTitle) g_o_QGroupBox_setTitle(pBox, qstr);
@@ -1351,7 +1614,13 @@ static void __fastcall hk_QTreeWidgetItem_setText(void* pItem, int column, const
     const wchar_t* wstr = nullptr;
     if (SafeGetUtf16(g_pfn_utf16, pQString, wstr)) {
         std::string trans;
-        if (FindTranslationScopedW(caller, wstr, trans, TranslationSource::ItemWidget)) {
+        bool found = false;
+        if (g_bTranslationEnabled.load(std::memory_order_relaxed)) {
+            found = FindTranslationScopedW(caller, wstr, trans, TranslationSource::ItemWidget);
+        } else {
+            found = FindReverseTranslationScopedW(caller, wstr, trans);
+        }
+        if (found) {
             void* qstr[1] = {0};
             if (SafeCreateQString(g_pfn_fromUtf8, qstr, trans.c_str(), (int)trans.length())) {
                 if (g_o_QTreeWidgetItem_setText) g_o_QTreeWidgetItem_setText(pItem, column, qstr);
@@ -1368,7 +1637,13 @@ static void __fastcall hk_QTreeWidget_setHeaderLabel(void* pTree, const void* pQ
     const wchar_t* wstr = nullptr;
     if (SafeGetUtf16(g_pfn_utf16, pQString, wstr)) {
         std::string trans;
-        if (FindTranslationScopedW(caller, wstr, trans, TranslationSource::ItemWidget)) {
+        bool found = false;
+        if (g_bTranslationEnabled.load(std::memory_order_relaxed)) {
+            found = FindTranslationScopedW(caller, wstr, trans, TranslationSource::ItemWidget);
+        } else {
+            found = FindReverseTranslationScopedW(caller, wstr, trans);
+        }
+        if (found) {
             void* qstr[1] = {0};
             if (SafeCreateQString(g_pfn_fromUtf8, qstr, trans.c_str(), (int)trans.length())) {
                 if (g_o_QTreeWidget_setHeaderLabel) g_o_QTreeWidget_setHeaderLabel(pTree, qstr);
@@ -1385,7 +1660,13 @@ static void* __fastcall hk_QTableWidgetItem_ctor(void* pItem, const void* pQStri
     const wchar_t* wstr = nullptr;
     if (SafeGetUtf16(g_pfn_utf16, pQString, wstr)) {
         std::string trans;
-        if (FindTranslationScopedW(caller, wstr, trans, TranslationSource::ItemWidget)) {
+        bool found = false;
+        if (g_bTranslationEnabled.load(std::memory_order_relaxed)) {
+            found = FindTranslationScopedW(caller, wstr, trans, TranslationSource::ItemWidget);
+        } else {
+            found = FindReverseTranslationScopedW(caller, wstr, trans);
+        }
+        if (found) {
             void* qstr[1] = {0};
             if (SafeCreateQString(g_pfn_fromUtf8, qstr, trans.c_str(), (int)trans.length())) {
                 void* res = g_o_QTableWidgetItem_ctor(pItem, qstr, type);
@@ -1402,7 +1683,13 @@ static void __fastcall hk_QTableWidgetItem_setText(void* pItem, const void* pQSt
     const wchar_t* wstr = nullptr;
     if (SafeGetUtf16(g_pfn_utf16, pQString, wstr)) {
         std::string trans;
-        if (FindTranslationScopedW(caller, wstr, trans, TranslationSource::ItemWidget)) {
+        bool found = false;
+        if (g_bTranslationEnabled.load(std::memory_order_relaxed)) {
+            found = FindTranslationScopedW(caller, wstr, trans, TranslationSource::ItemWidget);
+        } else {
+            found = FindReverseTranslationScopedW(caller, wstr, trans);
+        }
+        if (found) {
             void* qstr[1] = {0};
             if (SafeCreateQString(g_pfn_fromUtf8, qstr, trans.c_str(), (int)trans.length())) {
                 if (g_o_QTableWidgetItem_setText) g_o_QTableWidgetItem_setText(pItem, qstr);
@@ -1419,7 +1706,13 @@ static void* __fastcall hk_QListWidgetItem_ctor(void* pItem, const void* pQStrin
     const wchar_t* wstr = nullptr;
     if (SafeGetUtf16(g_pfn_utf16, pQString, wstr)) {
         std::string trans;
-        if (FindTranslationScopedW(caller, wstr, trans, TranslationSource::ItemWidget)) {
+        bool found = false;
+        if (g_bTranslationEnabled.load(std::memory_order_relaxed)) {
+            found = FindTranslationScopedW(caller, wstr, trans, TranslationSource::ItemWidget);
+        } else {
+            found = FindReverseTranslationScopedW(caller, wstr, trans);
+        }
+        if (found) {
             void* qstr[1] = {0};
             if (SafeCreateQString(g_pfn_fromUtf8, qstr, trans.c_str(), (int)trans.length())) {
                 void* res = g_o_QListWidgetItem_ctor(pItem, qstr, pListWidget, type);
@@ -1436,7 +1729,13 @@ static void __fastcall hk_QListWidgetItem_setText(void* pItem, const void* pQStr
     const wchar_t* wstr = nullptr;
     if (SafeGetUtf16(g_pfn_utf16, pQString, wstr)) {
         std::string trans;
-        if (FindTranslationScopedW(caller, wstr, trans, TranslationSource::ItemWidget)) {
+        bool found = false;
+        if (g_bTranslationEnabled.load(std::memory_order_relaxed)) {
+            found = FindTranslationScopedW(caller, wstr, trans, TranslationSource::ItemWidget);
+        } else {
+            found = FindReverseTranslationScopedW(caller, wstr, trans);
+        }
+        if (found) {
             void* qstr[1] = {0};
             if (SafeCreateQString(g_pfn_fromUtf8, qstr, trans.c_str(), (int)trans.length())) {
                 if (g_o_QListWidgetItem_setText) g_o_QListWidgetItem_setText(pItem, qstr);
@@ -1453,7 +1752,13 @@ static void __fastcall hk_QComboBox_addItem(void* pBox, const void* pQString, co
     const wchar_t* wstr = nullptr;
     if (SafeGetUtf16(g_pfn_utf16, pQString, wstr)) {
         std::string trans;
-        if (FindTranslationScopedW(caller, wstr, trans, TranslationSource::ItemWidget)) {
+        bool found = false;
+        if (g_bTranslationEnabled.load(std::memory_order_relaxed)) {
+            found = FindTranslationScopedW(caller, wstr, trans, TranslationSource::ItemWidget);
+        } else {
+            found = FindReverseTranslationScopedW(caller, wstr, trans);
+        }
+        if (found) {
             void* qstr[1] = {0};
             if (SafeCreateQString(g_pfn_fromUtf8, qstr, trans.c_str(), (int)trans.length())) {
                 if (g_o_QComboBox_addItem) g_o_QComboBox_addItem(pBox, qstr, pUserData);
@@ -1470,7 +1775,13 @@ static void __fastcall hk_QComboBox_addItem_icon(void* pBox, const void* pIcon, 
     const wchar_t* wstr = nullptr;
     if (SafeGetUtf16(g_pfn_utf16, pQString, wstr)) {
         std::string trans;
-        if (FindTranslationScopedW(caller, wstr, trans, TranslationSource::ItemWidget)) {
+        bool found = false;
+        if (g_bTranslationEnabled.load(std::memory_order_relaxed)) {
+            found = FindTranslationScopedW(caller, wstr, trans, TranslationSource::ItemWidget);
+        } else {
+            found = FindReverseTranslationScopedW(caller, wstr, trans);
+        }
+        if (found) {
             void* qstr[1] = {0};
             if (SafeCreateQString(g_pfn_fromUtf8, qstr, trans.c_str(), (int)trans.length())) {
                 if (g_o_QComboBox_addItem_icon) g_o_QComboBox_addItem_icon(pBox, pIcon, qstr, pUserData);
@@ -1487,7 +1798,13 @@ static void __fastcall hk_QComboBox_setItemText(void* pBox, int index, const voi
     const wchar_t* wstr = nullptr;
     if (SafeGetUtf16(g_pfn_utf16, pQString, wstr)) {
         std::string trans;
-        if (FindTranslationScopedW(caller, wstr, trans, TranslationSource::ItemWidget)) {
+        bool found = false;
+        if (g_bTranslationEnabled.load(std::memory_order_relaxed)) {
+            found = FindTranslationScopedW(caller, wstr, trans, TranslationSource::ItemWidget);
+        } else {
+            found = FindReverseTranslationScopedW(caller, wstr, trans);
+        }
+        if (found) {
             void* qstr[1] = {0};
             if (SafeCreateQString(g_pfn_fromUtf8, qstr, trans.c_str(), (int)trans.length())) {
                 if (g_o_QComboBox_setItemText) g_o_QComboBox_setItemText(pBox, index, qstr);
@@ -1504,7 +1821,13 @@ static void __fastcall hk_QComboBox_insertItem(void* pBox, int index, const void
     const wchar_t* wstr = nullptr;
     if (SafeGetUtf16(g_pfn_utf16, pQString, wstr)) {
         std::string trans;
-        if (FindTranslationScopedW(caller, wstr, trans, TranslationSource::ItemWidget)) {
+        bool found = false;
+        if (g_bTranslationEnabled.load(std::memory_order_relaxed)) {
+            found = FindTranslationScopedW(caller, wstr, trans, TranslationSource::ItemWidget);
+        } else {
+            found = FindReverseTranslationScopedW(caller, wstr, trans);
+        }
+        if (found) {
             void* qstr[1] = {0};
             if (SafeCreateQString(g_pfn_fromUtf8, qstr, trans.c_str(), (int)trans.length())) {
                 if (g_o_QComboBox_insertItem) g_o_QComboBox_insertItem(pBox, index, qstr, pUserData);
@@ -1521,7 +1844,13 @@ static void __fastcall hk_QComboBox_insertItem_icon(void* pBox, int index, const
     const wchar_t* wstr = nullptr;
     if (SafeGetUtf16(g_pfn_utf16, pQString, wstr)) {
         std::string trans;
-        if (FindTranslationScopedW(caller, wstr, trans, TranslationSource::ItemWidget)) {
+        bool found = false;
+        if (g_bTranslationEnabled.load(std::memory_order_relaxed)) {
+            found = FindTranslationScopedW(caller, wstr, trans, TranslationSource::ItemWidget);
+        } else {
+            found = FindReverseTranslationScopedW(caller, wstr, trans);
+        }
+        if (found) {
             void* qstr[1] = {0};
             if (SafeCreateQString(g_pfn_fromUtf8, qstr, trans.c_str(), (int)trans.length())) {
                 if (g_o_QComboBox_insertItem_icon) g_o_QComboBox_insertItem_icon(pBox, index, pIcon, qstr, pUserData);
@@ -1819,8 +2148,40 @@ static void ProcessCrashReportAsync() {
     }
 }
 
+#define WM_LOCALIZER_TOGGLE_LANG   (WM_USER + 101)
+#define WM_LOCALIZER_RELOAD_DICT   (WM_USER + 102)
+#define WM_LOCALIZER_QUERY_STATUS  (WM_USER + 103)
+
+static const wchar_t* IPC_WINDOW_CLASS = L"CS2_HAMMER_LOCALIZER_IPC";
+static const wchar_t* IPC_WINDOW_NAME  = L"CS2_Hammer_Localizer_MsgWnd";
+
+static LRESULT CALLBACK LocalizerIpcWndProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lParam) {
+    if (uMsg == WM_LOCALIZER_TOGGLE_LANG) {
+        LogHook("[IPC] Received WM_LOCALIZER_TOGGLE_LANG from launcher");
+        ToggleLanguage();
+        return g_bTranslationEnabled.load(std::memory_order_relaxed) ? 1 : 2;
+    } else if (uMsg == WM_LOCALIZER_RELOAD_DICT) {
+        LogHook("[IPC] Received WM_LOCALIZER_RELOAD_DICT from launcher");
+        ReloadTranslations();
+        return 1;
+    } else if (uMsg == WM_LOCALIZER_QUERY_STATUS) {
+        return g_bTranslationEnabled.load(std::memory_order_relaxed) ? 1 : 2;
+    }
+    return DefWindowProcW(hWnd, uMsg, wParam, lParam);
+}
+
 static DWORD WINAPI ToolsHookThread(LPVOID lpParam) {
     LogHook("[THREAD] ToolsHookThread started");
+
+    // 注册并创建隐藏 IPC 消息窗口（供启动器远程发送控制指令）
+    WNDCLASSEXW ipcWc = { sizeof(WNDCLASSEXW) };
+    ipcWc.lpfnWndProc = LocalizerIpcWndProc;
+    ipcWc.hInstance = g_hModule;
+    ipcWc.lpszClassName = IPC_WINDOW_CLASS;
+    RegisterClassExW(&ipcWc);
+
+    HWND hIpcWnd = CreateWindowExW(0, IPC_WINDOW_CLASS, IPC_WINDOW_NAME, 0, 0, 0, 0, 0, HWND_MESSAGE, NULL, g_hModule, NULL);
+    LogHook("[IPC] Message window created: %p", hIpcWnd);
 
     // 在后台独立线程中预加载字典与扫描工具模块
     EnsureDictionaryLoaded();
@@ -1829,6 +2190,13 @@ static DWORD WINAPI ToolsHookThread(LPVOID lpParam) {
     HANDLE waitHandles[2] = { g_hWakeHookEvent, g_hCrashReportEvent };
 
     while (!g_bStopHookThread.load(std::memory_order_relaxed)) {
+        // 泵送 IPC 窗口消息
+        MSG msg;
+        while (PeekMessageW(&msg, NULL, 0, 0, PM_REMOVE)) {
+            TranslateMessage(&msg);
+            DispatchMessageW(&msg);
+        }
+
         if (!g_bWidgetsHooked.load(std::memory_order_relaxed) || !g_bGuiHooked.load(std::memory_order_relaxed)) {
             TryHookQtToolsModules();
         }
@@ -1859,7 +2227,7 @@ static DWORD WINAPI ToolsHookThread(LPVOID lpParam) {
         }
 
         DWORD timeout = (g_bWidgetsHooked.load() && g_bGuiHooked.load()) ? 500 : 50;
-        DWORD waitRes = WaitForMultipleObjects(2, waitHandles, FALSE, timeout);
+        DWORD waitRes = MsgWaitForMultipleObjectsEx(2, waitHandles, timeout, QS_ALLINPUT, MWMO_INPUTAVAILABLE);
         if (waitRes == WAIT_OBJECT_0 + 1) {
             ProcessCrashReportAsync();
             break;
@@ -1869,6 +2237,11 @@ static DWORD WINAPI ToolsHookThread(LPVOID lpParam) {
     if (g_CrashSnapshot.captured.load(std::memory_order_acquire)) {
         ProcessCrashReportAsync();
     }
+
+    if (hIpcWnd) {
+        DestroyWindow(hIpcWnd);
+    }
+    UnregisterClassW(IPC_WINDOW_CLASS, g_hModule);
 
     LogHook("[THREAD] ToolsHookThread finishing (widgets=%d, gui=%d, stopRequested=%d)",
         g_bWidgetsHooked.load(), g_bGuiHooked.load(), g_bStopHookThread.load());
@@ -1893,6 +2266,11 @@ static bool IsToolAddress(void* rip) {
 // 极简 VEH 异常拦截器：严格保持 0 锁、0 LoadLibrary、0 文件 I/O、0 MiniDump
 static LONG WINAPI DiagnosticCrashLoggerVEH(PEXCEPTION_POINTERS pExceptionInfo) {
     if (!pExceptionInfo || !pExceptionInfo->ExceptionRecord || !pExceptionInfo->ContextRecord) {
+        return EXCEPTION_CONTINUE_SEARCH;
+    }
+
+    // 若当前处于安全对象探测/更新期间，异常由外层 SEH 专门安全捕获，绝对不作为崩溃捕获
+    if (g_bInSafeProbe.load(std::memory_order_relaxed)) {
         return EXCEPTION_CONTINUE_SEARCH;
     }
 

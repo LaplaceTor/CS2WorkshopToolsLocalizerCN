@@ -269,7 +269,16 @@ int main() {
     // 部署至实际 CS2 目录供实时调试
     fs::path realCs2Qt = fs::path(cs2Root) / L"game" / L"bin" / L"win64" / L"Qt5Core.dll";
     fs::copy_file(tempPatched, realCs2Qt, fs::copy_options::overwrite_existing);
-    std::cout << "[Test 3.4] Deployed patched Qt5Core.dll to live CS2 bin directory: PASSED\n";
+    fs::path liveQm = fs::path(cs2Root) / L"game" / L"bin" / L"win64" / L"qtcore_qm.dll";
+    fs::path liveJson = fs::path(cs2Root) / L"game" / L"bin" / L"win64" / L"qt_translations.jsonc";
+    fs::path qmSrc = fs::exists(fs::current_path() / L"qtcore_qm.dll") ? (fs::current_path() / L"qtcore_qm.dll") : (fs::current_path() / L"build" / L"qtcore_qm.dll");
+    fs::path jsonSrc = fs::exists(fs::current_path() / L"translations" / L"qt_translations.jsonc") ? (fs::current_path() / L"translations" / L"qt_translations.jsonc") : (fs::current_path() / L".." / L"translations" / L"qt_translations.jsonc");
+    fs::copy_file(qmSrc, liveQm, fs::copy_options::overwrite_existing);
+    fs::copy_file(jsonSrc, liveJson, fs::copy_options::overwrite_existing);
+    PatchInfo liveCheck;
+    std::wstring liveErr;
+    bool livePatched = PePatcher::GetPatchInfo(realCs2Qt.wstring(), liveCheck, liveErr);
+    std::cout << "[Test 3.4] Deployed patched Qt5Core.dll to live CS2 bin directory: PASSED (livePatched=" << livePatched << ", v=" << liveCheck.version << ")\n";
 
     if (fs::exists(tempPatched)) fs::remove(tempPatched);
     if (fs::exists(tempPatched2)) fs::remove(tempPatched2);

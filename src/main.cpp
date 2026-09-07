@@ -32,6 +32,15 @@ int main(int argc, char *argv[]) {
     MainWindow mainWindow(cs2Root);
     mainWindow.show();
 
+    // 检查是否带有 -debug 或 --debug 启动参数
+    for (int i = 1; i < argc; ++i) {
+        QString arg = QString::fromLocal8Bit(argv[i]).toLower();
+        if (arg == "-debug" || arg == "--debug") {
+            mainWindow.openDebugWindow();
+            break;
+        }
+    }
+
     return app.exec();
 }
 

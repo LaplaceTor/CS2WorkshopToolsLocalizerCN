@@ -4,6 +4,7 @@
 #include "pe_patcher.h"
 #include "backup_manager.h"
 #include "dictionary_compiler.h"
+#include "debug_window.h"
 
 #include <windows.h>
 #include <psapi.h>
@@ -77,6 +78,9 @@ MainWindow::MainWindow(const std::wstring& cs2Root, QWidget *parent)
     , m_isHammerRunning(false)
     , m_hammerPid(0)
     , m_hammerProcessHandle(nullptr)
+    , m_toggleLangBtn(nullptr)
+    , m_hotReloadBtn(nullptr)
+    , m_debugBtn(nullptr)
 {
     // 获取程序所在目录作为工作目录
     QString appDir = QApplication::applicationDirPath();
@@ -111,6 +115,21 @@ MainWindow::MainWindow(const std::wstring& cs2Root, QWidget *parent)
 
     connect(m_helpBtn, &QPushButton::clicked,
             this, &MainWindow::onHelpClicked);
+
+    if (m_toggleLangBtn) {
+        connect(m_toggleLangBtn, &QPushButton::clicked,
+                this, &MainWindow::onToggleLangClicked);
+    }
+
+    if (m_hotReloadBtn) {
+        connect(m_hotReloadBtn, &QPushButton::clicked,
+                this, &MainWindow::onHotReloadClicked);
+    }
+
+    if (m_debugBtn) {
+        connect(m_debugBtn, &QPushButton::clicked,
+                this, &MainWindow::onDebugClicked);
+    }
 
     connect(
         m_addonCombo,
@@ -561,10 +580,91 @@ void MainWindow::setupUi() {
         "}"
     );
 
+    m_debugBtn = new QPushButton("🐞 调试监控", centralWidget);
+    m_debugBtn->setMinimumHeight(28);
+    m_debugBtn->setToolTip("打开专用调试监控窗口，查看实时日志流、内存诊断、崩溃事件与快捷控制");
+    m_debugBtn->setStyleSheet(
+        "QPushButton {"
+        "  background-color: #21262d;"
+        "  color: #58a6ff;"
+        "  font-weight: bold;"
+        "  font-size: 12px;"
+        "  border-radius: 4px;"
+        "  border: 1px solid #30363d;"
+        "}"
+        "QPushButton:hover {"
+        "  background-color: #30363d;"
+        "  border-color: #58a6ff;"
+        "}"
+        "QPushButton:pressed {"
+        "  background-color: #161b22;"
+        "}"
+    );
+
     subBtnLayout->addWidget(m_updateBtn);
     subBtnLayout->addWidget(m_helpBtn);
+    subBtnLayout->addWidget(m_debugBtn);
 
     btnLayout->addLayout(subBtnLayout);
+
+    // 第三行：运行中实时联动控制（一键切换中英 / 免重启热重载）
+    QHBoxLayout* liveControlLayout = new QHBoxLayout();
+    liveControlLayout->setSpacing(6);
+
+    m_toggleLangBtn = new QPushButton("🔀 切换原文 / 翻译", centralWidget);
+    m_toggleLangBtn->setMinimumHeight(28);
+    m_toggleLangBtn->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Preferred);
+    m_toggleLangBtn->setEnabled(false);
+    m_toggleLangBtn->setToolTip("需在 Hammer 运行中时使用（一键切换原文/翻译）");
+    m_toggleLangBtn->setStyleSheet(
+        "QPushButton {"
+        "  background-color: #d29922;"
+        "  color: white;"
+        "  font-weight: bold;"
+        "  font-size: 12px;"
+        "  border-radius: 4px;"
+        "}"
+        "QPushButton:hover {"
+        "  background-color: #e3b341;"
+        "}"
+        "QPushButton:pressed {"
+        "  background-color: #bb8009;"
+        "}"
+        "QPushButton:disabled {"
+        "  background-color: #2d333b;"
+        "  color: #636e7b;"
+        "}"
+    );
+
+    m_hotReloadBtn = new QPushButton("⚡ 热重载词典", centralWidget);
+    m_hotReloadBtn->setMinimumHeight(28);
+    m_hotReloadBtn->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Preferred);
+    m_hotReloadBtn->setEnabled(false);
+    m_hotReloadBtn->setToolTip("需在 Hammer 运行中时使用（重新从磁盘读取词典，无需重启 Hammer）");
+    m_hotReloadBtn->setStyleSheet(
+        "QPushButton {"
+        "  background-color: #8957e5;"
+        "  color: white;"
+        "  font-weight: bold;"
+        "  font-size: 12px;"
+        "  border-radius: 4px;"
+        "}"
+        "QPushButton:hover {"
+        "  background-color: #a371f7;"
+        "}"
+        "QPushButton:pressed {"
+        "  background-color: #6e40b8;"
+        "}"
+        "QPushButton:disabled {"
+        "  background-color: #2d333b;"
+        "  color: #636e7b;"
+        "}"
+    );
+
+    liveControlLayout->addWidget(m_toggleLangBtn);
+    liveControlLayout->addWidget(m_hotReloadBtn);
+
+    btnLayout->addLayout(liveControlLayout);
 
     mainLayout->addLayout(btnLayout);
 
@@ -913,6 +1013,19 @@ bool MainWindow::isPatchDeployedAndValid() {
 }
 
 void MainWindow::updateActionButtonState() {
+    if (m_toggleLangBtn) {
+        m_toggleLangBtn->setEnabled(m_isHammerRunning);
+        m_toggleLangBtn->setToolTip(m_isHammerRunning ?
+            "一键向运行中的 Hammer 发送【切换原文 / 翻译】指令" :
+            "需在 Hammer 运行中时使用（一键切换原文/翻译）");
+    }
+    if (m_hotReloadBtn) {
+        m_hotReloadBtn->setEnabled(m_isHammerRunning);
+        m_hotReloadBtn->setToolTip(m_isHammerRunning ?
+            "重新从磁盘读取翻译词典并即时生效，无需重启 Hammer" :
+            "需在 Hammer 运行中时使用（免重启热重载词典）");
+    }
+
     if (m_isHammerRunning) {
         // HAMMER 运行中：三个核心按钮全部禁用
         m_injectBtn->setEnabled(false);
@@ -3095,4 +3208,50 @@ void MainWindow::closeEvent(
      * 仅注入 -> 关闭启动器 -> 保持补丁处于已注入状态。
      */
     event->accept();
+}
+
+#ifndef WM_LOCALIZER_TOGGLE_LANG
+#define WM_LOCALIZER_TOGGLE_LANG   (WM_USER + 101)
+#endif
+#ifndef WM_LOCALIZER_RELOAD_DICT
+#define WM_LOCALIZER_RELOAD_DICT   (WM_USER + 102)
+#endif
+
+bool MainWindow::sendIpcCommandToHammer(unsigned int msgId) {
+    HWND hWnd = FindWindowExW(HWND_MESSAGE, NULL, L"CS2_HAMMER_LOCALIZER_IPC", L"CS2_Hammer_Localizer_MsgWnd");
+    if (!hWnd) {
+        hWnd = FindWindowW(L"CS2_HAMMER_LOCALIZER_IPC", L"CS2_Hammer_Localizer_MsgWnd");
+    }
+    if (!hWnd) {
+        return false;
+    }
+    return (PostMessageW(hWnd, msgId, 0, 0) != FALSE);
+}
+
+void MainWindow::onToggleLangClicked() {
+    if (sendIpcCommandToHammer(WM_LOCALIZER_TOGGLE_LANG)) {
+        appendLog("[⚡] 已向运行中的 Hammer 发送【切换原文 / 翻译】指令", "#a6e22e");
+    } else {
+        appendLog("[!] 未检测到运行中的 Hammer 汉化模块 IPC 窗口（请确保 Hammer 正在运行）", "#f92672");
+    }
+}
+
+void MainWindow::onHotReloadClicked() {
+    if (sendIpcCommandToHammer(WM_LOCALIZER_RELOAD_DICT)) {
+        appendLog("[⚡] 已向运行中的 Hammer 发送【热重载翻译词典】指令", "#a6e22e");
+    } else {
+        appendLog("[!] 未检测到运行中的 Hammer 汉化模块 IPC 窗口（请确保 Hammer 正在运行）", "#f92672");
+    }
+}
+
+void MainWindow::onDebugClicked() {
+    openDebugWindow();
+}
+
+void MainWindow::openDebugWindow() {
+    DebugWindow* dbg = new DebugWindow(m_cs2Root, this);
+    dbg->setAttribute(Qt::WA_DeleteOnClose);
+    dbg->show();
+    dbg->raise();
+    dbg->activateWindow();
 }

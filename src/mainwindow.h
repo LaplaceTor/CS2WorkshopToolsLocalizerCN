@@ -28,6 +28,9 @@ private slots:
     void onRestoreClicked();
     void onUpdateTranslationsClicked();
     void onHelpClicked();
+    void onToggleLangClicked();
+    void onHotReloadClicked();
+    void onDebugClicked();
     void onHammerStarted();
     void onHammerFinished(int exitCode, QProcess::ExitStatus exitStatus);
     void onHammerError(QProcess::ProcessError error);
@@ -88,6 +91,15 @@ private:
     // 其他功能按钮
     QPushButton* m_updateBtn;
     QPushButton* m_helpBtn;
+    QPushButton* m_toggleLangBtn;
+    QPushButton* m_hotReloadBtn;
+    QPushButton* m_debugBtn;
+
+public:
+    void openDebugWindow();
+
+private:
+    bool sendIpcCommandToHammer(unsigned int msgId);
 
     QTextEdit* m_logEdit;
     QLabel* m_statusLabel;
