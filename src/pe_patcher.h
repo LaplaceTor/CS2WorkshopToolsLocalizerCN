@@ -3,6 +3,11 @@
 #include <string>
 #include <cstdint>
 #include <optional>
+#include <algorithm>  // std::min（此前靠 .cpp 的间接包含才编译通过，单独包含本头文件会失败）
+
+#ifndef NOMINMAX
+#define NOMINMAX      // 阻止 windows.h 定义 min/max 宏，否则会顶掉 std::min
+#endif
 #include <windows.h>
 
 #pragma pack(push, 1)

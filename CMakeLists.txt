@@ -60,6 +60,10 @@ add_executable(CS2WorkshopToolsLocalizerCN WIN32
     src/fgd_translator.cpp
     src/backup_manager.cpp
     src/dictionary_compiler.cpp
+    src/launcher_config.cpp
+    src/localization_service.cpp
+    src/process_monitor.cpp
+    src/hammer_ipc.cpp
 )
 
 set_target_properties(CS2WorkshopToolsLocalizerCN PROPERTIES
@@ -97,29 +101,7 @@ add_custom_command(TARGET CS2WorkshopToolsLocalizerCN POST_BUILD
         "$<TARGET_FILE_DIR:CS2WorkshopToolsLocalizerCN>/qtcore_qm.dll"
 )
 
-# 3. 单元与集成测试程序
-add_executable(test_components
-    tests/test_components.cpp
-    src/cs2_detector.cpp
-    src/pe_patcher.cpp
-    src/fgd_translator.cpp
-    src/backup_manager.cpp
-    src/hook_manager.cpp
-    src/dictionary_compiler.cpp
-    third_party/minhook/src/buffer.c
-    third_party/minhook/src/hook.c
-    third_party/minhook/src/trampoline.c
-    third_party/minhook/src/hde/hde64.c
-)
-target_include_directories(test_components PRIVATE
-    third_party/minhook/include
-    third_party/minhook/src
-)
-target_link_libraries(test_components PRIVATE
-    Qt6::Core
-    advapi32
-    user32
-    shell32
-    version
-    psapi
-)
+# 说明：本项目不设单元测试目标。
+# 注入型改动的行为正确性只能靠实际 HOOK 到 Hammer 进程验证，
+# 脱离宿主进程的单测无法覆盖真实时序，反而会给出虚假的安全感。
+# 验证方式见 README「验证」章节。

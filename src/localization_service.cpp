@@ -1,0 +1,423 @@
+#include "localization_service.h"
+
+#include <filesystem>
+
+#include <QThread>
+#include <QString>
+
+#include "backup_manager.h"
+#include "dictionary_compiler.h"
+#include "dictionary_paths.h"
+#include "fgd_translator.h"
+#include "path_constants.h"
+#include "pe_patcher.h"
+
+namespace fs = std::filesystem;
+bool LocalizationService::Inject(const Context& ctx, bool useMachineTrans, const LogSink& log) {
+    fs::path workPath(ctx.workingDir);
+
+    fs::path backupDir =
+        workPath / paths::kBackupDir;
+
+    fs::path transDir =
+        workPath / paths::kTranslationsDir;
+
+    fs::path cs2Bin = paths::Win64Bin(ctx.cs2Root);
+
+    fs::path fgdDictPath = ResolveDictionaryPath(ctx.workingDir, L"fgd_translations.jsonc");
+    fs::path fgdFallbackPath = ResolveDictionaryPath(ctx.workingDir, L"fgd_fallback.jsonc");
+    fs::path fgdOverridePath = ResolveDictionaryPath(ctx.workingDir, L"fgd_override.jsonc");
+    fs::path qtDictPath = ResolveDictionaryPath(ctx.workingDir, L"qt_translations.jsonc");
+    fs::path qtFallbackPath = ResolveDictionaryPath(ctx.workingDir, L"qt_fallback.jsonc");
+
+    fs::path qmDllSrc =
+        workPath / paths::kInjectDll;
+    if (!fs::exists(qmDllSrc)) {
+        if (fs::exists(fs::current_path() / paths::kInjectDll)) {
+            qmDllSrc = fs::current_path() / paths::kInjectDll;
+        }
+    }
+
+    std::wstring notice;
+
+    if (FgdTranslator::EnsureFgdDictionaryExists(
+            fgdDictPath.wstring(),
+            L"",
+            notice)) {
+
+        log(
+            "[i] " + QString::fromStdWString(notice),
+            "#66d9ef"
+        );
+    }
+
+    if (FgdTranslator::EnsureFgdOverrideDictionaryExists(
+            fgdOverridePath.wstring(),
+            L"",
+            notice)) {
+
+        log(
+            "[i] " + QString::fromStdWString(notice),
+            "#66d9ef"
+        );
+    }
+
+    if (FgdTranslator::EnsureQtDictionaryExists(
+            qtDictPath.wstring(),
+            L"",
+            notice)) {
+
+        log(
+            "[i] " + QString::fromStdWString(notice),
+            "#66d9ef"
+        );
+    }
+
+    // ==========================================
+    // STEP 1: 原版备份
+    // ==========================================
+    log(
+        "[1/3] 正在校验游戏版本并准备原版备份...",
+        "#e6db74"
+    );
+
+    auto matchResult =
+        BackupManager::BackupMatchesCurrentGame(
+            ctx.cs2Root,
+            backupDir.wstring()
+        );
+
+    bool forceRecreate = false;
+
+    if (matchResult.status ==
+        BackupMatchStatus::GameUpdated) {
+
+        log(
+            QString(
+                "[!] 检测到 CS2 游戏版本发生变化: %1"
+            )
+                .arg(
+                    QString::fromStdWString(
+                        matchResult.reason
+                    )
+                ),
+            "#fd971f"
+        );
+
+        // 二次哈希确认：Steam 更新进行中时文件哈希会不稳定，
+        // 避免把半更新状态的游戏文件定格为"纯净原版备份"（此时运行于 worker 线程，可安全等待）
+        log(
+            "[*] 疑似游戏更新，2 秒后进行二次哈希确认...",
+            "#66d9ef"
+        );
+
+        QThread::msleep(2000);
+
+        auto reconfirm =
+            BackupManager::BackupMatchesCurrentGame(
+                ctx.cs2Root,
+                backupDir.wstring()
+            );
+
+        if (reconfirm.status == BackupMatchStatus::Matches) {
+            log(
+                "[+] 二次校验显示备份与当前版本一致（此前可能正处于 Steam 更新过程中），继续使用现有备份。",
+                "#a6e22e"
+            );
+        } else if (reconfirm.status == BackupMatchStatus::GameUpdated) {
+            log(
+                "[*] 二次校验仍检测到版本变化，确认游戏已更新，旧备份已失效，将重新建立当前版本原版备份...",
+                "#66d9ef"
+            );
+
+            forceRecreate = true;
+        } else {
+            log(
+                QString(
+                    "[-] 二次版本校验失败，已中止注入: %1"
+                )
+                    .arg(
+                        QString::fromStdWString(
+                            reconfirm.reason
+                        )
+                    ),
+                "#f92672"
+            );
+
+            return false;
+        }
+    }
+
+    std::vector<std::wstring> backedFgd;
+    std::wstring err;
+
+    if (!BackupManager::CreateOrUpdateBackup(
+            ctx.cs2Root,
+            backupDir.wstring(),
+            backedFgd,
+            err,
+            forceRecreate)) {
+
+        log(
+            QString(
+                "[-] 备份原版文件失败: %1"
+            )
+                .arg(
+                    QString::fromStdWString(err)
+                ),
+            "#f92672"
+        );
+
+        return false;
+    }
+
+    log(
+        QString(
+            "[+] 成功捕获并绑定 %1 个原版 FGD 与 Qt5Core.dll"
+        )
+            .arg(backedFgd.size()),
+        "#a6e22e"
+    );
+
+    // ==========================================
+    // STEP 2: FGD 汉化
+    // ==========================================
+    log(
+        "[2/3] 正在部署 FGD 汉化...",
+        "#e6db74"
+    );
+
+    std::vector<std::wstring> transFgd;
+
+    if (useMachineTrans) {
+        log(
+            "[*] 已启用机翻模式：自动加载 fgd_fallback.jsonc 与 qt_fallback.jsonc 作为兜底词典",
+            "#66d9ef"
+        );
+    }
+
+    std::wstring fgdFallbackParam = (useMachineTrans && fs::exists(fgdFallbackPath)) ? fgdFallbackPath.wstring() : L"";
+
+    if (!FgdTranslator::TranslateAndDeployAll(
+            ctx.cs2Root,
+            backupDir.wstring(),
+            transDir.wstring(),
+            fgdDictPath.wstring(),
+            fgdOverridePath.wstring(),
+            transFgd,
+            err,
+            fgdFallbackParam)) {
+
+        log(
+            QString(
+                "[-] 汉化 FGD 失败: %1"
+            )
+                .arg(
+                    QString::fromStdWString(err)
+                ),
+            "#f92672"
+        );
+
+        Restore(ctx, false, log);
+        return false;
+    }
+
+    log(
+        QString(
+            "[+] 成功汉化并部署 %1 个 FGD 文件"
+        )
+            .arg(transFgd.size()),
+        "#a6e22e"
+    );
+
+    // ==========================================
+    // STEP 3: Qt Patch
+    // ==========================================
+    log(
+        "[3/3] 正在部署 Qt 汉化模块并修补 Qt5Core.dll...",
+        "#e6db74"
+    );
+
+    try {
+        fs::path destQtJson =
+            cs2Bin / paths::kQtDictFile;
+
+        fs::path destQmDll =
+            cs2Bin / L"qtcore_qm.dll";
+
+        if (!fs::exists(qtDictPath)) {
+            log(
+                "[-] 找不到 qt_translations.jsonc",
+                "#f92672"
+            );
+
+            Restore(ctx, false, log);
+            return false;
+        }
+
+        if (!fs::exists(qmDllSrc)) {
+            log(
+                "[-] 找不到 qtcore_qm.dll",
+                "#f92672"
+            );
+
+            Restore(ctx, false, log);
+            return false;
+        }
+
+        if (!BackupManager::SafeCopyFileWithRetry(qmDllSrc, destQmDll)) {
+            log(
+                "[-] 部署 qtcore_qm.dll 失败 (目标被占用或无写权限)",
+                "#f92672"
+            );
+
+            Restore(ctx, false, log);
+            return false;
+        }
+
+        std::wstring qtFallbackParam = (useMachineTrans && fs::exists(qtFallbackPath)) ? qtFallbackPath.wstring() : L"";
+
+        // 优先合并主词典与机翻兜底词典；合并失败或未启用机翻时直接部署主词典
+        bool qtJsonMerged = false;
+        if (!qtFallbackParam.empty()) {
+            std::wstring mergeErr;
+            qtJsonMerged = DictionaryCompiler::MergeJsonFiles(
+                    qtDictPath.wstring(),
+                    qtFallbackParam,
+                    destQtJson.wstring(),
+                    mergeErr);
+        }
+
+        if (!qtJsonMerged) {
+            if (!BackupManager::SafeCopyFileWithRetry(qtDictPath, destQtJson)) {
+                log(
+                    "[-] 部署 qt_translations.jsonc 失败 (目标被占用或无写权限)",
+                    "#f92672"
+                );
+
+                Restore(ctx, false, log);
+                return false;
+            }
+        }
+
+        // 修补 Qt5Core.dll
+        fs::path backupQtCore = paths::Qt5Core(backupDir);
+
+        fs::path targetQtCore =
+            cs2Bin / paths::kQt5CoreDll;
+
+        if (!PePatcher::PatchQtCore(
+                backupQtCore.wstring(),
+                targetQtCore.wstring(),
+                err)) {
+
+            log(
+                QString(
+                    "[-] 修补 Qt5Core.dll 失败: %1"
+                )
+                    .arg(
+                        QString::fromStdWString(err)
+                    ),
+                "#f92672"
+            );
+
+            Restore(ctx, false, log);
+            return false;
+        }
+
+        log(
+            "[+] Qt5Core.dll PE Code Cave 注入与重定向修补成功",
+            "#a6e22e"
+        );
+
+    } catch (const std::exception& e) {
+
+        log(
+            QString(
+                "[-] 部署补丁异常: %1"
+            )
+                .arg(e.what()),
+            "#f92672"
+        );
+
+        Restore(ctx, false, log);
+        return false;
+    }
+
+    /*
+     * 注入成功后记录 session_state。
+     *
+     * 这样即使用户之后直接关闭启动器，
+     * 下次启动依然可以知道当前目录没有被还原。
+     */
+    if (!BackupManager::SaveSessionState(
+            ctx.workingDir,
+            true
+        )) {
+        log(
+            "[-] 会话状态写入失败 (session_state.json)，异常退出后的自动恢复可能失效",
+            "#f92672"
+        );
+    }
+
+    log(
+        "[SUCCESS] 汉化补丁注入完成，当前处于“已注入”状态。",
+        "#a6e22e"
+    );
+
+    return true;
+}
+
+// ---------------------------------------------------------------------------
+
+bool LocalizationService::Restore(const Context& ctx, bool showLog, const LogSink& log) {
+    fs::path workPath(ctx.workingDir);
+
+    fs::path backupDir =
+        workPath / paths::kBackupDir;
+
+    if (!BackupManager::HasBackup(
+            backupDir.wstring())) {
+
+        return true;
+    }
+
+    if (showLog) {
+        log(
+            "[*] 正在还原原版 FGD 实体定义及核心二进制...",
+            "#66d9ef"
+        );
+    }
+
+    std::wstring err;
+
+    if (!BackupManager::RestoreAll(
+            ctx.cs2Root,
+            backupDir.wstring(),
+            err)) {
+
+        if (showLog) {
+            log(
+                QString(
+                    "[-] 还原备份失败: %1"
+                )
+                    .arg(
+                        QString::fromStdWString(err)
+                    ),
+                "#f92672"
+            );
+        }
+
+        return false;
+    }
+
+    if (showLog) {
+        log(
+            "[SUCCESS] 还原操作完成！所有原版 FGD 实体定义及 Qt5Core.dll 已恢复原样。",
+            "#a6e22e"
+        );
+    }
+
+    return true;
+}
+

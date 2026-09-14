@@ -1,10 +1,7 @@
 #include "dictionary_compiler.h"
-#ifndef NOMINMAX
-#define NOMINMAX
-#endif
-#include <windows.h>
+// 引入 UTF-8/UTF-16 转换工具（内部已带 NOMINMAX 与 windows.h，供 MoveFileExW 等使用）
+#include "encoding_util.h"
 #include <fstream>
-#include <sstream>
 #include <algorithm>
 #include <cstring>
 #include <filesystem>
@@ -302,9 +299,12 @@ private:
     }
 
     static std::wstring NormalizeSectionName(const std::string& name) {
-        std::wstring wname;
-        wname.reserve(name.size());
-        for (char c : name) wname.push_back(static_cast<wchar_t>(c));
+        // name 来自 JSONC，是 UTF-8。早期实现按字节 static_cast<wchar_t> 强转，
+        // 中文 section 名会被拆成一串乱码，导致词典永远查不中。
+        std::wstring wname = enc::Utf8ToWide(name);
+        if (wname.empty()) {
+            return {};
+        }
         std::transform(wname.begin(), wname.end(), wname.begin(), ::towlower);
         if (wname.length() > 4 && wname.substr(wname.length() - 4) == L".dll") {
             wname = wname.substr(0, wname.length() - 4);
@@ -341,6 +341,22 @@ bool DictionaryCompiler::ParseJsoncStringToMaps(
     // 2. 解析为分块字典结构
     SimpleJsonParser parser(cleanJson);
     if (!parser.Parse(outCommon, outScoped, outError)) {
+        return false;
+    }
+
+    // 3. 生效容量上限。这两个常量此前只是声明，从未被检查，
+    //    词典文件异常膨胀时会在注入进程里无上限吃内存。
+    if (outScoped.size() > MAX_TOTAL_SECTIONS) {
+        outError = L"作用域数量超出上限 (" + std::to_wstring(MAX_TOTAL_SECTIONS) + L")";
+        return false;
+    }
+
+    size_t totalEntries = outCommon.size();
+    for (const auto& scoped : outScoped) {
+        totalEntries += scoped.second.size();
+    }
+    if (totalEntries > MAX_TOTAL_ENTRIES) {
+        outError = L"词条总数超出上限 (" + std::to_wstring(MAX_TOTAL_ENTRIES) + L")";
         return false;
     }
 
@@ -455,8 +471,13 @@ bool DictionaryCompiler::MergeJsonFiles(
     std::unordered_map<std::string, std::string> commonDict;
     std::unordered_map<std::wstring, std::unordered_map<std::string, std::string>> scopedDicts;
 
-    if (!ParseJsoncFileToMaps(primaryJsonPath, commonDict, scopedDicts, outError, fallbackJsonPath)) {
-        outError = L"合并字典失败：未找到有效词条";
+    std::wstring parseError;
+    if (!ParseJsoncFileToMaps(primaryJsonPath, commonDict, scopedDicts, parseError, fallbackJsonPath)) {
+        // 保留下层的具体原因（哪个文件读不了、解析到哪一行），
+        // 早期实现直接覆盖成通用文案，出问题时只能靠猜
+        outError = parseError.empty()
+            ? L"合并字典失败：未找到有效词条"
+            : L"合并字典失败：" + parseError;
         return false;
     }
 
@@ -481,8 +502,8 @@ bool DictionaryCompiler::MergeJsonFiles(
         if (sc.second.empty()) continue;
         if (!first) fputs(",\n", outFp);
         first = false;
-        std::string secUtf8;
-        for (wchar_t wc : sc.first) secUtf8.push_back(static_cast<char>(wc));
+        // section 名以 UTF-8 落盘，写回时必须把 wchar_t 正确编码，不能逐字符截断
+        const std::string secUtf8 = enc::WideToUtf8(sc.first);
         std::string secHead = "  \"" + EscapeJsonStr(secUtf8) + "\": {\n";
         fputs(secHead.c_str(), outFp);
         bool secFirst = true;

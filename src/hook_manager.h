@@ -95,6 +95,14 @@ private:
     HookManager() = default;
     ~HookManager();
 
+    // 以下 *Locked 版本假定调用方已持有 m_mutex。
+    // 存在的意义：公共接口负责加锁，内部逻辑只写一份，
+    // 既避免 Shutdown 与 Unregister* 之间的复制粘贴，
+    // 也杜绝「先读标志位、再在锁外初始化」这类竞态。
+    bool InitializeLocked(PVECTORED_EXCEPTION_HANDLER pVehHandler);
+    void UnregisterDllNotificationLocked();
+    void UnregisterVehLocked();
+
     mutable std::mutex m_mutex;
     std::vector<HookEntry> m_hooks;
     void* m_pVehHandle = nullptr;

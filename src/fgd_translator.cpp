@@ -6,6 +6,7 @@
 #include <sstream>
 #include <regex>
 #include <filesystem>
+#include <optional>
 #include <iostream>
 #include <memory>
 #include <QJsonDocument>
@@ -300,6 +301,464 @@ std::string FgdTranslator::TranslateLine(
     return TranslateLine(line, dict, overrideData, inOutCurrentClass, dummyPending);
 }
 
+namespace {
+
+using FgdDict = std::unordered_map<std::string, std::string>;
+
+// 查词典；未命中或译为空串时原样返回
+std::string GetTranslation(const FgdDict& dict, const std::string& text) {
+    const std::string trimmed = TrimString(text);
+    auto it = dict.find(trimmed);
+    if (it != dict.end() && !it->second.empty()) {
+        return it->second;
+    }
+    return text;
+}
+
+// 翻译形如 ` "显示名"` 的片段，保留原始缩进与空格
+// （FGD 属性体按冒号切分后，每个片段都带前导空格，不能直接整体替换）
+std::string TranslateQuotedPart(const std::string& part, const FgdDict& dict) {
+    const std::string stripped = TrimString(part);
+    if (stripped.length() < 2 || stripped.front() != '"' || stripped.back() != '"') {
+        return part;
+    }
+    const std::string value = stripped.substr(1, stripped.length() - 2);
+    const std::string translated = GetTranslation(dict, value);
+
+    std::string out = part;
+    const size_t pos = out.find("\"" + value + "\"");
+    if (pos != std::string::npos) {
+        out.replace(pos, value.length() + 2, "\"" + translated + "\"");
+    }
+    return out;
+}
+
+// 按冒号切分属性体，忽略引号内的冒号。
+// 第一个冒号之前属于属性定义头，会被丢弃；返回 false 表示整行没有冒号分隔。
+// 该逻辑在「属性定义」与「属性跨行续行」两处完全相同，此前是两份复制。
+bool SplitPropertyParts(const std::string& body, std::vector<std::string>& outParts) {
+    outParts.clear();
+
+    std::string curr;
+    bool inQuote = false;
+    bool hasFirstColon = false;
+
+    for (size_t i = 0; i < body.length(); ++i) {
+        const char c = body[i];
+        if (c == '"') {
+            inQuote = !inQuote;
+            curr.push_back(c);
+        } else if (c == ':' && !inQuote) {
+            if (!hasFirstColon) {
+                hasFirstColon = true;
+                curr.clear();
+            } else {
+                outParts.push_back(curr);
+                curr.clear();
+            }
+        } else {
+            curr.push_back(c);
+        }
+    }
+    if (hasFirstColon) {
+        outParts.push_back(curr);
+    }
+    return hasFirstColon;
+}
+
+// 把切分后的片段重新拼回冒号分隔串。
+// 首冒号前的空格由 colon 决定，两种调用场景并不相同，不能统一：
+//   * 属性定义行   " :"（FGD 里 prop(type) : "Name" 冒号前有空格）
+//   * 跨行续行     ":" （续行以冒号顶格开始，冒号前无空格，否则会多出一个前导空格）
+std::string JoinPropertyParts(const std::vector<std::string>& parts, const std::string& colon) {
+    std::string out = colon;
+    for (size_t i = 0; i < parts.size(); ++i) {
+        if (i > 0) out += ":";
+        out += parts[i];
+    }
+    return out;
+}
+
+// ===========================================================================
+// 以下各 Try* 函数对应 FGD 语法中的一种结构。
+// 约定：返回 nullopt = 本行不属于该结构，交由后续分支继续尝试；
+//       返回字符串   = 该行的最终内容（不含行尾注释与换行）。
+// 这些分支原先以 `// 1.1 / 1.2 / 3.1` 手工编号的形式挤在一个 447 行的函数里。
+// ===========================================================================
+
+// 0. 等待上一行的跨行类说明（@PointClass ... = classname :\n  "Desc"）
+std::optional<std::string> TryPendingClassDesc(
+    const std::string& code, const FgdDict& dict, const FgdOverrideData& overrideData,
+    std::string& inOutPendingClassDesc)
+{
+    if (inOutPendingClassDesc.empty()) {
+        return std::nullopt;
+    }
+
+    const std::string trimmed = TrimString(code);
+    if (trimmed.empty()) {
+        // 空行保持状态，原样输出
+        return code;
+    }
+
+    static const std::regex standaloneStrRegex(R"re(^\s*"([^"]*)"\s*$)re");
+    std::smatch strMatch;
+    if (std::regex_match(code, strMatch, standaloneStrRegex)) {
+        const std::string origDesc = strMatch[1].str();
+
+        std::string finalDesc;
+        auto itDesc = overrideData.classDescriptions.find(inOutPendingClassDesc);
+        if (itDesc != overrideData.classDescriptions.end() && !itDesc->second.empty()) {
+            finalDesc = itDesc->second;
+        } else {
+            finalDesc = GetTranslation(dict, origDesc);
+        }
+        inOutPendingClassDesc.clear(); // 已完成匹配替换
+
+        const size_t lead = code.find_first_not_of(" \t");
+        const std::string indent = (lead != std::string::npos) ? code.substr(0, lead) : "\t";
+        return indent + "\"" + finalDesc + "\"";
+    }
+
+    if (trimmed.front() == '[') {
+        // 原类定义没有独立描述行，直接遇到了 [
+        auto itDesc = overrideData.classDescriptions.find(inOutPendingClassDesc);
+        const std::string cls = inOutPendingClassDesc;
+        inOutPendingClassDesc.clear();
+        if (itDesc != overrideData.classDescriptions.end() && !itDesc->second.empty()) {
+            const size_t lead = code.find_first_not_of(" \t");
+            const std::string indent = (lead != std::string::npos) ? code.substr(0, lead) : "";
+            return indent + "\t\"" + itDesc->second + "\"\n" + code;
+        }
+        return std::nullopt;
+    }
+
+    inOutPendingClassDesc.clear();
+    return std::nullopt;
+}
+
+// 1. 实体类定义与说明跟踪
+std::optional<std::string> TryClassDefinition(
+    const std::string& code, const FgdDict& dict, const FgdOverrideData& overrideData,
+    std::string& inOutCurrentClass, std::string& inOutPendingClassDesc)
+{
+    // 1.1 同行完整定义：= classname : "Description"
+    static const std::regex classFullRegex(R"re((=\s*)([a-zA-Z0-9_]+)\s*:\s*"([^"]*)")re");
+    std::smatch classFullMatch;
+    if (std::regex_search(code, classFullMatch, classFullRegex)) {
+        const std::string prefix = code.substr(0, classFullMatch.position(0));
+        const std::string eq = classFullMatch[1].str();
+        const std::string className = classFullMatch[2].str();
+        const std::string origDesc = classFullMatch[3].str();
+        const std::string suffix = code.substr(classFullMatch.position(0) + classFullMatch.length(0));
+
+        inOutCurrentClass = className;
+        inOutPendingClassDesc.clear();
+
+        std::string finalDesc;
+        auto itDesc = overrideData.classDescriptions.find(className);
+        if (itDesc != overrideData.classDescriptions.end() && !itDesc->second.empty()) {
+            finalDesc = itDesc->second;
+        } else {
+            finalDesc = GetTranslation(dict, origDesc);
+        }
+        return prefix + eq + className + " : \"" + finalDesc + "\"" + suffix;
+    }
+
+    // 1.2 跨行或末尾冒号/无描述类定义：= classname : 或 = classname (行尾)
+    static const std::regex classHeaderRegex(R"re((=\s*)([a-zA-Z0-9_]+)(\s*:\s*|\s*)$)re");
+    std::smatch classHeaderMatch;
+    if (std::regex_search(code, classHeaderMatch, classHeaderRegex)) {
+        const std::string className = classHeaderMatch[2].str();
+        inOutCurrentClass = className;
+        inOutPendingClassDesc = className;
+        return code;
+    }
+
+    // 1.3 同行紧接中括号的无描述类定义：= classname [
+    static const std::regex classBracketRegex(R"re((=\s*)([a-zA-Z0-9_]+)\s*(\[.*)$)re");
+    std::smatch classBracketMatch;
+    if (std::regex_search(code, classBracketMatch, classBracketRegex)) {
+        const std::string prefix = code.substr(0, classBracketMatch.position(0));
+        const std::string eq = classBracketMatch[1].str();
+        const std::string className = classBracketMatch[2].str();
+        const std::string bracketTail = classBracketMatch[3].str();
+
+        inOutCurrentClass = className;
+        inOutPendingClassDesc.clear();
+
+        auto itDesc = overrideData.classDescriptions.find(className);
+        if (itDesc != overrideData.classDescriptions.end() && !itDesc->second.empty()) {
+            return prefix + eq + className + " : \"" + itDesc->second + "\" " + bracketTail;
+        }
+        return code;
+    }
+
+    return std::nullopt;
+}
+
+// 2. 输入 / 输出描述：input/output Name(type) [ : "Description" ]
+std::optional<std::string> TryIoDefinition(
+    const std::string& code, const FgdDict& dict, const FgdOverrideData& overrideData,
+    const std::string& currentClass)
+{
+    static const std::regex ioRegex(R"re(^(\s*(?:input|output)\s+)([a-zA-Z0-9_]+)(\s*\([^)]*\))(.*)$)re");
+    std::smatch ioMatch;
+    if (!std::regex_match(code, ioMatch, ioRegex)) {
+        return std::nullopt;
+    }
+
+    const std::string ioPrefix = ioMatch[1].str();
+    const std::string ioName = ioMatch[2].str();
+    const std::string ioParam = ioMatch[3].str();
+    const std::string ioRest = ioMatch[4].str();
+
+    // 参数类型包含 api 时，Valve FGD 语法不支持冒号和描述，直接原样保留
+    if (ioParam.find("api") != std::string::npos) {
+        return code;
+    }
+
+    // 覆盖优先级：当前类 > 全局 ioOverrides > globalProperties
+    std::string overrideIoDesc;
+    if (!currentClass.empty()) {
+        auto itCls = overrideData.classProperties.find(currentClass);
+        if (itCls != overrideData.classProperties.end()) {
+            auto itP = itCls->second.find(ioName);
+            if (itP != itCls->second.end() && !itP->second.description.empty()) {
+                overrideIoDesc = itP->second.description;
+            }
+        }
+    }
+    if (overrideIoDesc.empty()) {
+        auto itIo = overrideData.ioOverrides.find(ioName);
+        if (itIo != overrideData.ioOverrides.end() && !itIo->second.empty()) {
+            overrideIoDesc = itIo->second;
+        }
+    }
+    if (overrideIoDesc.empty()) {
+        auto itGlob = overrideData.globalProperties.find(ioName);
+        if (itGlob != overrideData.globalProperties.end() && !itGlob->second.description.empty()) {
+            overrideIoDesc = itGlob->second.description;
+        }
+    }
+
+    static const std::regex descQuoteRegex(R"re(:\s*"([^"]*)")re");
+    std::smatch descQuoteMatch;
+    if (std::regex_search(ioRest, descQuoteMatch, descQuoteRegex)) {
+        const std::string origDesc = descQuoteMatch[1].str();
+        const std::string finalDesc = overrideIoDesc.empty() ? GetTranslation(dict, origDesc) : overrideIoDesc;
+        const std::string replacedRest =
+            ioRest.substr(0, descQuoteMatch.position(0)) + ": \"" + finalDesc + "\""
+            + ioRest.substr(descQuoteMatch.position(0) + descQuoteMatch.length(0));
+        return ioPrefix + ioName + ioParam + replacedRest;
+    }
+
+    if (!overrideIoDesc.empty()) {
+        // 原行无描述，追加描述
+        return ioPrefix + ioName + ioParam + " : \"" + overrideIoDesc + "\"";
+    }
+    return code;
+}
+
+// 3. 按钮/元数据说明：desc = "Description"
+std::optional<std::string> TryDescMetadata(const std::string& code, const FgdDict& dict) {
+    static const std::regex descRegex(R"re(\bdesc\s*=\s*"([^"]*)")re");
+    std::smatch descMatch;
+    if (!std::regex_search(code, descMatch, descRegex)) {
+        return std::nullopt;
+    }
+
+    const std::string prefix = code.substr(0, descMatch.position(0));
+    const std::string desc = descMatch[1].str();
+    const std::string suffix = code.substr(descMatch.position(0) + descMatch.length(0));
+    return prefix + "desc = \"" + GetTranslation(dict, desc) + "\"" + suffix;
+}
+
+// 3.1 属性跨行定义块内部的独立组声明：group = "GroupName"
+std::optional<std::string> TryStandaloneGroup(const std::string& code, const FgdDict& dict) {
+    static const std::regex standaloneGroupRegex(R"re(^\s*group(\s*=\s*)"([^"]*)")re");
+    std::smatch standMatch;
+    if (!std::regex_search(code, standMatch, standaloneGroupRegex)) {
+        return std::nullopt;
+    }
+
+    const std::string prefix = code.substr(0, standMatch.position(0));
+    const std::string eq = standMatch[1].str();
+    const std::string gName = standMatch[2].str();
+    const std::string suffix = code.substr(standMatch.position(0) + standMatch.length(0));
+    return prefix + "group" + eq + "\"" + GetTranslation(dict, gName) + "\"" + suffix;
+}
+
+// 4. 属性定义：prop(type) [attrs] {attrs} : "Display Name" [ : default [ : "Description" ]] [ = [ choices ] ]
+std::optional<std::string> TryPropertyDefinition(
+    const std::string& code, const FgdDict& dict, const FgdOverrideData& overrideData,
+    const std::string& currentClass)
+{
+    std::string propHead, propKey, propType, rest;
+    if (!ExtractPropertyHeader(code, propHead, propKey, propType, rest)) {
+        return std::nullopt;
+    }
+
+    // 翻译属性行内部的属性组：[ group="Render Properties" ] 或 { group="Style" }
+    static const std::regex groupRegex(R"re(\bgroup(\s*=\s*)"([^"]*)")re");
+    std::smatch groupMatch;
+    std::string newPropHead;
+    std::string searchHead = propHead;
+    while (std::regex_search(searchHead, groupMatch, groupRegex)) {
+        const std::string prefix = searchHead.substr(0, groupMatch.position(0));
+        const std::string eq = groupMatch[1].str();
+        const std::string groupName = groupMatch[2].str();
+        newPropHead += prefix + "group" + eq + "\"" + GetTranslation(dict, groupName) + "\"";
+        searchHead = searchHead.substr(groupMatch.position(0) + groupMatch.length(0));
+    }
+    if (!newPropHead.empty()) {
+        newPropHead += searchHead;
+        propHead = newPropHead;
+    }
+
+    // 查找该属性是否有 override（当前类优先，其次全局）
+    const FgdPropertyOverride* propOverride = nullptr;
+    if (!currentClass.empty()) {
+        auto itCls = overrideData.classProperties.find(currentClass);
+        if (itCls != overrideData.classProperties.end()) {
+            auto itP = itCls->second.find(propKey);
+            if (itP != itCls->second.end()) {
+                propOverride = &itP->second;
+            }
+        }
+    }
+    if (!propOverride) {
+        auto itGlob = overrideData.globalProperties.find(propKey);
+        if (itGlob != overrideData.globalProperties.end()) {
+            propOverride = &itGlob->second;
+        }
+    }
+
+    // 分离 choices 尾部（以等号开始，忽略引号内的等号）
+    std::string choicesTail;
+    std::string propBody = rest;
+    {
+        bool inQuote = false;
+        for (size_t i = 0; i < rest.length(); ++i) {
+            const char c = rest[i];
+            if (c == '"') {
+                inQuote = !inQuote;
+            } else if (c == '=' && !inQuote) {
+                propBody = rest.substr(0, i);
+                choicesTail = rest.substr(i);
+                break;
+            }
+        }
+    }
+
+    // 属性没有冒号定义（例如跨行定义的属性头 useLocalOffset(boolean) 或 spawnflags(flags) [ ... ] =）
+    if (TrimString(propBody).empty()) {
+        return propHead + rest;
+    }
+
+    std::vector<std::string> parts;
+    const bool hasFirstColon = SplitPropertyParts(propBody, parts);
+    if (!hasFirstColon) {
+        return code;
+    }
+
+    if (!parts.empty()) {
+        // parts[0] 显示名
+        if (propOverride && !propOverride->displayName.empty()) {
+            parts[0] = " \"" + propOverride->displayName + "\"";
+        } else {
+            parts[0] = TranslateQuotedPart(parts[0], dict);
+        }
+
+        if (parts.size() == 1) {
+            // 仅有显示名
+            if (propOverride && !propOverride->description.empty()) {
+                parts.push_back(" \"\"");
+                parts.push_back(" \"" + propOverride->description + "\"");
+            }
+        } else if (parts.size() == 2) {
+            // 显示名 + 默认值，无描述
+            if (propOverride && !propOverride->description.empty()) {
+                parts.push_back(" \"" + propOverride->description + "\"");
+            }
+        } else if (propOverride && !propOverride->description.empty()) {
+            // 显示名 + 默认值 + 描述
+            parts[2] = " \"" + propOverride->description + "\"";
+        } else {
+            parts[2] = TranslateQuotedPart(parts[2], dict);
+        }
+    }
+
+    return propHead + JoinPropertyParts(parts, " :") + choicesTail;
+}
+
+// 4.1 属性跨行定义的续行（以冒号开头，如 : "Use Local Transform" : 0 : "..."）
+std::optional<std::string> TryPropertyContinuation(const std::string& code, const FgdDict& dict) {
+    const std::string trimmedCode = TrimString(code);
+    if (trimmedCode.empty() || trimmedCode.front() != ':') {
+        return std::nullopt;
+    }
+
+    std::vector<std::string> parts;
+    const bool hasFirstColon = SplitPropertyParts(code, parts);
+    if (!hasFirstColon) {
+        return std::nullopt;
+    }
+
+    if (parts.empty()) {
+        return std::nullopt;
+    }
+
+    parts[0] = TranslateQuotedPart(parts[0], dict);          // 显示名
+    if (parts.size() >= 3) {
+        parts[2] = TranslateQuotedPart(parts[2], dict);      // 描述
+    }
+
+    const size_t leadPos = code.find_first_not_of(" \t");
+    const std::string leadingSpaces = (leadPos != std::string::npos) ? code.substr(0, leadPos) : "";
+    return leadingSpaces + JoinPropertyParts(parts, ":");
+}
+
+// 5. 选项列表 (Choices / Flags)："0" : "Enabled" : "Option Desc" 或 1 : "Passable" : 0
+std::optional<std::string> TryChoiceEntry(const std::string& code, const FgdDict& dict) {
+    const std::string trimmedCode = TrimString(code);
+    if (trimmedCode.empty() || trimmedCode.front() == '@' || code.find(':') == std::string::npos) {
+        return std::nullopt;
+    }
+
+    static const std::regex choiceRegex(R"re(^(\s*(?:"[^"]*"|[-0-9a-zA-Z_]+)\s*:\s*)"([^"]*)"(.*)$)re");
+    std::smatch choiceMatch;
+    if (!std::regex_match(code, choiceMatch, choiceRegex)) {
+        return std::nullopt;
+    }
+
+    const std::string cPrefix = choiceMatch[1].str();
+    const std::string display = choiceMatch[2].str();
+    std::string tail = choiceMatch[3].str();
+
+    // 替换 tail 中的附加选项描述（如果存在）
+    if (tail.find(':') != std::string::npos) {
+        static const std::regex tailDescRegex(R"re((:[^"]*)"([^"]*)")re");
+        std::smatch tailMatch;
+        if (std::regex_search(tail, tailMatch, tailDescRegex)) {
+            const std::string tPre = tailMatch[1].str();
+            const std::string tDesc = tailMatch[2].str();
+            const std::string trD = GetTranslation(dict, tDesc);
+            tail = tail.substr(0, tailMatch.position(0)) + tPre + "\"" + trD + "\""
+                 + tail.substr(tailMatch.position(0) + tailMatch.length(0));
+        }
+    }
+
+    return cPrefix + "\"" + GetTranslation(dict, display) + "\"" + tail;
+}
+
+} // namespace
+
+// ==============================================================================
+// 单行翻译主流程：
+//   分离行尾与注释 → 依次尝试各类 FGD 语法结构 → 未命中则原样返回
+// 各语法结构的判定与翻译见上方匿名命名空间中的 Try* 函数。
+// ==============================================================================
 std::string FgdTranslator::TranslateLine(
     const std::string& line,
     const std::unordered_map<std::string, std::string>& dict,
@@ -307,7 +766,8 @@ std::string FgdTranslator::TranslateLine(
     std::string& inOutCurrentClass,
     std::string& inOutPendingClassDesc
 ) {
-    std::string lineEnding = "";
+    // 1. 分离行尾换行符
+    std::string lineEnding;
     std::string raw = line;
     if (raw.length() >= 2 && raw.substr(raw.length() - 2) == "\r\n") {
         lineEnding = "\r\n";
@@ -317,12 +777,12 @@ std::string FgdTranslator::TranslateLine(
         raw = raw.substr(0, raw.length() - 1);
     }
 
-    // 分离代码与单行注释 //（避免匹配引号内的 //）
-    std::string comment = "";
+    // 2. 分离代码与单行注释 //（避免匹配引号内的 //）
+    std::string comment;
     std::string code = raw;
     bool inQuote = false;
     for (size_t i = 0; i < raw.length(); ++i) {
-        char ch = raw[i];
+        const char ch = raw[i];
         if (ch == '"') {
             inQuote = !inQuote;
         } else if (ch == '/' && !inQuote && i + 1 < raw.length() && raw[i + 1] == '/') {
@@ -332,420 +792,20 @@ std::string FgdTranslator::TranslateLine(
         }
     }
 
-    auto getTrans = [&](const std::string& text) -> std::string {
-        std::string trimmed = TrimString(text);
-        auto it = dict.find(trimmed);
-        if (it != dict.end() && !it->second.empty()) {
-            return it->second;
-        }
-        return text;
-    };
+    // 3. 按 FGD 语法优先级依次尝试，第一个命中的分支决定该行结果
+    const std::optional<std::string> translated = [&]() -> std::optional<std::string> {
+        if (auto r = TryPendingClassDesc(code, dict, overrideData, inOutPendingClassDesc)) return r;
+        if (auto r = TryClassDefinition(code, dict, overrideData, inOutCurrentClass, inOutPendingClassDesc)) return r;
+        if (auto r = TryIoDefinition(code, dict, overrideData, inOutCurrentClass)) return r;
+        if (auto r = TryDescMetadata(code, dict)) return r;
+        if (auto r = TryStandaloneGroup(code, dict)) return r;
+        if (auto r = TryPropertyDefinition(code, dict, overrideData, inOutCurrentClass)) return r;
+        if (auto r = TryPropertyContinuation(code, dict)) return r;
+        if (auto r = TryChoiceEntry(code, dict)) return r;
+        return std::nullopt;
+    }();
 
-    // 0. 检查是否正在等待上一行的跨行类说明 (如 @PointClass ... = classname :\n  "Desc")
-    if (!inOutPendingClassDesc.empty()) {
-        std::string trimmed = TrimString(code);
-        if (trimmed.empty()) {
-            // 空行保持状态
-            return code + comment + lineEnding;
-        }
-
-        std::regex standaloneStrRegex(R"re(^\s*"([^"]*)"\s*$)re");
-        std::smatch strMatch;
-        if (std::regex_match(code, strMatch, standaloneStrRegex)) {
-            std::string origDesc = strMatch[1].str();
-            std::string finalDesc = "";
-            auto itDesc = overrideData.classDescriptions.find(inOutPendingClassDesc);
-            if (itDesc != overrideData.classDescriptions.end() && !itDesc->second.empty()) {
-                finalDesc = itDesc->second;
-            } else {
-                finalDesc = getTrans(origDesc);
-            }
-            inOutPendingClassDesc = ""; // 已完成匹配替换
-
-            size_t lead = code.find_first_not_of(" \t");
-            std::string indent = (lead != std::string::npos) ? code.substr(0, lead) : "\t";
-            return indent + "\"" + finalDesc + "\"" + comment + lineEnding;
-        } else if (trimmed.front() == '[') {
-            // 原类定义没有独立描述行，直接遇到了 [
-            auto itDesc = overrideData.classDescriptions.find(inOutPendingClassDesc);
-            std::string cls = inOutPendingClassDesc;
-            inOutPendingClassDesc = "";
-            if (itDesc != overrideData.classDescriptions.end() && !itDesc->second.empty()) {
-                size_t lead = code.find_first_not_of(" \t");
-                std::string indent = (lead != std::string::npos) ? code.substr(0, lead) : "";
-                return indent + "\t\"" + itDesc->second + "\"\n" + code + comment + lineEnding;
-            }
-        } else {
-            inOutPendingClassDesc = "";
-        }
-    }
-
-    // 1. 实体类定义与说明跟踪：
-    // 1.1 同行完整定义：= classname : "Description"
-    std::regex classFullRegex(R"re((=\s*)([a-zA-Z0-9_]+)\s*:\s*"([^"]*)")re");
-    std::smatch classFullMatch;
-    if (std::regex_search(code, classFullMatch, classFullRegex)) {
-        std::string prefix = code.substr(0, classFullMatch.position(0));
-        std::string eq = classFullMatch[1].str();
-        std::string className = classFullMatch[2].str();
-        std::string origDesc = classFullMatch[3].str();
-        std::string suffix = code.substr(classFullMatch.position(0) + classFullMatch.length(0));
-
-        inOutCurrentClass = className;
-        inOutPendingClassDesc = "";
-
-        std::string finalDesc = "";
-        auto itDesc = overrideData.classDescriptions.find(className);
-        if (itDesc != overrideData.classDescriptions.end() && !itDesc->second.empty()) {
-            finalDesc = itDesc->second;
-        } else {
-            finalDesc = getTrans(origDesc);
-        }
-
-        return prefix + eq + className + " : \"" + finalDesc + "\"" + suffix + comment + lineEnding;
-    }
-
-    // 1.2 跨行或末尾冒号/无描述类定义：= classname : 或 = classname (行尾)
-    std::regex classHeaderRegex(R"re((=\s*)([a-zA-Z0-9_]+)(\s*:\s*|\s*)$)re");
-    std::smatch classHeaderMatch;
-    if (std::regex_search(code, classHeaderMatch, classHeaderRegex)) {
-        std::string className = classHeaderMatch[2].str();
-        inOutCurrentClass = className;
-        inOutPendingClassDesc = className;
-        return code + comment + lineEnding;
-    }
-
-    // 1.3 同行紧接中括号的无描述类定义：= classname [
-    std::regex classBracketRegex(R"re((=\s*)([a-zA-Z0-9_]+)\s*(\[.*)$)re");
-    std::smatch classBracketMatch;
-    if (std::regex_search(code, classBracketMatch, classBracketRegex)) {
-        std::string prefix = code.substr(0, classBracketMatch.position(0));
-        std::string eq = classBracketMatch[1].str();
-        std::string className = classBracketMatch[2].str();
-        std::string bracketTail = classBracketMatch[3].str();
-
-        inOutCurrentClass = className;
-        inOutPendingClassDesc = "";
-
-        auto itDesc = overrideData.classDescriptions.find(className);
-        if (itDesc != overrideData.classDescriptions.end() && !itDesc->second.empty()) {
-            return prefix + eq + className + " : \"" + itDesc->second + "\" " + bracketTail + comment + lineEnding;
-        }
-        return code + comment + lineEnding;
-    }
-
-    // 2. 输入 / 输出描述：input/output Name(type) [ : "Description" ]
-    std::regex ioRegex(R"re(^(\s*(?:input|output)\s+)([a-zA-Z0-9_]+)(\s*\([^)]*\))(.*)$)re");
-    std::smatch ioMatch;
-    if (std::regex_match(code, ioMatch, ioRegex)) {
-        std::string ioPrefix = ioMatch[1].str();
-        std::string ioName = ioMatch[2].str();
-        std::string ioParam = ioMatch[3].str();
-        std::string ioRest = ioMatch[4].str();
-
-        // 如果参数类型包含 api (如 (api))，Valve FGD 语法不支持冒号和描述，直接原样保留
-        if (ioParam.find("api") != std::string::npos) {
-            return code + comment + lineEnding;
-        }
-
-        std::string overrideIoDesc = "";
-        // 优先在当前类中查找，其次在全局 ioOverrides，最后在 globalProperties
-        if (!inOutCurrentClass.empty()) {
-            auto itCls = overrideData.classProperties.find(inOutCurrentClass);
-            if (itCls != overrideData.classProperties.end()) {
-                auto itP = itCls->second.find(ioName);
-                if (itP != itCls->second.end() && !itP->second.description.empty()) {
-                    overrideIoDesc = itP->second.description;
-                }
-            }
-        }
-        if (overrideIoDesc.empty()) {
-            auto itIo = overrideData.ioOverrides.find(ioName);
-            if (itIo != overrideData.ioOverrides.end() && !itIo->second.empty()) {
-                overrideIoDesc = itIo->second;
-            }
-        }
-        if (overrideIoDesc.empty()) {
-            auto itGlob = overrideData.globalProperties.find(ioName);
-            if (itGlob != overrideData.globalProperties.end() && !itGlob->second.description.empty()) {
-                overrideIoDesc = itGlob->second.description;
-            }
-        }
-
-        std::regex descQuoteRegex(R"re(:\s*"([^"]*)")re");
-        std::smatch descQuoteMatch;
-        if (std::regex_search(ioRest, descQuoteMatch, descQuoteRegex)) {
-            std::string origDesc = descQuoteMatch[1].str();
-            std::string finalDesc = overrideIoDesc.empty() ? getTrans(origDesc) : overrideIoDesc;
-            std::string replacedRest = ioRest.substr(0, descQuoteMatch.position(0)) + ": \"" + finalDesc + "\"" + ioRest.substr(descQuoteMatch.position(0) + descQuoteMatch.length(0));
-            return ioPrefix + ioName + ioParam + replacedRest + comment + lineEnding;
-        } else if (!overrideIoDesc.empty()) {
-            // 原行无描述，追加描述
-            return ioPrefix + ioName + ioParam + " : \"" + overrideIoDesc + "\"" + comment + lineEnding;
-        }
-        return code + comment + lineEnding;
-    }
-
-    // 3. 按钮/元数据说明：desc = "Description"
-    std::regex descRegex(R"re(\bdesc\s*=\s*"([^"]*)")re");
-    std::smatch descMatch;
-    if (std::regex_search(code, descMatch, descRegex)) {
-        std::string prefix = code.substr(0, descMatch.position(0));
-        std::string desc = descMatch[1].str();
-        std::string suffix = code.substr(descMatch.position(0) + descMatch.length(0));
-        std::string tr = getTrans(desc);
-        return prefix + "desc = \"" + tr + "\"" + suffix + comment + lineEnding;
-    }
-
-    // 3.1 属性跨行定义块内部独立组声明：group = "GroupName" (如 base.fgd useLocalOffset 属性内部)
-    std::regex standaloneGroupRegex(R"re(^\s*group(\s*=\s*)"([^"]*)")re");
-    std::smatch standMatch;
-    if (std::regex_search(code, standMatch, standaloneGroupRegex)) {
-        std::string prefix = code.substr(0, standMatch.position(0));
-        std::string eq = standMatch[1].str();
-        std::string gName = standMatch[2].str();
-        std::string suffix = code.substr(standMatch.position(0) + standMatch.length(0));
-        std::string trGroup = getTrans(gName);
-        return prefix + "group" + eq + "\"" + trGroup + "\"" + suffix + comment + lineEnding;
-    }
-
-    // 4. 属性定义：prop(type) [attrs] {attrs} : "Display Name" [ : default [ : "Description" ]] [ = [ choices ] ]
-    std::string propHead, propKey, propType, rest;
-    if (ExtractPropertyHeader(code, propHead, propKey, propType, rest)) {
-        // 翻译属性行内部的属性组：[ group="Render Properties" ] 或 { group="Style" } 等
-        std::regex groupRegex(R"re(\bgroup(\s*=\s*)"([^"]*)")re");
-        std::smatch groupMatch;
-        std::string newPropHead = "";
-        std::string searchHead = propHead;
-        while (std::regex_search(searchHead, groupMatch, groupRegex)) {
-            std::string prefix = searchHead.substr(0, groupMatch.position(0));
-            std::string eq = groupMatch[1].str();
-            std::string groupName = groupMatch[2].str();
-            std::string trGroup = getTrans(groupName);
-            newPropHead += prefix + "group" + eq + "\"" + trGroup + "\"";
-            searchHead = searchHead.substr(groupMatch.position(0) + groupMatch.length(0));
-        }
-        if (!newPropHead.empty()) {
-            newPropHead += searchHead;
-            propHead = newPropHead;
-        }
-
-        // 查找该属性是否有 override
-        const FgdPropertyOverride* propOverride = nullptr;
-        if (!inOutCurrentClass.empty()) {
-            auto itCls = overrideData.classProperties.find(inOutCurrentClass);
-            if (itCls != overrideData.classProperties.end()) {
-                auto itP = itCls->second.find(propKey);
-                if (itP != itCls->second.end()) {
-                    propOverride = &itP->second;
-                }
-            }
-        }
-        if (!propOverride) {
-            auto itGlob = overrideData.globalProperties.find(propKey);
-            if (itGlob != overrideData.globalProperties.end()) {
-                propOverride = &itGlob->second;
-            }
-        }
-
-        // 分离 choices 尾部 (如果有 = )
-        std::string choicesTail = "";
-        std::string propBody = rest;
-        bool inQ = false;
-        for (size_t i = 0; i < rest.length(); ++i) {
-            char c = rest[i];
-            if (c == '"') {
-                inQ = !inQ;
-            } else if (c == '=' && !inQ) {
-                propBody = rest.substr(0, i);
-                choicesTail = rest.substr(i);
-                break;
-            }
-        }
-
-        // 如果属性没有冒号定义（例如跨行定义的属性头部 useLocalOffset(boolean) 或 spawnflags(flags) [ group="Physics Properties" ] =）
-        if (TrimString(propBody).empty()) {
-            return propHead + rest + comment + lineEnding;
-        }
-
-        // 解析 propBody 中的冒号分隔项
-        std::vector<std::string> parts;
-        std::string curr = "";
-        inQ = false;
-        bool hasFirstColon = false;
-
-        for (size_t i = 0; i < propBody.length(); ++i) {
-            char c = propBody[i];
-            if (c == '"') {
-                inQ = !inQ;
-                curr.push_back(c);
-            } else if (c == ':' && !inQ) {
-                if (!hasFirstColon) {
-                    hasFirstColon = true;
-                    curr.clear();
-                } else {
-                    parts.push_back(curr);
-                    curr.clear();
-                }
-            } else {
-                curr.push_back(c);
-            }
-        }
-        if (hasFirstColon) {
-            parts.push_back(curr);
-        }
-
-        if (!hasFirstColon) {
-            return code + comment + lineEnding;
-        }
-
-        // 处理显示名称 (parts[0])
-        if (!parts.empty()) {
-            std::string dispPart = parts[0];
-            std::string dispStrip = TrimString(dispPart);
-            if (propOverride && !propOverride->displayName.empty()) {
-                parts[0] = " \"" + propOverride->displayName + "\"";
-            } else if (dispStrip.length() >= 2 && dispStrip.front() == '"' && dispStrip.back() == '"') {
-                std::string val = dispStrip.substr(1, dispStrip.length() - 2);
-                std::string tr = getTrans(val);
-                size_t pos = dispPart.find("\"" + val + "\"");
-                if (pos != std::string::npos) {
-                    dispPart.replace(pos, val.length() + 2, "\"" + tr + "\"");
-                }
-                parts[0] = dispPart;
-            }
-
-            // 处理描述与默认值
-            if (parts.size() == 1) {
-                // 仅有显示名
-                if (propOverride && !propOverride->description.empty()) {
-                    parts.push_back(" \"\"");
-                    parts.push_back(" \"" + propOverride->description + "\"");
-                }
-            } else if (parts.size() == 2) {
-                // 有显示名 + 默认值，无描述
-                if (propOverride && !propOverride->description.empty()) {
-                    parts.push_back(" \"" + propOverride->description + "\"");
-                }
-            } else {
-                // 有显示名 + 默认值 + 描述 (parts.size() >= 3)
-                std::string descPart = parts[2];
-                std::string descStrip = TrimString(descPart);
-
-                if (propOverride && !propOverride->description.empty()) {
-                    parts[2] = " \"" + propOverride->description + "\"";
-                } else if (descStrip.length() >= 2 && descStrip.front() == '"' && descStrip.back() == '"') {
-                    std::string val = descStrip.substr(1, descStrip.length() - 2);
-                    std::string tr = getTrans(val);
-                    size_t pos = descPart.find("\"" + val + "\"");
-                    if (pos != std::string::npos) {
-                        descPart.replace(pos, val.length() + 2, "\"" + tr + "\"");
-                    }
-                    parts[2] = descPart;
-                }
-            }
-        }
-
-        std::string newPropBody = " :";
-        for (size_t idx = 0; idx < parts.size(); ++idx) {
-            if (idx > 0) newPropBody += ":";
-            newPropBody += parts[idx];
-        }
-
-        return propHead + newPropBody + choicesTail + comment + lineEnding;
-    }
-
-    // 4.1 属性跨行定义的续行（以冒号开头，例如 : "Use Local Transform" : 0 : "..."）
-    std::string trimmedCode = TrimString(code);
-    if (!trimmedCode.empty() && trimmedCode.front() == ':') {
-        std::vector<std::string> parts;
-        std::string curr = "";
-        bool inQ = false;
-        bool hasFirstColon = false;
-        for (size_t k = 0; k < code.length(); ++k) {
-            char c = code[k];
-            if (c == '"') {
-                inQ = !inQ;
-                curr.push_back(c);
-            } else if (c == ':' && !inQ) {
-                if (!hasFirstColon) {
-                    hasFirstColon = true;
-                    curr.clear();
-                } else {
-                    parts.push_back(curr);
-                    curr.clear();
-                }
-            } else {
-                curr.push_back(c);
-            }
-        }
-        if (hasFirstColon) {
-            parts.push_back(curr);
-        }
-
-        if (!parts.empty()) {
-            // parts[0] display name
-            std::string dStrip = TrimString(parts[0]);
-            if (dStrip.length() >= 2 && dStrip.front() == '"' && dStrip.back() == '"') {
-                std::string val = dStrip.substr(1, dStrip.length() - 2);
-                std::string tr = getTrans(val);
-                size_t pos = parts[0].find("\"" + val + "\"");
-                if (pos != std::string::npos) {
-                    parts[0].replace(pos, val.length() + 2, "\"" + tr + "\"");
-                }
-            }
-            // parts[2] description
-            if (parts.size() >= 3) {
-                std::string descStrip = TrimString(parts[2]);
-                if (descStrip.length() >= 2 && descStrip.front() == '"' && descStrip.back() == '"') {
-                    std::string val = descStrip.substr(1, descStrip.length() - 2);
-                    std::string tr = getTrans(val);
-                    size_t pos = parts[2].find("\"" + val + "\"");
-                    if (pos != std::string::npos) {
-                        parts[2].replace(pos, val.length() + 2, "\"" + tr + "\"");
-                    }
-                }
-            }
-
-            size_t leadPos = code.find_first_not_of(" \t");
-            std::string leadingSpaces = (leadPos != std::string::npos) ? code.substr(0, leadPos) : "";
-            std::string reassembled = leadingSpaces + ":";
-            for (size_t k = 0; k < parts.size(); ++k) {
-                if (k > 0) reassembled += ":";
-                reassembled += parts[k];
-            }
-            return reassembled + comment + lineEnding;
-        }
-    }
-
-    // 5. 选项列表 (Choices / Flags)："0" : "Enabled" : "Option Desc" 或 1 : "Passable" : 0
-    if (!trimmedCode.empty() && trimmedCode.front() != '@' && code.find(':') != std::string::npos) {
-        std::regex choiceRegex(R"re(^(\s*(?:"[^"]*"|[-0-9a-zA-Z_]+)\s*:\s*)"([^"]*)"(.*)$)re");
-        std::smatch choiceMatch;
-        if (std::regex_match(code, choiceMatch, choiceRegex)) {
-            std::string cPrefix = choiceMatch[1].str();
-            std::string display = choiceMatch[2].str();
-            std::string tail = choiceMatch[3].str();
-            std::string trDisplay = getTrans(display);
-
-            // 替换 tail 中的附加选项描述 (如果存在)
-            if (tail.find(':') != std::string::npos) {
-                std::regex tailDescRegex(R"re((:[^"]*)"([^"]*)")re");
-                std::smatch tailMatch;
-                if (std::regex_search(tail, tailMatch, tailDescRegex)) {
-                    std::string tPre = tailMatch[1].str();
-                    std::string tDesc = tailMatch[2].str();
-                    std::string trD = getTrans(tDesc);
-                    std::string replacedTail = tail.substr(0, tailMatch.position(0)) + tPre + "\"" + trD + "\"" + tail.substr(tailMatch.position(0) + tailMatch.length(0));
-                    tail = replacedTail;
-                }
-            }
-
-            return cPrefix + "\"" + trDisplay + "\"" + tail + comment + lineEnding;
-        }
-    }
-
-    return code + comment + lineEnding;
+    return translated.value_or(code) + comment + lineEnding;
 }
 
 // ==============================================================================

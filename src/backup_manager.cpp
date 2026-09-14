@@ -1,5 +1,6 @@
 #include "backup_manager.h"
 #include "pe_patcher.h"
+#include "path_constants.h"
 #include <windows.h>
 #include <winver.h>
 #include <filesystem>
@@ -20,6 +21,21 @@
 #include <QDebug>
 
 namespace fs = std::filesystem;
+
+namespace {
+
+// 判断一个 DLL 是否带 LCLZ 补丁标记。
+//
+// 语义约定：GetPatchInfo 失败时（文件被占用、不是合法 PE 等）一律按「未打补丁」处理，
+// 这是各调用点长期以来的实际行为。此前每处都声明一个从不读取的 pErr，
+// 看不出"忽略错误"是有意为之，也让 5 个调用点各写一遍同样的三行样板。
+bool IsPatchedDll(const fs::path& dllPath) {
+    PatchInfo info;
+    std::wstring ignoredError;
+    return PePatcher::GetPatchInfo(dllPath.wstring(), info, ignoredError) && info.isPatched;
+}
+
+} // namespace
 
 std::string BackupManager::ComputeFileSha256(const std::wstring& filePath) {
     QFile file(QString::fromStdWString(filePath));
@@ -103,10 +119,10 @@ bool BackupManager::HasBackup(const std::wstring& backupDir) {
 
 bool BackupManager::GetCurrentGameSignature(const std::wstring& cs2Root, GameVersionSignature& outSig, std::wstring& outError) {
     try {
-        fs::path win64Bin = fs::path(cs2Root) / L"game" / L"bin" / L"win64";
-        fs::path cs2Exe = win64Bin / L"cs2.exe";
-        fs::path qt5Core = win64Bin / L"Qt5Core.dll";
-        fs::path qt5Widgets = win64Bin / L"Qt5Widgets.dll";
+        fs::path win64Bin = paths::Win64Bin(cs2Root);
+        fs::path cs2Exe = paths::Cs2Exe(cs2Root);
+        fs::path qt5Core = paths::Qt5Core(cs2Root);
+        fs::path qt5Widgets = paths::Qt5Widgets(cs2Root);
 
         if (!fs::exists(cs2Exe)) {
             outError = L"未找到 cs2.exe: " + cs2Exe.wstring();
@@ -126,7 +142,7 @@ bool BackupManager::GetCurrentGameSignature(const std::wstring& cs2Root, GameVer
 
 bool BackupManager::ReadBackupManifest(const std::wstring& backupDir, GameVersionSignature& outSig, std::wstring& outError) {
     try {
-        fs::path manifestPath = fs::path(backupDir) / L"backup_manifest.json";
+        fs::path manifestPath = paths::Manifest(backupDir);
         if (!fs::exists(manifestPath)) {
             outError = L"未找到备份版本元数据清单: " + manifestPath.wstring();
             return false;
@@ -168,7 +184,7 @@ bool BackupManager::ReadBackupManifest(const std::wstring& backupDir, GameVersio
 
 bool BackupManager::WriteBackupManifest(const std::wstring& backupDir, const GameVersionSignature& sig, std::wstring& outError) {
     try {
-        fs::path manifestPath = fs::path(backupDir) / L"backup_manifest.json";
+        fs::path manifestPath = paths::Manifest(backupDir);
         fs::create_directories(manifestPath.parent_path());
 
         QJsonObject root;
@@ -260,11 +276,9 @@ BackupValidationResult BackupManager::BackupMatchesCurrentGame(const std::wstrin
     }
 
     // 3. 校验备份中 Qt5Core.dll 与清单记录的一致性
-    fs::path backupQtCore = fs::path(backupDir) / L"game" / L"bin" / L"win64" / L"Qt5Core.dll";
+    fs::path backupQtCore = paths::Qt5Core(backupDir);
     if (fs::exists(backupQtCore)) {
-        PatchInfo bInfo;
-        std::wstring pErr;
-        if (PePatcher::GetPatchInfo(backupQtCore.wstring(), bInfo, pErr) && bInfo.isPatched) {
+        if (IsPatchedDll(backupQtCore)) {
             res.status = BackupMatchStatus::GameUpdated;
             res.reason = L"备份目录内的 Qt5Core.dll 包含 LCLZ 补丁标记（非纯净原版），备份不可用。";
             return res;
@@ -279,12 +293,9 @@ BackupValidationResult BackupManager::BackupMatchesCurrentGame(const std::wstrin
     }
 
     // 4. 校验当前游戏目录中未补丁状态的 Qt5Core.dll (若当前游戏文件是纯净状态，比对是否与备份一致)
-    fs::path gameQtCore = fs::path(cs2Root) / L"game" / L"bin" / L"win64" / L"Qt5Core.dll";
+    fs::path gameQtCore = paths::Qt5Core(cs2Root);
     if (fs::exists(gameQtCore)) {
-        PatchInfo gInfo;
-        std::wstring pErr;
-        bool isPatched = (PePatcher::GetPatchInfo(gameQtCore.wstring(), gInfo, pErr) && gInfo.isPatched);
-        if (!isPatched) {
+        if (!IsPatchedDll(gameQtCore)) {
             std::string gameQtCoreHash = ComputeFileSha256(gameQtCore.wstring());
             if (gameQtCoreHash != res.backupSig.qt5CoreSha256) {
                 res.status = BackupMatchStatus::GameUpdated;
@@ -301,7 +312,7 @@ BackupValidationResult BackupManager::BackupMatchesCurrentGame(const std::wstrin
 
 bool BackupManager::CreateOrUpdateBackup(const std::wstring& cs2Root, const std::wstring& backupDir, std::vector<std::wstring>& outBackedUpFiles, std::wstring& outError, bool forceRecreate) {
     fs::path targetBackupPath(backupDir);
-    fs::path manifestPath = targetBackupPath / L"backup_manifest.json";
+    fs::path manifestPath = paths::Manifest(targetBackupPath);
 
     // 核心安全防线 1：如果不是显式 forceRecreate，且有效备份与 manifest 已存在，绝不重复更新 manifest！
     if (!forceRecreate && HasBackup(backupDir) && fs::exists(manifestPath)) {
@@ -331,7 +342,7 @@ bool BackupManager::CreateOrUpdateBackup(const std::wstring& cs2Root, const std:
         return false;
     }
 
-    fs::path backupQtCore = stagingPath / L"game" / L"bin" / L"win64" / L"Qt5Core.dll";
+    fs::path backupQtCore = paths::Qt5Core(stagingPath);
     if (!fs::exists(backupQtCore)) {
         fs::remove_all(stagingPath, ec);
         outError = L"备份临时目录未找到 Qt5Core.dll";
@@ -339,9 +350,7 @@ bool BackupManager::CreateOrUpdateBackup(const std::wstring& cs2Root, const std:
     }
 
     // 严格验证备份目录中的 Qt5Core.dll 绝不能是 patched 的！
-    PatchInfo patchInfo;
-    std::wstring pErr;
-    if (PePatcher::GetPatchInfo(backupQtCore.wstring(), patchInfo, pErr) && patchInfo.isPatched) {
+    if (IsPatchedDll(backupQtCore)) {
         fs::remove_all(stagingPath, ec);
         outError = L"备份的 Qt5Core.dll 包含 LCLZ 补丁标记，严禁用 patched 文件生成 manifest！";
         return false;
@@ -400,7 +409,7 @@ bool BackupManager::CreateOrUpdateBackup(const std::wstring& cs2Root, const std:
 bool BackupManager::BackupFgdFiles(const std::wstring& cs2Root, const std::wstring& backupDir, std::vector<std::wstring>& outBackedUpFiles, std::wstring& outError) {
     try {
         fs::path cs2Path(cs2Root);
-        fs::path gamePath = cs2Path / L"game";
+        fs::path gamePath = cs2Path / paths::kGameDir;
         fs::path backupPath(backupDir);
 
         if (!fs::exists(gamePath)) {
@@ -434,8 +443,8 @@ bool BackupManager::BackupFgdFiles(const std::wstring& cs2Root, const std::wstri
 
 bool BackupManager::BackupQtCore(const std::wstring& cs2Root, const std::wstring& backupDir, std::wstring& outError) {
     try {
-        fs::path srcQtCore = fs::path(cs2Root) / L"game" / L"bin" / L"win64" / L"Qt5Core.dll";
-        fs::path dstQtCore = fs::path(backupDir) / L"game" / L"bin" / L"win64" / L"Qt5Core.dll";
+        fs::path srcQtCore = paths::Qt5Core(cs2Root);
+        fs::path dstQtCore = paths::Qt5Core(backupDir);
 
         if (!fs::exists(srcQtCore)) {
             outError = L"未找到源 Qt5Core.dll: " + srcQtCore.wstring();
@@ -445,9 +454,7 @@ bool BackupManager::BackupQtCore(const std::wstring& cs2Root, const std::wstring
         // 安全策略：若备份已存在
         if (fs::exists(dstQtCore)) {
             // 验证已存在的备份是否是未补丁的纯净原版
-            PatchInfo bInfo;
-            std::wstring pErr;
-            if (PePatcher::GetPatchInfo(dstQtCore.wstring(), bInfo, pErr) && bInfo.isPatched) {
+            if (IsPatchedDll(dstQtCore)) {
                 // 备份文件已被污染（包含 LCLZ），必须将其移除
                 std::error_code ec;
                 fs::remove(dstQtCore, ec);
@@ -458,9 +465,7 @@ bool BackupManager::BackupQtCore(const std::wstring& cs2Root, const std::wstring
         }
 
         // 检查源 Qt5Core.dll 是否已被修补 (包含 LCLZ 补丁)
-        PatchInfo srcInfo;
-        std::wstring pErr;
-        if (PePatcher::GetPatchInfo(srcQtCore.wstring(), srcInfo, pErr) && srcInfo.isPatched) {
+        if (IsPatchedDll(srcQtCore)) {
             outError = L"当前 CS2 目录下的 Qt5Core.dll 处于已补丁状态 (包含 LCLZ 标记)，严禁将其作为原版备份复制！";
             return false;
         }
@@ -499,7 +504,7 @@ bool BackupManager::RestoreAll(const std::wstring& cs2Root, const std::wstring& 
         // 1. 还原 backup 目录下的所有文件 (排除 backup_manifest.json，带重试机制)
         for (const auto& entry : fs::recursive_directory_iterator(backupRoot)) {
             if (entry.is_regular_file()) {
-                if (entry.path().filename() == L"backup_manifest.json") {
+                if (entry.path().filename() == paths::kBackupManifest) {
                     continue;
                 }
 
@@ -515,9 +520,9 @@ bool BackupManager::RestoreAll(const std::wstring& cs2Root, const std::wstring& 
         }
 
         // 2. 清理临时部署的注入文件 (带重试机制)
-        fs::path win64Bin = cs2Path / L"game" / L"bin" / L"win64";
-        fs::path tempQmDll = win64Bin / L"qtcore_qm.dll";
-        fs::path tempJsonc = win64Bin / L"qt_translations.jsonc";
+        fs::path win64Bin = paths::Win64Bin(cs2Path);
+        fs::path tempQmDll = win64Bin / paths::kInjectDll;
+        fs::path tempJsonc = win64Bin / paths::kQtDictFile;
 
         SafeRemoveFileWithRetry(tempQmDll, 15, 100);
         SafeRemoveFileWithRetry(tempJsonc, 15, 100);
@@ -531,9 +536,9 @@ bool BackupManager::RestoreAll(const std::wstring& cs2Root, const std::wstring& 
 
 bool BackupManager::IsPatchDeployed(const std::wstring& cs2Root) {
     try {
-        fs::path win64Bin = fs::path(cs2Root) / L"game" / L"bin" / L"win64";
-        fs::path qmDll = win64Bin / L"qtcore_qm.dll";
-        fs::path qtJsonc = win64Bin / L"qt_translations.jsonc";
+        fs::path win64Bin = paths::Win64Bin(cs2Root);
+        fs::path qmDll = win64Bin / paths::kInjectDll;
+        fs::path qtJsonc = win64Bin / paths::kQtDictFile;
         return fs::exists(qmDll) || fs::exists(qtJsonc);
     } catch (...) {
         return false;

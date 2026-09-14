@@ -1,8 +1,12 @@
 #pragma once
 
 #include <QMainWindow>
+#include <QJsonDocument>
+#include <QByteArray>
 #include <QProcess>
 #include <string>
+#include "process_monitor.h"
+#include "hammer_ipc.h"
 
 class QComboBox;
 class QLineEdit;
@@ -78,6 +82,34 @@ private:
         std::function<void(bool success, const QByteArray& data)> callback
     );
 
+    // 在线词典「下载失败」的统一收尾：记日志 + 弹窗 + 恢复 UI
+    void reportDictionaryFetchFailure(const QString& dictName);
+
+    // 在线词典「解析失败」的统一收尾：记日志（含解析错误描述）+ 弹窗 + 恢复 UI
+    void reportDictionaryParseFailure(
+        const QString& dictName,
+        const QString& parseErrorText
+    );
+
+    // 一个在线词典的拉取结果
+    struct OnlineDictionary {
+        QByteArray    raw;    // 原始下载内容（落盘时使用）
+        QJsonDocument doc;    // 剥离注释并解析后的文档（校验与计数使用）
+        qsizetype     count;  // 有效条目数（日志与结果提示使用）
+    };
+
+    // 在线词典的统一下载流程：尝试多个候选 URL → 剥离 JSONC 注释 → 解析 → 校验。
+    // 失败时已完成日志、弹窗与 UI 恢复，且不会调用 onSuccess；
+    // 成功时把结果交给 onSuccess 继续下一步（三个词典需串行拉取，故用回调串联）。
+    void fetchOnlineDictionary(
+        const QStringList& urls,
+        const QString& stepLabel,                                  // 如 "[1/3]"
+        const QString& dictName,                                   // 如 "qt_translations.jsonc"
+        const QString& desc,                                       // 如 "界面词典"
+        std::function<qsizetype(const QJsonDocument&)> countOf,     // 有效条目数如何统计
+        std::function<void(const OnlineDictionary&)> onSuccess
+    );
+
     std::wstring m_cs2Root;
     std::wstring m_workingDir;
 
@@ -117,7 +149,7 @@ private:
     QProcess* m_hammerProcess;
     class QTimer* m_monitorTimer;
 
-    int m_notRunningCount;
+    ProcessMonitor m_processMonitor;
     bool m_isHammerRunning;
     qint64 m_hammerPid;
     void* m_hammerProcessHandle;

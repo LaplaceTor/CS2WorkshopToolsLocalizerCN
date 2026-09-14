@@ -13,6 +13,7 @@
 #include "hook_manager.h"
 #include "pe_patcher.h"
 #include "dictionary_compiler.h"
+#include "encoding_util.h"
 #include "hde/hde64.h"
 
 #pragma intrinsic(_ReturnAddress)
@@ -1039,18 +1040,12 @@ static bool FindTranslationScoped(void* callerAddr, const char* text, std::strin
     return false;
 }
 
+// 堆分配版 UTF-16 -> UTF-8，委托给全项目统一的 enc::WideToUtf8。
+// 注意：调用方在它之前还有一条栈缓冲快路径（char utf8Stack[1024]），
+// 那是钩子热路径上刻意做的免分配优化，不要一并替换掉。
 static std::string WStringToUtf8(const wchar_t* wstr) {
     if (!wstr || !*wstr) return "";
-    int sizeNeeded = WideCharToMultiByte(CP_UTF8, 0, wstr, -1, NULL, 0, NULL, NULL);
-    if (sizeNeeded <= 1) return "";
-    std::string str(static_cast<size_t>(sizeNeeded), '\0');
-    int written = WideCharToMultiByte(CP_UTF8, 0, wstr, -1, str.data(), sizeNeeded, NULL, NULL);
-    if (written > 0) {
-        str.resize(static_cast<size_t>(written - 1));
-    } else {
-        str.clear();
-    }
-    return str;
+    return enc::WideToUtf8(wstr);
 }
 
 static bool FindTranslationScopedW(void* callerAddr, const wchar_t* wstr, std::string& outResult, TranslationSource source = TranslationSource::StaticUI) {
@@ -1255,676 +1250,262 @@ extern "C" __declspec(dllexport) void* __fastcall tr(const void* pMetaObject, vo
     return hk_QMetaObject_tr(pMetaObject, pOutQString, sourceText, disambiguation, n);
 }
 
-// 2. QPainter::drawText (全面覆盖 PropertyEditor 属性面板与树形表格渲染，支持双向即时无损渲染)
-static void __fastcall hk_QPainter_drawText_Rect(void* pPainter, const void* pRect, int flags, const void* pQString, void* pBoundingRect) {
-    void* caller = _ReturnAddress();
+// =============================================================================
+// 3.5 通用转发钩子
+// -----------------------------------------------------------------------------
+// 下面 29 个 hk_* 钩子此前是 29 份几乎逐行相同的代码：取返回地址 → 读 QString 原文
+// → 查作用域词典 → 命中则构造译文 QString 并调用原始函数 → 否则用原文调用。
+// 现在这段流程只实现一次，每个钩子只保留自己的签名与调用实参。
+//
+// 【重要】caller 必须由钩子函数用 _ReturnAddress() 取得后传入，不能在辅助函数内部取：
+// 作用域词典靠调用方地址定位所属模块，若在辅助函数里取，得到的永远是本 DLL 的地址，
+// 所有模块作用域判定会全部失效（表现为所有 scoped 词条都不生效，且不报任何错）。
+// =============================================================================
+
+// 读取 pQString 的原文并查词典，然后用译文（未命中则用原文）调用 forward。
+// forward 恰好被调用一次；是否判空、如何处理返回值由各钩子自己决定。
+template <typename Forward>
+__forceinline static void ForwardTranslatedQString(void* caller, const void* pQString,
+                                     TranslationSource source, Forward&& forward) {
     const wchar_t* wstr = nullptr;
     if (SafeGetUtf16(g_pfn_utf16, pQString, wstr)) {
         std::string trans;
         bool found = false;
         if (g_bTranslationEnabled.load(std::memory_order_relaxed)) {
-            found = FindTranslationScopedW(caller, wstr, trans, TranslationSource::Painter);
+            found = FindTranslationScopedW(caller, wstr, trans, source);
         } else {
             found = FindReverseTranslationScopedW(caller, wstr, trans);
         }
         if (found) {
             void* qstr[1] = {0};
-            if (SafeCreateQString(g_pfn_fromUtf8, qstr, trans.c_str(), (int)trans.length())) {
-                if (g_o_QPainter_drawText_Rect) g_o_QPainter_drawText_Rect(pPainter, pRect, flags, qstr, pBoundingRect);
+            if (SafeCreateQString(g_pfn_fromUtf8, qstr, trans.c_str(), static_cast<int>(trans.length()))) {
+                forward(qstr);
                 SafeDestroyQString(g_pfn_QString_dtor, qstr);
                 return;
             }
         }
     }
-    if (g_o_QPainter_drawText_Rect) g_o_QPainter_drawText_Rect(pPainter, pRect, flags, pQString, pBoundingRect);
+    forward(pQString);
+}
+
+// 2. QPainter::drawText 系列
+//    全面覆盖 PropertyEditor 属性面板与树形表格渲染，支持双向即时无损渲染
+
+static void __fastcall hk_QPainter_drawText_Rect(void* pPainter, const void* pRect, int flags, const void* pQString, void* pBoundingRect) {
+    void* caller = _ReturnAddress();
+    ForwardTranslatedQString(caller, pQString, TranslationSource::Painter, [&](const void* text) {
+        if (g_o_QPainter_drawText_Rect) g_o_QPainter_drawText_Rect(pPainter, pRect, flags, text, pBoundingRect);
+    });
 }
 
 static void __fastcall hk_QPainter_drawText_RectF(void* pPainter, const void* pRectF, int flags, const void* pQString, void* pBoundingRect) {
     void* caller = _ReturnAddress();
-    const wchar_t* wstr = nullptr;
-    if (SafeGetUtf16(g_pfn_utf16, pQString, wstr)) {
-        std::string trans;
-        bool found = false;
-        if (g_bTranslationEnabled.load(std::memory_order_relaxed)) {
-            found = FindTranslationScopedW(caller, wstr, trans, TranslationSource::Painter);
-        } else {
-            found = FindReverseTranslationScopedW(caller, wstr, trans);
-        }
-        if (found) {
-            void* qstr[1] = {0};
-            if (SafeCreateQString(g_pfn_fromUtf8, qstr, trans.c_str(), (int)trans.length())) {
-                if (g_o_QPainter_drawText_RectF) g_o_QPainter_drawText_RectF(pPainter, pRectF, flags, qstr, pBoundingRect);
-                SafeDestroyQString(g_pfn_QString_dtor, qstr);
-                return;
-            }
-        }
-    }
-    if (g_o_QPainter_drawText_RectF) g_o_QPainter_drawText_RectF(pPainter, pRectF, flags, pQString, pBoundingRect);
+    ForwardTranslatedQString(caller, pQString, TranslationSource::Painter, [&](const void* text) {
+        if (g_o_QPainter_drawText_RectF) g_o_QPainter_drawText_RectF(pPainter, pRectF, flags, text, pBoundingRect);
+    });
 }
 
 static void __fastcall hk_QPainter_drawText_PointF(void* pPainter, const void* pPointF, const void* pQString) {
     void* caller = _ReturnAddress();
-    const wchar_t* wstr = nullptr;
-    if (SafeGetUtf16(g_pfn_utf16, pQString, wstr)) {
-        std::string trans;
-        bool found = false;
-        if (g_bTranslationEnabled.load(std::memory_order_relaxed)) {
-            found = FindTranslationScopedW(caller, wstr, trans, TranslationSource::Painter);
-        } else {
-            found = FindReverseTranslationScopedW(caller, wstr, trans);
-        }
-        if (found) {
-            void* qstr[1] = {0};
-            if (SafeCreateQString(g_pfn_fromUtf8, qstr, trans.c_str(), (int)trans.length())) {
-                if (g_o_QPainter_drawText_PointF) g_o_QPainter_drawText_PointF(pPainter, pPointF, qstr);
-                SafeDestroyQString(g_pfn_QString_dtor, qstr);
-                return;
-            }
-        }
-    }
-    if (g_o_QPainter_drawText_PointF) g_o_QPainter_drawText_PointF(pPainter, pPointF, pQString);
+    ForwardTranslatedQString(caller, pQString, TranslationSource::Painter, [&](const void* text) {
+        if (g_o_QPainter_drawText_PointF) g_o_QPainter_drawText_PointF(pPainter, pPointF, text);
+    });
 }
 
 static void __fastcall hk_QPainter_drawText_RectF_Option(void* pPainter, const void* pRectF, const void* pQString, const void* pOption) {
     void* caller = _ReturnAddress();
-    const wchar_t* wstr = nullptr;
-    if (SafeGetUtf16(g_pfn_utf16, pQString, wstr)) {
-        std::string trans;
-        bool found = false;
-        if (g_bTranslationEnabled.load(std::memory_order_relaxed)) {
-            found = FindTranslationScopedW(caller, wstr, trans, TranslationSource::Painter);
-        } else {
-            found = FindReverseTranslationScopedW(caller, wstr, trans);
-        }
-        if (found) {
-            void* qstr[1] = {0};
-            if (SafeCreateQString(g_pfn_fromUtf8, qstr, trans.c_str(), (int)trans.length())) {
-                if (g_o_QPainter_drawText_RectF_Option) g_o_QPainter_drawText_RectF_Option(pPainter, pRectF, qstr, pOption);
-                SafeDestroyQString(g_pfn_QString_dtor, qstr);
-                return;
-            }
-        }
-    }
-    if (g_o_QPainter_drawText_RectF_Option) g_o_QPainter_drawText_RectF_Option(pPainter, pRectF, pQString, pOption);
+    ForwardTranslatedQString(caller, pQString, TranslationSource::Painter, [&](const void* text) {
+        if (g_o_QPainter_drawText_RectF_Option) g_o_QPainter_drawText_RectF_Option(pPainter, pRectF, text, pOption);
+    });
 }
 
 static void __fastcall hk_QPainter_drawText_Point(void* pPainter, const void* pPoint, const void* pQString) {
     void* caller = _ReturnAddress();
-    const wchar_t* wstr = nullptr;
-    if (SafeGetUtf16(g_pfn_utf16, pQString, wstr)) {
-        std::string trans;
-        bool found = false;
-        if (g_bTranslationEnabled.load(std::memory_order_relaxed)) {
-            found = FindTranslationScopedW(caller, wstr, trans, TranslationSource::Painter);
-        } else {
-            found = FindReverseTranslationScopedW(caller, wstr, trans);
-        }
-        if (found) {
-            void* qstr[1] = {0};
-            if (SafeCreateQString(g_pfn_fromUtf8, qstr, trans.c_str(), (int)trans.length())) {
-                if (g_o_QPainter_drawText_Point) g_o_QPainter_drawText_Point(pPainter, pPoint, qstr);
-                SafeDestroyQString(g_pfn_QString_dtor, qstr);
-                return;
-            }
-        }
-    }
-    if (g_o_QPainter_drawText_Point) g_o_QPainter_drawText_Point(pPainter, pPoint, pQString);
+    ForwardTranslatedQString(caller, pQString, TranslationSource::Painter, [&](const void* text) {
+        if (g_o_QPainter_drawText_Point) g_o_QPainter_drawText_Point(pPainter, pPoint, text);
+    });
 }
 
 static void __fastcall hk_QPainter_drawText_xy(void* pPainter, int x, int y, const void* pQString) {
     void* caller = _ReturnAddress();
-    const wchar_t* wstr = nullptr;
-    if (SafeGetUtf16(g_pfn_utf16, pQString, wstr)) {
-        std::string trans;
-        bool found = false;
-        if (g_bTranslationEnabled.load(std::memory_order_relaxed)) {
-            found = FindTranslationScopedW(caller, wstr, trans, TranslationSource::Painter);
-        } else {
-            found = FindReverseTranslationScopedW(caller, wstr, trans);
-        }
-        if (found) {
-            void* qstr[1] = {0};
-            if (SafeCreateQString(g_pfn_fromUtf8, qstr, trans.c_str(), (int)trans.length())) {
-                if (g_o_QPainter_drawText_xy) g_o_QPainter_drawText_xy(pPainter, x, y, qstr);
-                SafeDestroyQString(g_pfn_QString_dtor, qstr);
-                return;
-            }
-        }
-    }
-    if (g_o_QPainter_drawText_xy) g_o_QPainter_drawText_xy(pPainter, x, y, pQString);
+    ForwardTranslatedQString(caller, pQString, TranslationSource::Painter, [&](const void* text) {
+        if (g_o_QPainter_drawText_xy) g_o_QPainter_drawText_xy(pPainter, x, y, text);
+    });
 }
 
-// 2.1 QTextDocument (拦截 CQRichItemListPicker 等富文本代理列表项与描述文本)
+// 3. 静态界面文本：菜单项、标签、窗口标题、按钮文字等
+//    作用域 StaticUI，与绘制期文本区分开，避免误译
+
 static void __fastcall hk_QTextDocument_setPlainText(void* pDoc, const void* pQString) {
     void* caller = _ReturnAddress();
-    const wchar_t* wstr = nullptr;
-    if (SafeGetUtf16(g_pfn_utf16, pQString, wstr)) {
-        std::string trans;
-        bool found = false;
-        if (g_bTranslationEnabled.load(std::memory_order_relaxed)) {
-            found = FindTranslationScopedW(caller, wstr, trans, TranslationSource::StaticUI);
-        } else {
-            found = FindReverseTranslationScopedW(caller, wstr, trans);
-        }
-        if (found) {
-            void* qstr[1] = {0};
-            if (SafeCreateQString(g_pfn_fromUtf8, qstr, trans.c_str(), (int)trans.length())) {
-                if (g_o_QTextDocument_setPlainText) g_o_QTextDocument_setPlainText(pDoc, qstr);
-                SafeDestroyQString(g_pfn_QString_dtor, qstr);
-                return;
-            }
-        }
-    }
-    if (g_o_QTextDocument_setPlainText) g_o_QTextDocument_setPlainText(pDoc, pQString);
+    ForwardTranslatedQString(caller, pQString, TranslationSource::StaticUI, [&](const void* text) {
+        if (g_o_QTextDocument_setPlainText) g_o_QTextDocument_setPlainText(pDoc, text);
+    });
 }
 
 static void __fastcall hk_QTextDocument_setHtml(void* pDoc, const void* pQString) {
     void* caller = _ReturnAddress();
-    const wchar_t* wstr = nullptr;
-    if (SafeGetUtf16(g_pfn_utf16, pQString, wstr)) {
-        std::string trans;
-        bool found = false;
-        if (g_bTranslationEnabled.load(std::memory_order_relaxed)) {
-            found = FindTranslationScopedW(caller, wstr, trans, TranslationSource::StaticUI);
-        } else {
-            found = FindReverseTranslationScopedW(caller, wstr, trans);
-        }
-        if (found) {
-            void* qstr[1] = {0};
-            if (SafeCreateQString(g_pfn_fromUtf8, qstr, trans.c_str(), (int)trans.length())) {
-                if (g_o_QTextDocument_setHtml) g_o_QTextDocument_setHtml(pDoc, qstr);
-                SafeDestroyQString(g_pfn_QString_dtor, qstr);
-                return;
-            }
-        }
-    }
-    if (g_o_QTextDocument_setHtml) g_o_QTextDocument_setHtml(pDoc, pQString);
-}
-
-// 3. QAction
-static void* __fastcall hk_QAction_ctor(void* pAction, const void* pQString, void* pParent) {
-    void* caller = _ReturnAddress();
-    const wchar_t* wstr = nullptr;
-    if (SafeGetUtf16(g_pfn_utf16, pQString, wstr)) {
-        std::string trans;
-        bool found = false;
-        if (g_bTranslationEnabled.load(std::memory_order_relaxed)) {
-            found = FindTranslationScopedW(caller, wstr, trans);
-        } else {
-            found = FindReverseTranslationScopedW(caller, wstr, trans);
-        }
-        if (found) {
-            void* qstr[1] = {0};
-            if (SafeCreateQString(g_pfn_fromUtf8, qstr, trans.c_str(), (int)trans.length())) {
-                void* res = g_o_QAction_ctor(pAction, qstr, pParent);
-                SafeDestroyQString(g_pfn_QString_dtor, qstr);
-                return res;
-            }
-        }
-    }
-    return g_o_QAction_ctor(pAction, pQString, pParent);
-}
-
-static void* __fastcall hk_QAction_ctor_icon(void* pAction, const void* pIcon, const void* pQString, void* pParent) {
-    void* caller = _ReturnAddress();
-    const wchar_t* wstr = nullptr;
-    if (SafeGetUtf16(g_pfn_utf16, pQString, wstr)) {
-        std::string trans;
-        bool found = false;
-        if (g_bTranslationEnabled.load(std::memory_order_relaxed)) {
-            found = FindTranslationScopedW(caller, wstr, trans);
-        } else {
-            found = FindReverseTranslationScopedW(caller, wstr, trans);
-        }
-        if (found) {
-            void* qstr[1] = {0};
-            if (SafeCreateQString(g_pfn_fromUtf8, qstr, trans.c_str(), (int)trans.length())) {
-                void* res = g_o_QAction_ctor_icon(pAction, pIcon, qstr, pParent);
-                SafeDestroyQString(g_pfn_QString_dtor, qstr);
-                return res;
-            }
-        }
-    }
-    return g_o_QAction_ctor_icon(pAction, pIcon, pQString, pParent);
+    ForwardTranslatedQString(caller, pQString, TranslationSource::StaticUI, [&](const void* text) {
+        if (g_o_QTextDocument_setHtml) g_o_QTextDocument_setHtml(pDoc, text);
+    });
 }
 
 static void __fastcall hk_QAction_setText(void* pAction, const void* pQString) {
     void* caller = _ReturnAddress();
-    const wchar_t* wstr = nullptr;
-    if (SafeGetUtf16(g_pfn_utf16, pQString, wstr)) {
-        std::string trans;
-        bool found = false;
-        if (g_bTranslationEnabled.load(std::memory_order_relaxed)) {
-            found = FindTranslationScopedW(caller, wstr, trans);
-        } else {
-            found = FindReverseTranslationScopedW(caller, wstr, trans);
-        }
-        if (found) {
-            void* qstr[1] = {0};
-            if (SafeCreateQString(g_pfn_fromUtf8, qstr, trans.c_str(), (int)trans.length())) {
-                if (g_o_QAction_setText) g_o_QAction_setText(pAction, qstr);
-                SafeDestroyQString(g_pfn_QString_dtor, qstr);
-                return;
-            }
-        }
-    }
-    if (g_o_QAction_setText) g_o_QAction_setText(pAction, pQString);
+    ForwardTranslatedQString(caller, pQString, TranslationSource::StaticUI, [&](const void* text) {
+        if (g_o_QAction_setText) g_o_QAction_setText(pAction, text);
+    });
 }
 
 static void __fastcall hk_QAction_setToolTip(void* pAction, const void* pQString) {
     void* caller = _ReturnAddress();
-    const wchar_t* wstr = nullptr;
-    if (SafeGetUtf16(g_pfn_utf16, pQString, wstr)) {
-        std::string trans;
-        bool found = false;
-        if (g_bTranslationEnabled.load(std::memory_order_relaxed)) {
-            found = FindTranslationScopedW(caller, wstr, trans);
-        } else {
-            found = FindReverseTranslationScopedW(caller, wstr, trans);
-        }
-        if (found) {
-            void* qstr[1] = {0};
-            if (SafeCreateQString(g_pfn_fromUtf8, qstr, trans.c_str(), (int)trans.length())) {
-                if (g_o_QAction_setToolTip) g_o_QAction_setToolTip(pAction, qstr);
-                SafeDestroyQString(g_pfn_QString_dtor, qstr);
-                return;
-            }
-        }
-    }
-    if (g_o_QAction_setToolTip) g_o_QAction_setToolTip(pAction, pQString);
+    ForwardTranslatedQString(caller, pQString, TranslationSource::StaticUI, [&](const void* text) {
+        if (g_o_QAction_setToolTip) g_o_QAction_setToolTip(pAction, text);
+    });
 }
 
 static void __fastcall hk_QAction_setStatusTip(void* pAction, const void* pQString) {
     void* caller = _ReturnAddress();
-    const wchar_t* wstr = nullptr;
-    if (SafeGetUtf16(g_pfn_utf16, pQString, wstr)) {
-        std::string trans;
-        bool found = false;
-        if (g_bTranslationEnabled.load(std::memory_order_relaxed)) {
-            found = FindTranslationScopedW(caller, wstr, trans);
-        } else {
-            found = FindReverseTranslationScopedW(caller, wstr, trans);
-        }
-        if (found) {
-            void* qstr[1] = {0};
-            if (SafeCreateQString(g_pfn_fromUtf8, qstr, trans.c_str(), (int)trans.length())) {
-                if (g_o_QAction_setStatusTip) g_o_QAction_setStatusTip(pAction, qstr);
-                SafeDestroyQString(g_pfn_QString_dtor, qstr);
-                return;
-            }
-        }
-    }
-    if (g_o_QAction_setStatusTip) g_o_QAction_setStatusTip(pAction, pQString);
+    ForwardTranslatedQString(caller, pQString, TranslationSource::StaticUI, [&](const void* text) {
+        if (g_o_QAction_setStatusTip) g_o_QAction_setStatusTip(pAction, text);
+    });
 }
 
 static void __fastcall hk_QAction_setWhatsThis(void* pAction, const void* pQString) {
     void* caller = _ReturnAddress();
-    const wchar_t* wstr = nullptr;
-    if (SafeGetUtf16(g_pfn_utf16, pQString, wstr)) {
-        std::string trans;
-        bool found = false;
-        if (g_bTranslationEnabled.load(std::memory_order_relaxed)) {
-            found = FindTranslationScopedW(caller, wstr, trans);
-        } else {
-            found = FindReverseTranslationScopedW(caller, wstr, trans);
-        }
-        if (found) {
-            void* qstr[1] = {0};
-            if (SafeCreateQString(g_pfn_fromUtf8, qstr, trans.c_str(), (int)trans.length())) {
-                if (g_o_QAction_setWhatsThis) g_o_QAction_setWhatsThis(pAction, qstr);
-                SafeDestroyQString(g_pfn_QString_dtor, qstr);
-                return;
-            }
-        }
-    }
-    if (g_o_QAction_setWhatsThis) g_o_QAction_setWhatsThis(pAction, pQString);
+    ForwardTranslatedQString(caller, pQString, TranslationSource::StaticUI, [&](const void* text) {
+        if (g_o_QAction_setWhatsThis) g_o_QAction_setWhatsThis(pAction, text);
+    });
 }
 
-// 4. 按钮/标签/窗口标题
 static void __fastcall hk_QAbstractButton_setText(void* pButton, const void* pQString) {
     void* caller = _ReturnAddress();
-    const wchar_t* wstr = nullptr;
-    if (SafeGetUtf16(g_pfn_utf16, pQString, wstr)) {
-        std::string trans;
-        bool found = false;
-        if (g_bTranslationEnabled.load(std::memory_order_relaxed)) {
-            found = FindTranslationScopedW(caller, wstr, trans);
-        } else {
-            found = FindReverseTranslationScopedW(caller, wstr, trans);
-        }
-        if (found) {
-            void* qstr[1] = {0};
-            if (SafeCreateQString(g_pfn_fromUtf8, qstr, trans.c_str(), (int)trans.length())) {
-                if (g_o_QAbstractButton_setText) g_o_QAbstractButton_setText(pButton, qstr);
-                SafeDestroyQString(g_pfn_QString_dtor, qstr);
-                return;
-            }
-        }
-    }
-    if (g_o_QAbstractButton_setText) g_o_QAbstractButton_setText(pButton, pQString);
+    ForwardTranslatedQString(caller, pQString, TranslationSource::StaticUI, [&](const void* text) {
+        if (g_o_QAbstractButton_setText) g_o_QAbstractButton_setText(pButton, text);
+    });
 }
 
 static void __fastcall hk_QLabel_setText(void* pLabel, const void* pQString) {
     void* caller = _ReturnAddress();
-    const wchar_t* wstr = nullptr;
-    if (SafeGetUtf16(g_pfn_utf16, pQString, wstr)) {
-        std::string trans;
-        bool found = false;
-        if (g_bTranslationEnabled.load(std::memory_order_relaxed)) {
-            found = FindTranslationScopedW(caller, wstr, trans);
-        } else {
-            found = FindReverseTranslationScopedW(caller, wstr, trans);
-        }
-        if (found) {
-            void* qstr[1] = {0};
-            if (SafeCreateQString(g_pfn_fromUtf8, qstr, trans.c_str(), (int)trans.length())) {
-                if (g_o_QLabel_setText) g_o_QLabel_setText(pLabel, qstr);
-                SafeDestroyQString(g_pfn_QString_dtor, qstr);
-                return;
-            }
-        }
-    }
-    if (g_o_QLabel_setText) g_o_QLabel_setText(pLabel, pQString);
+    ForwardTranslatedQString(caller, pQString, TranslationSource::StaticUI, [&](const void* text) {
+        if (g_o_QLabel_setText) g_o_QLabel_setText(pLabel, text);
+    });
 }
 
 static void __fastcall hk_QWidget_setWindowTitle(void* pWidget, const void* pQString) {
     void* caller = _ReturnAddress();
-    const wchar_t* wstr = nullptr;
-    if (SafeGetUtf16(g_pfn_utf16, pQString, wstr)) {
-        std::string trans;
-        bool found = false;
-        if (g_bTranslationEnabled.load(std::memory_order_relaxed)) {
-            found = FindTranslationScopedW(caller, wstr, trans);
-        } else {
-            found = FindReverseTranslationScopedW(caller, wstr, trans);
-        }
-        if (found) {
-            void* qstr[1] = {0};
-            if (SafeCreateQString(g_pfn_fromUtf8, qstr, trans.c_str(), (int)trans.length())) {
-                if (g_o_QWidget_setWindowTitle) g_o_QWidget_setWindowTitle(pWidget, qstr);
-                SafeDestroyQString(g_pfn_QString_dtor, qstr);
-                return;
-            }
-        }
-    }
-    if (g_o_QWidget_setWindowTitle) g_o_QWidget_setWindowTitle(pWidget, pQString);
+    ForwardTranslatedQString(caller, pQString, TranslationSource::StaticUI, [&](const void* text) {
+        if (g_o_QWidget_setWindowTitle) g_o_QWidget_setWindowTitle(pWidget, text);
+    });
 }
 
 static void __fastcall hk_QGroupBox_setTitle(void* pBox, const void* pQString) {
     void* caller = _ReturnAddress();
-    const wchar_t* wstr = nullptr;
-    if (SafeGetUtf16(g_pfn_utf16, pQString, wstr)) {
-        std::string trans;
-        bool found = false;
-        if (g_bTranslationEnabled.load(std::memory_order_relaxed)) {
-            found = FindTranslationScopedW(caller, wstr, trans);
-        } else {
-            found = FindReverseTranslationScopedW(caller, wstr, trans);
-        }
-        if (found) {
-            void* qstr[1] = {0};
-            if (SafeCreateQString(g_pfn_fromUtf8, qstr, trans.c_str(), (int)trans.length())) {
-                if (g_o_QGroupBox_setTitle) g_o_QGroupBox_setTitle(pBox, qstr);
-                SafeDestroyQString(g_pfn_QString_dtor, qstr);
-                return;
-            }
-        }
-    }
-    if (g_o_QGroupBox_setTitle) g_o_QGroupBox_setTitle(pBox, pQString);
+    ForwardTranslatedQString(caller, pQString, TranslationSource::StaticUI, [&](const void* text) {
+        if (g_o_QGroupBox_setTitle) g_o_QGroupBox_setTitle(pBox, text);
+    });
 }
 
-// 5. Item 控件
+static void* __fastcall hk_QAction_ctor(void* pAction, const void* pQString, void* pParent) {
+    void* caller = _ReturnAddress();
+    void* result = nullptr;
+    ForwardTranslatedQString(caller, pQString, TranslationSource::StaticUI, [&](const void* text) {
+        result = g_o_QAction_ctor(pAction, text, pParent);
+    });
+    return result;
+}
+
+static void* __fastcall hk_QAction_ctor_icon(void* pAction, const void* pIcon, const void* pQString, void* pParent) {
+    void* caller = _ReturnAddress();
+    void* result = nullptr;
+    ForwardTranslatedQString(caller, pQString, TranslationSource::StaticUI, [&](const void* text) {
+        result = g_o_QAction_ctor_icon(pAction, pIcon, text, pParent);
+    });
+    return result;
+}
+
+// 4. 列表 / 树 / 表格 / 下拉框项文本
+//    作用域 ItemWidget，这类文本重复率极高，单独分组便于词典维护
+
 static void __fastcall hk_QTreeWidgetItem_setText(void* pItem, int column, const void* pQString) {
     void* caller = _ReturnAddress();
-    const wchar_t* wstr = nullptr;
-    if (SafeGetUtf16(g_pfn_utf16, pQString, wstr)) {
-        std::string trans;
-        bool found = false;
-        if (g_bTranslationEnabled.load(std::memory_order_relaxed)) {
-            found = FindTranslationScopedW(caller, wstr, trans, TranslationSource::ItemWidget);
-        } else {
-            found = FindReverseTranslationScopedW(caller, wstr, trans);
-        }
-        if (found) {
-            void* qstr[1] = {0};
-            if (SafeCreateQString(g_pfn_fromUtf8, qstr, trans.c_str(), (int)trans.length())) {
-                if (g_o_QTreeWidgetItem_setText) g_o_QTreeWidgetItem_setText(pItem, column, qstr);
-                SafeDestroyQString(g_pfn_QString_dtor, qstr);
-                return;
-            }
-        }
-    }
-    if (g_o_QTreeWidgetItem_setText) g_o_QTreeWidgetItem_setText(pItem, column, pQString);
+    ForwardTranslatedQString(caller, pQString, TranslationSource::ItemWidget, [&](const void* text) {
+        if (g_o_QTreeWidgetItem_setText) g_o_QTreeWidgetItem_setText(pItem, column, text);
+    });
 }
 
 static void __fastcall hk_QTreeWidget_setHeaderLabel(void* pTree, const void* pQString) {
     void* caller = _ReturnAddress();
-    const wchar_t* wstr = nullptr;
-    if (SafeGetUtf16(g_pfn_utf16, pQString, wstr)) {
-        std::string trans;
-        bool found = false;
-        if (g_bTranslationEnabled.load(std::memory_order_relaxed)) {
-            found = FindTranslationScopedW(caller, wstr, trans, TranslationSource::ItemWidget);
-        } else {
-            found = FindReverseTranslationScopedW(caller, wstr, trans);
-        }
-        if (found) {
-            void* qstr[1] = {0};
-            if (SafeCreateQString(g_pfn_fromUtf8, qstr, trans.c_str(), (int)trans.length())) {
-                if (g_o_QTreeWidget_setHeaderLabel) g_o_QTreeWidget_setHeaderLabel(pTree, qstr);
-                SafeDestroyQString(g_pfn_QString_dtor, qstr);
-                return;
-            }
-        }
-    }
-    if (g_o_QTreeWidget_setHeaderLabel) g_o_QTreeWidget_setHeaderLabel(pTree, pQString);
-}
-
-static void* __fastcall hk_QTableWidgetItem_ctor(void* pItem, const void* pQString, int type) {
-    void* caller = _ReturnAddress();
-    const wchar_t* wstr = nullptr;
-    if (SafeGetUtf16(g_pfn_utf16, pQString, wstr)) {
-        std::string trans;
-        bool found = false;
-        if (g_bTranslationEnabled.load(std::memory_order_relaxed)) {
-            found = FindTranslationScopedW(caller, wstr, trans, TranslationSource::ItemWidget);
-        } else {
-            found = FindReverseTranslationScopedW(caller, wstr, trans);
-        }
-        if (found) {
-            void* qstr[1] = {0};
-            if (SafeCreateQString(g_pfn_fromUtf8, qstr, trans.c_str(), (int)trans.length())) {
-                void* res = g_o_QTableWidgetItem_ctor(pItem, qstr, type);
-                SafeDestroyQString(g_pfn_QString_dtor, qstr);
-                return res;
-            }
-        }
-    }
-    return g_o_QTableWidgetItem_ctor(pItem, pQString, type);
+    ForwardTranslatedQString(caller, pQString, TranslationSource::ItemWidget, [&](const void* text) {
+        if (g_o_QTreeWidget_setHeaderLabel) g_o_QTreeWidget_setHeaderLabel(pTree, text);
+    });
 }
 
 static void __fastcall hk_QTableWidgetItem_setText(void* pItem, const void* pQString) {
     void* caller = _ReturnAddress();
-    const wchar_t* wstr = nullptr;
-    if (SafeGetUtf16(g_pfn_utf16, pQString, wstr)) {
-        std::string trans;
-        bool found = false;
-        if (g_bTranslationEnabled.load(std::memory_order_relaxed)) {
-            found = FindTranslationScopedW(caller, wstr, trans, TranslationSource::ItemWidget);
-        } else {
-            found = FindReverseTranslationScopedW(caller, wstr, trans);
-        }
-        if (found) {
-            void* qstr[1] = {0};
-            if (SafeCreateQString(g_pfn_fromUtf8, qstr, trans.c_str(), (int)trans.length())) {
-                if (g_o_QTableWidgetItem_setText) g_o_QTableWidgetItem_setText(pItem, qstr);
-                SafeDestroyQString(g_pfn_QString_dtor, qstr);
-                return;
-            }
-        }
-    }
-    if (g_o_QTableWidgetItem_setText) g_o_QTableWidgetItem_setText(pItem, pQString);
-}
-
-static void* __fastcall hk_QListWidgetItem_ctor(void* pItem, const void* pQString, void* pListWidget, int type) {
-    void* caller = _ReturnAddress();
-    const wchar_t* wstr = nullptr;
-    if (SafeGetUtf16(g_pfn_utf16, pQString, wstr)) {
-        std::string trans;
-        bool found = false;
-        if (g_bTranslationEnabled.load(std::memory_order_relaxed)) {
-            found = FindTranslationScopedW(caller, wstr, trans, TranslationSource::ItemWidget);
-        } else {
-            found = FindReverseTranslationScopedW(caller, wstr, trans);
-        }
-        if (found) {
-            void* qstr[1] = {0};
-            if (SafeCreateQString(g_pfn_fromUtf8, qstr, trans.c_str(), (int)trans.length())) {
-                void* res = g_o_QListWidgetItem_ctor(pItem, qstr, pListWidget, type);
-                SafeDestroyQString(g_pfn_QString_dtor, qstr);
-                return res;
-            }
-        }
-    }
-    return g_o_QListWidgetItem_ctor(pItem, pQString, pListWidget, type);
+    ForwardTranslatedQString(caller, pQString, TranslationSource::ItemWidget, [&](const void* text) {
+        if (g_o_QTableWidgetItem_setText) g_o_QTableWidgetItem_setText(pItem, text);
+    });
 }
 
 static void __fastcall hk_QListWidgetItem_setText(void* pItem, const void* pQString) {
     void* caller = _ReturnAddress();
-    const wchar_t* wstr = nullptr;
-    if (SafeGetUtf16(g_pfn_utf16, pQString, wstr)) {
-        std::string trans;
-        bool found = false;
-        if (g_bTranslationEnabled.load(std::memory_order_relaxed)) {
-            found = FindTranslationScopedW(caller, wstr, trans, TranslationSource::ItemWidget);
-        } else {
-            found = FindReverseTranslationScopedW(caller, wstr, trans);
-        }
-        if (found) {
-            void* qstr[1] = {0};
-            if (SafeCreateQString(g_pfn_fromUtf8, qstr, trans.c_str(), (int)trans.length())) {
-                if (g_o_QListWidgetItem_setText) g_o_QListWidgetItem_setText(pItem, qstr);
-                SafeDestroyQString(g_pfn_QString_dtor, qstr);
-                return;
-            }
-        }
-    }
-    if (g_o_QListWidgetItem_setText) g_o_QListWidgetItem_setText(pItem, pQString);
+    ForwardTranslatedQString(caller, pQString, TranslationSource::ItemWidget, [&](const void* text) {
+        if (g_o_QListWidgetItem_setText) g_o_QListWidgetItem_setText(pItem, text);
+    });
 }
 
 static void __fastcall hk_QComboBox_addItem(void* pBox, const void* pQString, const void* pUserData) {
     void* caller = _ReturnAddress();
-    const wchar_t* wstr = nullptr;
-    if (SafeGetUtf16(g_pfn_utf16, pQString, wstr)) {
-        std::string trans;
-        bool found = false;
-        if (g_bTranslationEnabled.load(std::memory_order_relaxed)) {
-            found = FindTranslationScopedW(caller, wstr, trans, TranslationSource::ItemWidget);
-        } else {
-            found = FindReverseTranslationScopedW(caller, wstr, trans);
-        }
-        if (found) {
-            void* qstr[1] = {0};
-            if (SafeCreateQString(g_pfn_fromUtf8, qstr, trans.c_str(), (int)trans.length())) {
-                if (g_o_QComboBox_addItem) g_o_QComboBox_addItem(pBox, qstr, pUserData);
-                SafeDestroyQString(g_pfn_QString_dtor, qstr);
-                return;
-            }
-        }
-    }
-    if (g_o_QComboBox_addItem) g_o_QComboBox_addItem(pBox, pQString, pUserData);
+    ForwardTranslatedQString(caller, pQString, TranslationSource::ItemWidget, [&](const void* text) {
+        if (g_o_QComboBox_addItem) g_o_QComboBox_addItem(pBox, text, pUserData);
+    });
 }
 
 static void __fastcall hk_QComboBox_addItem_icon(void* pBox, const void* pIcon, const void* pQString, const void* pUserData) {
     void* caller = _ReturnAddress();
-    const wchar_t* wstr = nullptr;
-    if (SafeGetUtf16(g_pfn_utf16, pQString, wstr)) {
-        std::string trans;
-        bool found = false;
-        if (g_bTranslationEnabled.load(std::memory_order_relaxed)) {
-            found = FindTranslationScopedW(caller, wstr, trans, TranslationSource::ItemWidget);
-        } else {
-            found = FindReverseTranslationScopedW(caller, wstr, trans);
-        }
-        if (found) {
-            void* qstr[1] = {0};
-            if (SafeCreateQString(g_pfn_fromUtf8, qstr, trans.c_str(), (int)trans.length())) {
-                if (g_o_QComboBox_addItem_icon) g_o_QComboBox_addItem_icon(pBox, pIcon, qstr, pUserData);
-                SafeDestroyQString(g_pfn_QString_dtor, qstr);
-                return;
-            }
-        }
-    }
-    if (g_o_QComboBox_addItem_icon) g_o_QComboBox_addItem_icon(pBox, pIcon, pQString, pUserData);
+    ForwardTranslatedQString(caller, pQString, TranslationSource::ItemWidget, [&](const void* text) {
+        if (g_o_QComboBox_addItem_icon) g_o_QComboBox_addItem_icon(pBox, pIcon, text, pUserData);
+    });
 }
 
 static void __fastcall hk_QComboBox_setItemText(void* pBox, int index, const void* pQString) {
     void* caller = _ReturnAddress();
-    const wchar_t* wstr = nullptr;
-    if (SafeGetUtf16(g_pfn_utf16, pQString, wstr)) {
-        std::string trans;
-        bool found = false;
-        if (g_bTranslationEnabled.load(std::memory_order_relaxed)) {
-            found = FindTranslationScopedW(caller, wstr, trans, TranslationSource::ItemWidget);
-        } else {
-            found = FindReverseTranslationScopedW(caller, wstr, trans);
-        }
-        if (found) {
-            void* qstr[1] = {0};
-            if (SafeCreateQString(g_pfn_fromUtf8, qstr, trans.c_str(), (int)trans.length())) {
-                if (g_o_QComboBox_setItemText) g_o_QComboBox_setItemText(pBox, index, qstr);
-                SafeDestroyQString(g_pfn_QString_dtor, qstr);
-                return;
-            }
-        }
-    }
-    if (g_o_QComboBox_setItemText) g_o_QComboBox_setItemText(pBox, index, pQString);
+    ForwardTranslatedQString(caller, pQString, TranslationSource::ItemWidget, [&](const void* text) {
+        if (g_o_QComboBox_setItemText) g_o_QComboBox_setItemText(pBox, index, text);
+    });
 }
 
 static void __fastcall hk_QComboBox_insertItem(void* pBox, int index, const void* pQString, const void* pUserData) {
     void* caller = _ReturnAddress();
-    const wchar_t* wstr = nullptr;
-    if (SafeGetUtf16(g_pfn_utf16, pQString, wstr)) {
-        std::string trans;
-        bool found = false;
-        if (g_bTranslationEnabled.load(std::memory_order_relaxed)) {
-            found = FindTranslationScopedW(caller, wstr, trans, TranslationSource::ItemWidget);
-        } else {
-            found = FindReverseTranslationScopedW(caller, wstr, trans);
-        }
-        if (found) {
-            void* qstr[1] = {0};
-            if (SafeCreateQString(g_pfn_fromUtf8, qstr, trans.c_str(), (int)trans.length())) {
-                if (g_o_QComboBox_insertItem) g_o_QComboBox_insertItem(pBox, index, qstr, pUserData);
-                SafeDestroyQString(g_pfn_QString_dtor, qstr);
-                return;
-            }
-        }
-    }
-    if (g_o_QComboBox_insertItem) g_o_QComboBox_insertItem(pBox, index, pQString, pUserData);
+    ForwardTranslatedQString(caller, pQString, TranslationSource::ItemWidget, [&](const void* text) {
+        if (g_o_QComboBox_insertItem) g_o_QComboBox_insertItem(pBox, index, text, pUserData);
+    });
 }
 
 static void __fastcall hk_QComboBox_insertItem_icon(void* pBox, int index, const void* pIcon, const void* pQString, const void* pUserData) {
     void* caller = _ReturnAddress();
-    const wchar_t* wstr = nullptr;
-    if (SafeGetUtf16(g_pfn_utf16, pQString, wstr)) {
-        std::string trans;
-        bool found = false;
-        if (g_bTranslationEnabled.load(std::memory_order_relaxed)) {
-            found = FindTranslationScopedW(caller, wstr, trans, TranslationSource::ItemWidget);
-        } else {
-            found = FindReverseTranslationScopedW(caller, wstr, trans);
-        }
-        if (found) {
-            void* qstr[1] = {0};
-            if (SafeCreateQString(g_pfn_fromUtf8, qstr, trans.c_str(), (int)trans.length())) {
-                if (g_o_QComboBox_insertItem_icon) g_o_QComboBox_insertItem_icon(pBox, index, pIcon, qstr, pUserData);
-                SafeDestroyQString(g_pfn_QString_dtor, qstr);
-                return;
-            }
-        }
-    }
-    if (g_o_QComboBox_insertItem_icon) g_o_QComboBox_insertItem_icon(pBox, index, pIcon, pQString, pUserData);
+    ForwardTranslatedQString(caller, pQString, TranslationSource::ItemWidget, [&](const void* text) {
+        if (g_o_QComboBox_insertItem_icon) g_o_QComboBox_insertItem_icon(pBox, index, pIcon, text, pUserData);
+    });
+}
+
+static void* __fastcall hk_QTableWidgetItem_ctor(void* pItem, const void* pQString, int type) {
+    void* caller = _ReturnAddress();
+    void* result = nullptr;
+    ForwardTranslatedQString(caller, pQString, TranslationSource::ItemWidget, [&](const void* text) {
+        result = g_o_QTableWidgetItem_ctor(pItem, text, type);
+    });
+    return result;
+}
+
+static void* __fastcall hk_QListWidgetItem_ctor(void* pItem, const void* pQString, void* pListWidget, int type) {
+    void* caller = _ReturnAddress();
+    void* result = nullptr;
+    ForwardTranslatedQString(caller, pQString, TranslationSource::ItemWidget, [&](const void* text) {
+        result = g_o_QListWidgetItem_ctor(pItem, text, pListWidget, type);
+    });
+    return result;
 }
 
 // ==============================================================================

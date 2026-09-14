@@ -13,6 +13,12 @@
 #include <QTableWidget>
 #include <cstdint>
 
+// 分区构建函数的返回类型只需前向声明即可（布局与分组盒仅在 .cpp 中使用）
+class QHBoxLayout;
+class QVBoxLayout;
+class QGridLayout;
+class QGroupBox;
+
 class DebugWindow : public QDialog {
     Q_OBJECT
 
@@ -32,6 +38,14 @@ private slots:
 
 private:
     void setupUi();
+
+    // setupUi 的分区构建（原 155 行 setupUi 拆分为 5 个专职函数，各自只负责一块 UI）
+    QWidget*     createStatusDashboard();  // 顶部：目标进程与汉化状态看板
+    QHBoxLayout* createControlToolbar();   // 按钮工具条（含信号连接）
+    QWidget*     createHookLogTab();       // Tab 1：实时 Hook 日志流
+    QWidget*     createCrashTab();         // Tab 2：崩溃捕获与事件诊断
+    QWidget*     createModulesTab();       // Tab 3：已加载模块诊断
+
     void updateProcessDashboard();
     void pollHookRuntimeLog();
     void queryHammerLanguageStatus();

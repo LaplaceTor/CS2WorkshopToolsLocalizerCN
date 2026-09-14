@@ -1,5 +1,11 @@
 #include "mainwindow.h"
 #include "cs2_detector.h"
+#include "path_constants.h"
+#include "dictionary_paths.h"
+#include "launcher_config.h"
+#include "localization_service.h"
+#include "hammer_ipc.h"
+#include "process_monitor.h"
 #include "fgd_translator.h"
 #include "pe_patcher.h"
 #include "backup_manager.h"
@@ -30,7 +36,6 @@
 #include <QTimer>
 #include <QFileInfo>
 #include <QDir>
-#include <QSettings>
 #include <QNetworkAccessManager>
 #include <QNetworkRequest>
 #include <QNetworkReply>
@@ -48,45 +53,24 @@
 
 namespace fs = std::filesystem;
 
-static fs::path resolveJsonPath(const std::wstring& workingDir, const std::wstring& filename) {
-    fs::path workPath(workingDir);
-    fs::path inputPath(filename);
-    std::wstring baseStem = inputPath.stem().wstring();
-    std::wstring targetName = baseStem + L".jsonc";
-
-    std::vector<fs::path> baseDirs = {
-        workPath / L"translations",
-        workPath,
-        workPath / L".." / L"translations",
-        fs::current_path() / L"translations",
-        fs::current_path(),
-        fs::current_path() / L".." / L"translations"
-    };
-
-    for (const auto& dir : baseDirs) {
-        fs::path p = dir / targetName;
-        if (fs::exists(p)) return p;
-    }
-
-    return workPath / L"translations" / targetName;
-}
 
 MainWindow::MainWindow(const std::wstring& cs2Root, QWidget *parent)
+    // 注意：初始化顺序必须与 mainwindow.h 中的声明顺序一致，
+    // 否则 MSVC 会报 C5038（-Wreorder）。调整成员声明位置时请同步改这里。
     : QMainWindow(parent)
     , m_cs2Root(cs2Root)
     , m_useMachineTransCheck(nullptr)
-    , m_networkManager(new QNetworkAccessManager(this))
-    , m_hammerProcess(new QProcess(this))
-    , m_monitorTimer(new QTimer(this))
-    , m_notRunningCount(0)
-    , m_isHammerRunning(false)
-    , m_hammerPid(0)
-    , m_hammerProcessHandle(nullptr)
     , m_toggleLangBtn(nullptr)
     , m_hotReloadBtn(nullptr)
     , m_debugBtn(nullptr)
     , m_fileWatcher(nullptr)
     , m_hotReloadDebounceTimer(nullptr)
+    , m_networkManager(new QNetworkAccessManager(this))
+    , m_hammerProcess(new QProcess(this))
+    , m_monitorTimer(new QTimer(this))
+        , m_isHammerRunning(false)
+    , m_hammerPid(0)
+    , m_hammerProcessHandle(nullptr)
 {
     // 获取程序所在目录作为工作目录
     QString appDir = QApplication::applicationDirPath();
@@ -216,9 +200,9 @@ MainWindow::MainWindow(const std::wstring& cs2Root, QWidget *parent)
     );
 
     // 检查并生成翻译字典文件
-    fs::path fgdPath = resolveJsonPath(m_workingDir, L"fgd_translations.jsonc");
-    fs::path fgdOverridePath = resolveJsonPath(m_workingDir, L"fgd_override.jsonc");
-    fs::path qtPath = resolveJsonPath(m_workingDir, L"qt_translations.jsonc");
+    fs::path fgdPath = ResolveDictionaryPath(m_workingDir, L"fgd_translations.jsonc");
+    fs::path fgdOverridePath = ResolveDictionaryPath(m_workingDir, L"fgd_override.jsonc");
+    fs::path qtPath = ResolveDictionaryPath(m_workingDir, L"qt_translations.jsonc");
 
     std::wstring notice;
 
@@ -764,108 +748,46 @@ void MainWindow::populateAddons() {
 }
 
 void MainWindow::loadSettings() {
-    fs::path configPath =
-        fs::path(m_workingDir) / L"config.ini";
-
-    QSettings settings(
-        QString::fromStdWString(configPath.wstring()),
-        QSettings::IniFormat
-    );
-
-    QString savedAddon =
-        settings.value(
-            "Launcher/SelectedAddon",
-            ""
-        ).toString().trimmed();
-
-    QString savedArgs =
-        settings.value(
-            "Launcher/LaunchArgs",
-            ""
-        ).toString();
+    const LauncherSettings saved = LauncherConfig::Load(m_workingDir);
 
     // 恢复附加启动参数
-    m_argsEdit->setText(savedArgs);
+    m_argsEdit->setText(saved.launchArgs);
 
     // 恢复使用机翻设置
-    bool savedUseMachineTrans = settings.value("Launcher/UseMachineTrans", true).toBool();
     if (m_useMachineTransCheck) {
-        m_useMachineTransCheck->setChecked(savedUseMachineTrans);
+        m_useMachineTransCheck->setChecked(saved.useMachineTrans);
     }
 
-    // 恢复选择的目标 Addon
-    if (!savedAddon.isEmpty()) {
-        int index =
-            m_addonCombo->findText(savedAddon);
-
+    // 恢复选择的目标 Addon：先精确匹配，再退化为「名称 + 空格」前缀匹配
+    int index = -1;
+    if (!saved.selectedAddon.isEmpty()) {
+        index = m_addonCombo->findText(saved.selectedAddon);
         if (index == -1) {
-            for (int i = 0;
-                 i < m_addonCombo->count();
-                 ++i) {
-
-                QString itemText =
-                    m_addonCombo->itemText(i);
-
-                if (itemText == savedAddon ||
-                    itemText.startsWith(
-                        savedAddon + " "
-                    )) {
-
+            const QString prefix = saved.selectedAddon + " ";
+            for (int i = 0; i < m_addonCombo->count(); ++i) {
+                const QString itemText = m_addonCombo->itemText(i);
+                if (itemText == saved.selectedAddon || itemText.startsWith(prefix)) {
                     index = i;
                     break;
                 }
             }
         }
+    }
 
-        if (index != -1) {
-            m_addonCombo->setCurrentIndex(index);
-        } else {
-            if (m_addonCombo->count() > 0) {
-                m_addonCombo->setCurrentIndex(0);
-            }
-        }
-    } else {
-        if (m_addonCombo->count() > 0) {
-            m_addonCombo->setCurrentIndex(0);
-        }
+    if (index != -1) {
+        m_addonCombo->setCurrentIndex(index);
+    } else if (m_addonCombo->count() > 0) {
+        m_addonCombo->setCurrentIndex(0);
     }
 }
 
 void MainWindow::saveSettings() {
-    fs::path configPath =
-        fs::path(m_workingDir) / L"config.ini";
+    LauncherSettings settings;
+    settings.selectedAddon   = LauncherConfig::NormalizeAddonName(m_addonCombo->currentText());
+    settings.launchArgs      = m_argsEdit->text();
+    settings.useMachineTrans = m_useMachineTransCheck ? m_useMachineTransCheck->isChecked() : true;
 
-    QSettings settings(
-        QString::fromStdWString(configPath.wstring()),
-        QSettings::IniFormat
-    );
-
-    QString selectedAddon =
-        m_addonCombo->currentText().trimmed();
-
-    if (selectedAddon.contains(" ")) {
-        selectedAddon =
-            selectedAddon.split(" ").first();
-    }
-
-    settings.setValue(
-        "Launcher/SelectedAddon",
-        selectedAddon
-    );
-
-    settings.setValue(
-        "Launcher/LaunchArgs",
-        m_argsEdit->text()
-    );
-
-    if (m_useMachineTransCheck) {
-        settings.setValue(
-            "Launcher/UseMachineTrans",
-            m_useMachineTransCheck->isChecked()
-        );
-    }
-
-    settings.sync();
+    LauncherConfig::Save(m_workingDir, settings);
 }
 
 void MainWindow::appendLog(
@@ -948,7 +870,7 @@ void MainWindow::setUiBusy(bool busy) {
 
 bool MainWindow::isPatchDeployedAndValid() {
     fs::path backupDir =
-        fs::path(m_workingDir) / L"backup";
+        fs::path(m_workingDir) / paths::kBackupDir;
 
     // 没有备份，不认为当前处于有效的已注入状态
     if (!BackupManager::HasBackup(
@@ -1019,7 +941,7 @@ bool MainWindow::isPatchDeployedAndValid() {
             QtConcurrent::run([cs2Root, workingDir]() -> bool {
                 auto validation = BackupManager::BackupMatchesCurrentGame(
                     cs2Root,
-                    (fs::path(workingDir) / L"backup").wstring());
+                    (fs::path(workingDir) / paths::kBackupDir).wstring());
                 return validation.status == BackupMatchStatus::Matches;
             })
         );
@@ -1122,367 +1044,11 @@ bool MainWindow::injectLocalization() {
 }
 
 bool MainWindow::injectLocalizationCore(bool useMachineTrans) {
-    fs::path workPath(m_workingDir);
-
-    fs::path backupDir =
-        workPath / L"backup";
-
-    fs::path transDir =
-        workPath / L"translations";
-
-    fs::path cs2Bin =
-        fs::path(m_cs2Root) /
-        L"game" /
-        L"bin" /
-        L"win64";
-
-    fs::path fgdDictPath = resolveJsonPath(m_workingDir, L"fgd_translations.jsonc");
-    fs::path fgdFallbackPath = resolveJsonPath(m_workingDir, L"fgd_fallback.jsonc");
-    fs::path fgdOverridePath = resolveJsonPath(m_workingDir, L"fgd_override.jsonc");
-    fs::path qtDictPath = resolveJsonPath(m_workingDir, L"qt_translations.jsonc");
-    fs::path qtFallbackPath = resolveJsonPath(m_workingDir, L"qt_fallback.jsonc");
-
-    fs::path qmDllSrc =
-        workPath / L"qtcore_qm.dll";
-    if (!fs::exists(qmDllSrc)) {
-        if (fs::exists(fs::current_path() / L"qtcore_qm.dll")) {
-            qmDllSrc = fs::current_path() / L"qtcore_qm.dll";
-        }
-    }
-
-    std::wstring notice;
-
-    if (FgdTranslator::EnsureFgdDictionaryExists(
-            fgdDictPath.wstring(),
-            L"",
-            notice)) {
-
-        appendLog(
-            "[i] " + QString::fromStdWString(notice),
-            "#66d9ef"
-        );
-    }
-
-    if (FgdTranslator::EnsureFgdOverrideDictionaryExists(
-            fgdOverridePath.wstring(),
-            L"",
-            notice)) {
-
-        appendLog(
-            "[i] " + QString::fromStdWString(notice),
-            "#66d9ef"
-        );
-    }
-
-    if (FgdTranslator::EnsureQtDictionaryExists(
-            qtDictPath.wstring(),
-            L"",
-            notice)) {
-
-        appendLog(
-            "[i] " + QString::fromStdWString(notice),
-            "#66d9ef"
-        );
-    }
-
-    // ==========================================
-    // STEP 1: 原版备份
-    // ==========================================
-    appendLog(
-        "[1/3] 正在校验游戏版本并准备原版备份...",
-        "#e6db74"
-    );
-
-    auto matchResult =
-        BackupManager::BackupMatchesCurrentGame(
-            m_cs2Root,
-            backupDir.wstring()
-        );
-
-    bool forceRecreate = false;
-
-    if (matchResult.status ==
-        BackupMatchStatus::GameUpdated) {
-
-        appendLog(
-            QString(
-                "[!] 检测到 CS2 游戏版本发生变化: %1"
-            )
-                .arg(
-                    QString::fromStdWString(
-                        matchResult.reason
-                    )
-                ),
-            "#fd971f"
-        );
-
-        // 二次哈希确认：Steam 更新进行中时文件哈希会不稳定，
-        // 避免把半更新状态的游戏文件定格为"纯净原版备份"（此时运行于 worker 线程，可安全等待）
-        appendLog(
-            "[*] 疑似游戏更新，2 秒后进行二次哈希确认...",
-            "#66d9ef"
-        );
-
-        QThread::msleep(2000);
-
-        auto reconfirm =
-            BackupManager::BackupMatchesCurrentGame(
-                m_cs2Root,
-                backupDir.wstring()
-            );
-
-        if (reconfirm.status == BackupMatchStatus::Matches) {
-            appendLog(
-                "[+] 二次校验显示备份与当前版本一致（此前可能正处于 Steam 更新过程中），继续使用现有备份。",
-                "#a6e22e"
-            );
-        } else if (reconfirm.status == BackupMatchStatus::GameUpdated) {
-            appendLog(
-                "[*] 二次校验仍检测到版本变化，确认游戏已更新，旧备份已失效，将重新建立当前版本原版备份...",
-                "#66d9ef"
-            );
-
-            forceRecreate = true;
-        } else {
-            appendLog(
-                QString(
-                    "[-] 二次版本校验失败，已中止注入: %1"
-                )
-                    .arg(
-                        QString::fromStdWString(
-                            reconfirm.reason
-                        )
-                    ),
-                "#f92672"
-            );
-
-            return false;
-        }
-    }
-
-    std::vector<std::wstring> backedFgd;
-    std::wstring err;
-
-    if (!BackupManager::CreateOrUpdateBackup(
-            m_cs2Root,
-            backupDir.wstring(),
-            backedFgd,
-            err,
-            forceRecreate)) {
-
-        appendLog(
-            QString(
-                "[-] 备份原版文件失败: %1"
-            )
-                .arg(
-                    QString::fromStdWString(err)
-                ),
-            "#f92672"
-        );
-
-        return false;
-    }
-
-    appendLog(
-        QString(
-            "[+] 成功捕获并绑定 %1 个原版 FGD 与 Qt5Core.dll"
-        )
-            .arg(backedFgd.size()),
-        "#a6e22e"
-    );
-
-    // ==========================================
-    // STEP 2: FGD 汉化
-    // ==========================================
-    appendLog(
-        "[2/3] 正在部署 FGD 汉化...",
-        "#e6db74"
-    );
-
-    std::vector<std::wstring> transFgd;
-
-    if (useMachineTrans) {
-        appendLog(
-            "[*] 已启用机翻模式：自动加载 fgd_fallback.jsonc 与 qt_fallback.jsonc 作为兜底词典",
-            "#66d9ef"
-        );
-    }
-
-    std::wstring fgdFallbackParam = (useMachineTrans && fs::exists(fgdFallbackPath)) ? fgdFallbackPath.wstring() : L"";
-
-    if (!FgdTranslator::TranslateAndDeployAll(
-            m_cs2Root,
-            backupDir.wstring(),
-            transDir.wstring(),
-            fgdDictPath.wstring(),
-            fgdOverridePath.wstring(),
-            transFgd,
-            err,
-            fgdFallbackParam)) {
-
-        appendLog(
-            QString(
-                "[-] 汉化 FGD 失败: %1"
-            )
-                .arg(
-                    QString::fromStdWString(err)
-                ),
-            "#f92672"
-        );
-
-        doRestore(false);
-        return false;
-    }
-
-    appendLog(
-        QString(
-            "[+] 成功汉化并部署 %1 个 FGD 文件"
-        )
-            .arg(transFgd.size()),
-        "#a6e22e"
-    );
-
-    // ==========================================
-    // STEP 3: Qt Patch
-    // ==========================================
-    appendLog(
-        "[3/3] 正在部署 Qt 汉化模块并修补 Qt5Core.dll...",
-        "#e6db74"
-    );
-
-    try {
-        fs::path destQtJson =
-            cs2Bin / L"qt_translations.jsonc";
-
-        fs::path destQmDll =
-            cs2Bin / L"qtcore_qm.dll";
-
-        if (!fs::exists(qtDictPath)) {
-            appendLog(
-                "[-] 找不到 qt_translations.jsonc",
-                "#f92672"
-            );
-
-            doRestore(false);
-            return false;
-        }
-
-        if (!fs::exists(qmDllSrc)) {
-            appendLog(
-                "[-] 找不到 qtcore_qm.dll",
-                "#f92672"
-            );
-
-            doRestore(false);
-            return false;
-        }
-
-        if (!BackupManager::SafeCopyFileWithRetry(qmDllSrc, destQmDll)) {
-            appendLog(
-                "[-] 部署 qtcore_qm.dll 失败 (目标被占用或无写权限)",
-                "#f92672"
-            );
-
-            doRestore(false);
-            return false;
-        }
-
-        std::wstring qtFallbackParam = (useMachineTrans && fs::exists(qtFallbackPath)) ? qtFallbackPath.wstring() : L"";
-
-        // 优先合并主词典与机翻兜底词典；合并失败或未启用机翻时直接部署主词典
-        bool qtJsonMerged = false;
-        if (!qtFallbackParam.empty()) {
-            std::wstring mergeErr;
-            qtJsonMerged = DictionaryCompiler::MergeJsonFiles(
-                    qtDictPath.wstring(),
-                    qtFallbackParam,
-                    destQtJson.wstring(),
-                    mergeErr);
-        }
-
-        if (!qtJsonMerged) {
-            if (!BackupManager::SafeCopyFileWithRetry(qtDictPath, destQtJson)) {
-                appendLog(
-                    "[-] 部署 qt_translations.jsonc 失败 (目标被占用或无写权限)",
-                    "#f92672"
-                );
-
-                doRestore(false);
-                return false;
-            }
-        }
-
-        // 修补 Qt5Core.dll
-        fs::path backupQtCore =
-            backupDir /
-            L"game" /
-            L"bin" /
-            L"win64" /
-            L"Qt5Core.dll";
-
-        fs::path targetQtCore =
-            cs2Bin / L"Qt5Core.dll";
-
-        if (!PePatcher::PatchQtCore(
-                backupQtCore.wstring(),
-                targetQtCore.wstring(),
-                err)) {
-
-            appendLog(
-                QString(
-                    "[-] 修补 Qt5Core.dll 失败: %1"
-                )
-                    .arg(
-                        QString::fromStdWString(err)
-                    ),
-                "#f92672"
-            );
-
-            doRestore(false);
-            return false;
-        }
-
-        appendLog(
-            "[+] Qt5Core.dll PE Code Cave 注入与重定向修补成功",
-            "#a6e22e"
-        );
-
-    } catch (const std::exception& e) {
-
-        appendLog(
-            QString(
-                "[-] 部署补丁异常: %1"
-            )
-                .arg(e.what()),
-            "#f92672"
-        );
-
-        doRestore(false);
-        return false;
-    }
-
-    /*
-     * 注入成功后记录 session_state。
-     *
-     * 这样即使用户之后直接关闭启动器，
-     * 下次启动依然可以知道当前目录没有被还原。
-     */
-    if (!BackupManager::SaveSessionState(
-            m_workingDir,
-            true
-        )) {
-        appendLog(
-            "[-] 会话状态写入失败 (session_state.json)，异常退出后的自动恢复可能失效",
-            "#f92672"
-        );
-    }
-
-    appendLog(
-        "[SUCCESS] 汉化补丁注入完成，当前处于“已注入”状态。",
-        "#a6e22e"
-    );
-
-    return true;
+    const LocalizationService::Context ctx{m_cs2Root, m_workingDir};
+    return LocalizationService::Inject(
+        ctx,
+        useMachineTrans,
+        [this](const QString& msg, const QString& color) { appendLog(msg, color); });
 }
 
 void MainWindow::onInjectClicked() {
@@ -1577,11 +1143,7 @@ void MainWindow::onInjectClicked() {
 }
 
 bool MainWindow::startHammerProcess() {
-    fs::path cs2Bin =
-        fs::path(m_cs2Root) /
-        L"game" /
-        L"bin" /
-        L"win64";
+    fs::path cs2Bin = paths::Win64Bin(m_cs2Root);
 
     QString selectedAddon =
         m_addonCombo->currentText().trimmed();
@@ -1597,7 +1159,7 @@ bool MainWindow::startHammerProcess() {
 
     QString cs2ExePath =
         QString::fromStdWString(
-            (cs2Bin / L"cs2.exe").wstring()
+            (cs2Bin / paths::kCs2Exe).wstring()
         );
 
     if (!QFileInfo::exists(cs2ExePath)) {
@@ -1673,7 +1235,7 @@ bool MainWindow::startHammerProcess() {
     }
 
     m_isHammerRunning = true;
-    m_notRunningCount = 0;
+    m_processMonitor.Reset();
 
     m_statusLabel->setText(
         "状态: Hammer 编辑器正在启动..."
@@ -1783,7 +1345,7 @@ void MainWindow::onLaunchClicked() {
 
 void MainWindow::onHammerStarted() {
     m_isHammerRunning = true;
-    m_notRunningCount = 0;
+    m_processMonitor.Reset();
 
     m_hammerPid =
         m_hammerProcess->processId();
@@ -1841,54 +1403,19 @@ void MainWindow::onCheckProcessState() {
         return;
     }
 
-    bool isRunning = false;
+    // 三路探测来源按优先级由 ProcessMonitor 判定（QProcess → 原生句柄 → PID）
+    ProcessMonitor::Source src;
+    src.qProcessRunning = (m_hammerProcess != nullptr) &&
+                          (m_hammerProcess->state() == QProcess::Running);
+    src.nativeHandle    = m_hammerProcessHandle;
+    src.pid             = static_cast<unsigned long>(m_hammerPid);
 
-    if (m_hammerProcess &&
-        m_hammerProcess->state() ==
-            QProcess::Running) {
-
-        isRunning = true;
-
-    } else if (
-        m_hammerProcessHandle != nullptr
-    ) {
-
-        DWORD waitRes =
-            WaitForSingleObject(
-                static_cast<HANDLE>(
-                    m_hammerProcessHandle
-                ),
-                0
-            );
-
-        if (waitRes == WAIT_TIMEOUT) {
-            isRunning = true;
-        }
-
-    } else if (m_hammerPid > 0) {
-
-        isRunning =
-            Cs2Detector::IsProcessRunning(
-                static_cast<DWORD>(
-                    m_hammerPid
-                )
-            );
-    }
-
-    if (isRunning) {
-        m_notRunningCount = 0;
-
+    if (m_processMonitor.Sample(src)) {
         m_statusLabel->setText(
             "状态: Hammer 编辑器正在运行中 (退出后将自动恢复备份)"
         );
-
-    } else {
-
-        m_notRunningCount++;
-
-        if (m_notRunningCount >= 2) {
-            handleHammerProcessTerminated();
-        }
+    } else if (m_processMonitor.ReachedTerminationThreshold()) {
+        handleHammerProcessTerminated();
     }
 }
 
@@ -2033,54 +1560,11 @@ void MainWindow::onHammerError(
 }
 
 bool MainWindow::doRestore(bool showLog) {
-    fs::path workPath(m_workingDir);
-
-    fs::path backupDir =
-        workPath / L"backup";
-
-    if (!BackupManager::HasBackup(
-            backupDir.wstring())) {
-
-        return true;
-    }
-
-    if (showLog) {
-        appendLog(
-            "[*] 正在还原原版 FGD 实体定义及核心二进制...",
-            "#66d9ef"
-        );
-    }
-
-    std::wstring err;
-
-    if (!BackupManager::RestoreAll(
-            m_cs2Root,
-            backupDir.wstring(),
-            err)) {
-
-        if (showLog) {
-            appendLog(
-                QString(
-                    "[-] 还原备份失败: %1"
-                )
-                    .arg(
-                        QString::fromStdWString(err)
-                    ),
-                "#f92672"
-            );
-        }
-
-        return false;
-    }
-
-    if (showLog) {
-        appendLog(
-            "[SUCCESS] 还原操作完成！所有原版 FGD 实体定义及 Qt5Core.dll 已恢复原样。",
-            "#a6e22e"
-        );
-    }
-
-    return true;
+    const LocalizationService::Context ctx{m_cs2Root, m_workingDir};
+    return LocalizationService::Restore(
+        ctx,
+        showLog,
+        [this](const QString& msg, const QString& color) { appendLog(msg, color); });
 }
 
 void MainWindow::fetchUrlCandidates(
@@ -2176,6 +1660,108 @@ void MainWindow::fetchUrlCandidates(
     (*fetchNext)(0);
 }
 
+void MainWindow::reportDictionaryFetchFailure(const QString& dictName) {
+    appendLog(
+        QString("[-] 获取 %1 失败：%2").arg(dictName,"所有节点连接超时或不可达，请检查网络或代理设置。"),
+        "#f92672"
+    );
+
+    QMessageBox::critical(
+        this,
+        "更新失败",
+        QString("获取 %1 失败！\n%2").arg(dictName,"无法连接到 GitHub 仓库，请检查您的网络连接或代理设置。")
+    );
+
+    setUiBusy(false);
+    m_statusLabel->setText("状态: 词典更新失败");
+}
+
+void MainWindow::reportDictionaryParseFailure(
+    const QString& dictName,
+    const QString& parseErrorText
+) {
+    appendLog(
+        QString("[-] 解析 %1 失败: %2").arg(dictName, parseErrorText),
+        "#f92672"
+    );
+
+    QMessageBox::critical(
+        this,
+        "更新失败",
+        QString("下载的 %1 格式异常或内容为空，已放弃更新。").arg(dictName)
+    );
+
+    setUiBusy(false);
+    m_statusLabel->setText("状态: 词典校验失败");
+}
+
+// 剥离 JSONC 注释，使其可被 QJsonDocument 解析（含尾随逗号移除）
+static QByteArray StripJsonc(const QByteArray& input) {
+    const std::string stripped =
+        DictionaryCompiler::StripJsonComments(input.constData(), (size_t)input.size());
+    return QByteArray(stripped.data(), (qsizetype)stripped.size());
+}
+
+// 统计 fgd_override 词典的有效规则数：
+// properties / io / classes 三个子对象的键数之和，再加上其余非下划线开头的顶层键；
+// 三者合计为 0 时退化为顶层键总数。
+static qsizetype CountOverrideRules(const QJsonObject& obj) {
+    qsizetype count = 0;
+
+    for (const char* section : {"properties", "io", "classes"}) {
+        if (obj.contains(section) && obj[section].isObject()) {
+            count += obj[section].toObject().keys().size();
+        }
+    }
+
+    for (auto it = obj.begin(); it != obj.end(); ++it) {
+        if (it.key() != "properties" && it.key() != "io" && it.key() != "classes" &&
+            !it.key().startsWith("_")) {
+            ++count;
+        }
+    }
+
+    return (count == 0) ? obj.keys().size() : count;
+}
+
+void MainWindow::fetchOnlineDictionary(
+    const QStringList& urls,
+    const QString& stepLabel,
+    const QString& dictName,
+    const QString& desc,
+    std::function<qsizetype(const QJsonDocument&)> countOf,
+    std::function<void(const OnlineDictionary&)> onSuccess
+) {
+    appendLog(
+        QString("%1 正在获取 %2 (%3)...").arg(stepLabel, dictName, desc),
+        "#e6db74"
+    );
+
+    fetchUrlCandidates(
+        urls,
+        [this, dictName, countOf, onSuccess](bool ok, const QByteArray& data) {
+            if (!ok) {
+                reportDictionaryFetchFailure(dictName);
+                return;
+            }
+
+            QJsonParseError parseErr;
+            QJsonDocument doc = QJsonDocument::fromJson(StripJsonc(data), &parseErr);
+            if (parseErr.error != QJsonParseError::NoError ||
+                !doc.isObject() || doc.object().isEmpty()) {
+                reportDictionaryParseFailure(dictName, parseErr.errorString());
+                return;
+            }
+
+            OnlineDictionary result;
+            result.raw   = data;
+            result.doc   = doc;
+            result.count = countOf(doc);
+            onSuccess(result);
+        }
+    );
+}
+
 void MainWindow::onUpdateTranslationsClicked() {
     if (m_isHammerRunning) {
         QMessageBox::warning(
@@ -2229,572 +1815,200 @@ void MainWindow::onUpdateTranslationsClicked() {
         "https://cdn.jsdelivr.net/gh/LaplaceTor/CS2WorkshopToolsLocalizerCN@main/translations/fgd_override.jsonc",
     };
 
-    auto stripJsonc =
-        [](const QByteArray& input) -> QByteArray {
 
-        QByteArray output;
-        output.reserve(input.size());
-
-        const char* p = input.constData();
-        const char* end = p + input.size();
-
-        while (p < end) {
-
-            if (*p == '"') {
-
-                output.append(*p++);
-
-                while (p < end && *p != '"') {
-
-                    if (*p == '\\' && p + 1 < end) {
-                        output.append(*p++);
-                    }
-
-                    output.append(*p++);
-                }
-
-                if (p < end) {
-                    output.append(*p++);
-                }
-            }
-            else if (
-                *p == '/' &&
-                p + 1 < end &&
-                *(p + 1) == '/'
-            ) {
-
-                p += 2;
-
-                while (
-                    p < end &&
-                    *p != '\n' &&
-                    *p != '\r'
-                ) {
-                    p++;
-                }
-            }
-            else if (
-                *p == '/' &&
-                p + 1 < end &&
-                *(p + 1) == '*'
-            ) {
-
-                p += 2;
-
-                while (
-                    p + 1 < end &&
-                    !(
-                        *p == '*' &&
-                        *(p + 1) == '/'
-                    )
-                ) {
-                    p++;
-                }
-
-                if (p + 1 < end) {
-                    p += 2;
-                }
-            }
-            else {
-                output.append(
-                    *p++
-                );
-            }
-        }
-
-        return output;
-    };
-
-    // 1. Fetch qt_translations.jsonc
-    appendLog(
-        "[1/3] 正在获取 qt_translations.jsonc (界面词典)...",
-        "#e6db74"
-    );
-
-    fetchUrlCandidates(
+    // 依次拉取三个在线词典：任一步失败都会中止（失败收尾由 fetchOnlineDictionary 统一处理）
+    fetchOnlineDictionary(
         qtUrls,
-        [
-            this,
-            fgdUrls,
-            overrideUrls,
-            stripJsonc
-        ]
-        (
-            bool qtOk,
-            const QByteArray& qtData
-        ) {
-
-        if (!qtOk) {
-
+        "[1/3]",
+        "qt_translations.jsonc",
+        "界面词典",
+        [](const QJsonDocument& doc) { return doc.object().keys().size(); },
+        [this, fgdUrls, overrideUrls](const OnlineDictionary& qt) {
             appendLog(
-                "[-] 获取 qt_translations.jsonc 失败：所有节点连接超时或不可达，请检查网络或代理设置。",
-                "#f92672"
-            );
-
-            QMessageBox::critical(
-                this,
-                "更新失败",
-                "获取 qt_translations.jsonc 失败！\n"
-                "无法连接到 GitHub 仓库，请检查您的网络连接或代理设置。"
-            );
-
-            setUiBusy(false);
-
-            m_statusLabel->setText(
-                "状态: 词典更新失败"
-            );
-
-            return;
-        }
-
-        QJsonParseError qtParseErr;
-
-        QJsonDocument qtDoc =
-            QJsonDocument::fromJson(
-                stripJsonc(qtData),
-                &qtParseErr
-            );
-
-        if (
-            qtParseErr.error !=
-                QJsonParseError::NoError ||
-            !qtDoc.isObject() ||
-            qtDoc.object().isEmpty()
-        ) {
-
-            appendLog(
-                QString(
-                    "[-] 解析 qt_translations.jsonc 失败: %1"
-                )
-                    .arg(
-                        qtParseErr.errorString()
-                    ),
-                "#f92672"
-            );
-
-            QMessageBox::critical(
-                this,
-                "更新失败",
-                "下载的 qt_translations.jsonc 格式异常或内容为空，已放弃更新。"
-            );
-
-            setUiBusy(false);
-
-            m_statusLabel->setText(
-                "状态: 词典校验失败"
-            );
-
-            return;
-        }
-
-        qsizetype qtCount =
-            qtDoc.object().keys().size();
-
-        appendLog(
-            QString(
-                "[+] qt_translations.jsonc 获取成功，有效词条: %1 条"
-            )
-                .arg(qtCount),
-            "#a6e22e"
-        );
-
-        // 2. Fetch fgd_translations.jsonc
-        appendLog(
-            "[2/3] 正在获取 fgd_translations.jsonc (实体定义词典)...",
-            "#e6db74"
-        );
-
-        fetchUrlCandidates(
-            fgdUrls,
-            [
-                this,
-                overrideUrls,
-                qtData,
-                qtCount,
-                stripJsonc
-            ]
-            (
-                bool fgdOk,
-                const QByteArray& fgdData
-            ) {
-
-            if (!fgdOk) {
-
-                appendLog(
-                    "[-] 获取 fgd_translations.jsonc 失败：所有节点连接超时或不可达，请检查网络设置。",
-                    "#f92672"
-                );
-
-                QMessageBox::critical(
-                    this,
-                    "更新失败",
-                    "获取 fgd_translations.jsonc 失败！\n"
-                    "无法连接到 GitHub 仓库，请检查网络连接。"
-                );
-
-                setUiBusy(false);
-
-                m_statusLabel->setText(
-                    "状态: 词典更新失败"
-                );
-
-                return;
-            }
-
-            QJsonParseError fgdParseErr;
-
-            QJsonDocument fgdDoc =
-                QJsonDocument::fromJson(
-                    stripJsonc(fgdData),
-                    &fgdParseErr
-                );
-
-            if (
-                fgdParseErr.error !=
-                    QJsonParseError::NoError ||
-                !fgdDoc.isObject() ||
-                fgdDoc.object().isEmpty()
-            ) {
-
-                appendLog(
-                    QString(
-                        "[-] 解析 fgd_translations.jsonc 失败: %1"
-                    )
-                        .arg(
-                            fgdParseErr.errorString()
-                        ),
-                    "#f92672"
-                );
-
-                QMessageBox::critical(
-                    this,
-                    "更新失败",
-                    "下载的 fgd_translations.jsonc 格式异常或内容为空，已放弃更新。"
-                );
-
-                setUiBusy(false);
-
-                m_statusLabel->setText(
-                    "状态: 词典校验失败"
-                );
-
-                return;
-            }
-
-            qsizetype fgdCount =
-                fgdDoc.object().keys().size();
-
-            appendLog(
-                QString(
-                    "[+] fgd_translations.jsonc 获取成功，有效词条: %1 条"
-                )
-                    .arg(fgdCount),
+                QString("[+] qt_translations.jsonc 获取成功，有效词条: %1 条").arg(qt.count),
                 "#a6e22e"
             );
 
-            // 3. Fetch fgd_override.jsonc
-            appendLog(
-                "[3/3] 正在获取 fgd_override.jsonc (实体覆盖词典)...",
-                "#e6db74"
+            fetchOnlineDictionary(
+                fgdUrls,
+                "[2/3]",
+                "fgd_translations.jsonc",
+                "实体定义词典",
+                [](const QJsonDocument& doc) { return doc.object().keys().size(); },
+                [this, overrideUrls, qt](const OnlineDictionary& fgd) {
+                    appendLog(
+                        QString("[+] fgd_translations.jsonc 获取成功，有效词条: %1 条").arg(fgd.count),
+                        "#a6e22e"
+                    );
+
+                    fetchOnlineDictionary(
+                        overrideUrls,
+                        "[3/3]",
+                        "fgd_override.jsonc",
+                        "实体覆盖词典",
+                        [](const QJsonDocument& doc) { return CountOverrideRules(doc.object()); },
+                        [this, qt, fgd](const OnlineDictionary& ovr) {
+                            appendLog(
+                                QString("[+] fgd_override.jsonc 获取成功，有效规则: %1 条").arg(ovr.count),
+                                "#a6e22e"
+                            );
+
+                            // 原子保存
+                            auto atomicSave =
+                                [this](
+                                    const QString& localPath,
+                                    const QByteArray& data,
+                                    const QString& name
+                                ) -> bool {
+
+                                std::string clean =
+                                    DictionaryCompiler::StripJsonComments(
+                                        data.constData(),
+                                        data.size()
+                                    );
+
+                                QJsonParseError parseErr;
+                                QJsonDocument doc =
+                                    QJsonDocument::fromJson(
+                                        QByteArray(clean.data(), static_cast<qsizetype>(clean.size())),
+                                        &parseErr
+                                    );
+
+                                if (parseErr.error != QJsonParseError::NoError || doc.isNull() || !doc.isObject()) {
+                                    appendLog(
+                                        QString("[-] 词典数据校验未通过，已放弃写入 %1: %2").arg(name, parseErr.errorString()),
+                                        "#f92672"
+                                    );
+                                    return false;
+                                }
+
+                                QSaveFile saveFile(localPath);
+                                if (!saveFile.open(QIODevice::WriteOnly | QIODevice::Truncate)) {
+                                    appendLog(
+                                        QString("[-] 无法以安全原子模式打开文件 %1: %2").arg(localPath, saveFile.errorString()),
+                                        "#f92672"
+                                    );
+                                    return false;
+                                }
+
+                                qint64 written = saveFile.write(data);
+                                if (written != data.size()) {
+                                    saveFile.cancelWriting();
+                                    appendLog(
+                                        QString("[-] 写入数据不完整 (%1): 预期 %2 字节，实际写入 %3 字节").arg(localPath).arg(data.size()).arg(written),
+                                        "#f92672"
+                                    );
+                                    return false;
+                                }
+
+                                if (!saveFile.commit()) {
+                                    appendLog(
+                                        QString("[-] 提交安全写入失败 (%1): %2").arg(localPath, saveFile.errorString()),
+                                        "#f92672"
+                                    );
+                                    return false;
+                                }
+
+                                return true;
+                            };
+
+                            fs::path transDir = fs::path(m_workingDir) / paths::kTranslationsDir;
+                            std::error_code ec;
+                            fs::create_directories(transDir, ec);
+
+                            QString qtLocalPath =
+                                QString::fromStdWString(
+                                    (transDir / L"qt_translations.jsonc").wstring()
+                                );
+
+                            QString fgdLocalPath =
+                                QString::fromStdWString(
+                                    (transDir / L"fgd_translations.jsonc").wstring()
+                                );
+
+                            QString overrideLocalPath =
+                                QString::fromStdWString(
+                                    (transDir / L"fgd_override.jsonc").wstring()
+                                );
+
+                            if (
+                                !atomicSave(
+                                    qtLocalPath,
+                                    qt.raw,
+                                    "qt_translations.jsonc"
+                                ) ||
+                                !atomicSave(
+                                    fgdLocalPath,
+                                    fgd.raw,
+                                    "fgd_translations.jsonc"
+                                ) ||
+                                !atomicSave(
+                                    overrideLocalPath,
+                                    ovr.raw,
+                                    "fgd_override.jsonc"
+                                )
+                            ) {
+
+                                QMessageBox::critical(
+                                    this,
+                                    "写入失败",
+                                    "保存或校验更新词典失败，请检查文件写入权限。"
+                                );
+
+                                setUiBusy(false);
+
+                                m_statusLabel->setText(
+                                    "状态: 写入失败"
+                                );
+
+                                return;
+                            }
+
+                            appendLog(
+                                QString(
+                                    "[SUCCESS] 翻译词典原子更新成功！(界面: %1, 实体: %2, 覆盖: %3)"
+                                )
+                                    .arg(
+                                        qt.count
+                                    )
+                                    .arg(
+                                        fgd.count
+                                    )
+                                    .arg(
+                                        ovr.count
+                                    ),
+                                "#a6e22e"
+                            );
+
+                            m_statusLabel->setText(
+                                "状态: 在线词典更新成功"
+                            );
+
+                            setUiBusy(false);
+
+                            QMessageBox::information(
+                                this,
+                                "更新成功",
+                                QString(
+                                    "已成功从 GitHub 获取并更新最新汉化词典！\n\n"
+                                    "- 界面词典 (qt_translations.jsonc): %1 条\n"
+                                    "- 实体词典 (fgd_translations.jsonc): %2 条\n"
+                                    "- 覆盖词典 (fgd_override.jsonc): %3 条\n\n"
+                                    "当前可使用“仅注入”或“启动 HAMMER”应用最新汉化。"
+                                )
+                                    .arg(qt.count)
+                                    .arg(fgd.count)
+                                    .arg(ovr.count)
+                            );
+
+                            updateActionButtonState();
+
+                        }
+                    );
+                }
             );
-
-            fetchUrlCandidates(
-                overrideUrls,
-                [
-                    this,
-                    qtData,
-                    fgdData,
-                    qtCount,
-                    fgdCount,
-                    stripJsonc
-                ]
-                (
-                    bool overrideOk,
-                    const QByteArray& overrideData
-                ) {
-
-                if (!overrideOk) {
-
-                    appendLog(
-                        "[-] 获取 fgd_override.jsonc 失败：所有节点连接超时或不可达，请检查网络设置。",
-                        "#f92672"
-                    );
-
-                    QMessageBox::critical(
-                        this,
-                        "更新失败",
-                        "获取 fgd_override.jsonc 失败！\n"
-                        "无法连接到 GitHub 仓库，请检查网络设置。"
-                    );
-
-                    setUiBusy(false);
-
-                    m_statusLabel->setText(
-                        "状态: 词典更新失败"
-                    );
-
-                    return;
-                }
-
-                QJsonParseError overrideParseErr;
-
-                QJsonDocument overrideDoc =
-                    QJsonDocument::fromJson(
-                        stripJsonc(overrideData),
-                        &overrideParseErr
-                    );
-
-                if (
-                    overrideParseErr.error !=
-                        QJsonParseError::NoError ||
-                    !overrideDoc.isObject() ||
-                    overrideDoc.object().isEmpty()
-                ) {
-
-                    appendLog(
-                        QString(
-                            "[-] 解析 fgd_override.jsonc 失败: %1"
-                        )
-                            .arg(
-                                overrideParseErr.errorString()
-                            ),
-                        "#f92672"
-                    );
-
-                    QMessageBox::critical(
-                        this,
-                        "更新失败",
-                        "下载的 fgd_override.jsonc 格式异常或内容为空，已放弃更新。"
-                    );
-
-                    setUiBusy(false);
-
-                    m_statusLabel->setText(
-                        "状态: 词典校验失败"
-                    );
-
-                    return;
-                }
-
-                qsizetype overrideCount = 0;
-
-                QJsonObject overrideObj =
-                    overrideDoc.object();
-
-                if (
-                    overrideObj.contains("properties") &&
-                    overrideObj["properties"].isObject()
-                ) {
-                    overrideCount +=
-                        overrideObj["properties"]
-                            .toObject()
-                            .keys()
-                            .size();
-                }
-
-                if (
-                    overrideObj.contains("io") &&
-                    overrideObj["io"].isObject()
-                ) {
-                    overrideCount +=
-                        overrideObj["io"]
-                            .toObject()
-                            .keys()
-                            .size();
-                }
-
-                if (
-                    overrideObj.contains("classes") &&
-                    overrideObj["classes"].isObject()
-                ) {
-                    overrideCount +=
-                        overrideObj["classes"]
-                            .toObject()
-                            .keys()
-                            .size();
-                }
-
-                for (
-                    auto it = overrideObj.begin();
-                    it != overrideObj.end();
-                    ++it
-                ) {
-
-                    if (
-                        it.key() != "properties" &&
-                        it.key() != "io" &&
-                        it.key() != "classes" &&
-                        !it.key().startsWith("_")
-                    ) {
-                        overrideCount++;
-                    }
-                }
-
-                if (overrideCount == 0) {
-                    overrideCount =
-                        overrideObj.keys().size();
-                }
-
-                appendLog(
-                    QString(
-                        "[+] fgd_override.jsonc 获取成功，有效规则: %1 条"
-                    )
-                        .arg(overrideCount),
-                    "#a6e22e"
-                );
-
-                // 原子保存
-                auto atomicSave =
-                    [this](
-                        const QString& localPath,
-                        const QByteArray& data,
-                        const QString& name
-                    ) -> bool {
-
-                    std::string clean =
-                        DictionaryCompiler::StripJsonComments(
-                            data.constData(),
-                            data.size()
-                        );
-
-                    QJsonParseError parseErr;
-                    QJsonDocument doc =
-                        QJsonDocument::fromJson(
-                            QByteArray(clean.data(), static_cast<qsizetype>(clean.size())),
-                            &parseErr
-                        );
-
-                    if (parseErr.error != QJsonParseError::NoError || doc.isNull() || !doc.isObject()) {
-                        appendLog(
-                            QString("[-] 词典数据校验未通过，已放弃写入 %1: %2").arg(name, parseErr.errorString()),
-                            "#f92672"
-                        );
-                        return false;
-                    }
-
-                    QSaveFile saveFile(localPath);
-                    if (!saveFile.open(QIODevice::WriteOnly | QIODevice::Truncate)) {
-                        appendLog(
-                            QString("[-] 无法以安全原子模式打开文件 %1: %2").arg(localPath, saveFile.errorString()),
-                            "#f92672"
-                        );
-                        return false;
-                    }
-
-                    qint64 written = saveFile.write(data);
-                    if (written != data.size()) {
-                        saveFile.cancelWriting();
-                        appendLog(
-                            QString("[-] 写入数据不完整 (%1): 预期 %2 字节，实际写入 %3 字节").arg(localPath).arg(data.size()).arg(written),
-                            "#f92672"
-                        );
-                        return false;
-                    }
-
-                    if (!saveFile.commit()) {
-                        appendLog(
-                            QString("[-] 提交安全写入失败 (%1): %2").arg(localPath, saveFile.errorString()),
-                            "#f92672"
-                        );
-                        return false;
-                    }
-
-                    return true;
-                };
-
-                fs::path transDir = fs::path(m_workingDir) / L"translations";
-                std::error_code ec;
-                fs::create_directories(transDir, ec);
-
-                QString qtLocalPath =
-                    QString::fromStdWString(
-                        (transDir / L"qt_translations.jsonc").wstring()
-                    );
-
-                QString fgdLocalPath =
-                    QString::fromStdWString(
-                        (transDir / L"fgd_translations.jsonc").wstring()
-                    );
-
-                QString overrideLocalPath =
-                    QString::fromStdWString(
-                        (transDir / L"fgd_override.jsonc").wstring()
-                    );
-
-                if (
-                    !atomicSave(
-                        qtLocalPath,
-                        qtData,
-                        "qt_translations.jsonc"
-                    ) ||
-                    !atomicSave(
-                        fgdLocalPath,
-                        fgdData,
-                        "fgd_translations.jsonc"
-                    ) ||
-                    !atomicSave(
-                        overrideLocalPath,
-                        overrideData,
-                        "fgd_override.jsonc"
-                    )
-                ) {
-
-                    QMessageBox::critical(
-                        this,
-                        "写入失败",
-                        "保存或校验更新词典失败，请检查文件写入权限。"
-                    );
-
-                    setUiBusy(false);
-
-                    m_statusLabel->setText(
-                        "状态: 写入失败"
-                    );
-
-                    return;
-                }
-
-                appendLog(
-                    QString(
-                        "[SUCCESS] 翻译词典原子更新成功！(界面: %1, 实体: %2, 覆盖: %3)"
-                    )
-                        .arg(
-                            qtCount
-                        )
-                        .arg(
-                            fgdCount
-                        )
-                        .arg(
-                            overrideCount
-                        ),
-                    "#a6e22e"
-                );
-
-                m_statusLabel->setText(
-                    "状态: 在线词典更新成功"
-                );
-
-                setUiBusy(false);
-
-                QMessageBox::information(
-                    this,
-                    "更新成功",
-                    QString(
-                        "已成功从 GitHub 获取并更新最新汉化词典！\n\n"
-                        "- 界面词典 (qt_translations.jsonc): %1 条\n"
-                        "- 实体词典 (fgd_translations.jsonc): %2 条\n"
-                        "- 覆盖词典 (fgd_override.jsonc): %3 条\n\n"
-                        "当前可使用“仅注入”或“启动 HAMMER”应用最新汉化。"
-                    )
-                        .arg(qtCount)
-                        .arg(fgdCount)
-                        .arg(overrideCount)
-                );
-
-                updateActionButtonState();
-            });
-        });
-    });
+        }
+    );
 }
 
 void MainWindow::onRestoreClicked() {
@@ -2862,7 +2076,7 @@ void MainWindow::onRestoreClicked() {
                 auto val =
                     BackupManager::BackupMatchesCurrentGame(
                         m_cs2Root,
-                        (fs::path(m_workingDir) / L"backup").wstring()
+                        (fs::path(m_workingDir) / paths::kBackupDir).wstring()
                     );
 
                 if (val.status != BackupMatchStatus::Matches) {
@@ -2960,7 +2174,7 @@ void MainWindow::checkAndRecoverAbnormalExit() {
     fs::path workPath(m_workingDir);
 
     fs::path backupDir =
-        workPath / L"backup";
+        workPath / paths::kBackupDir;
 
     bool hasUnrestored =
         BackupManager::HasUnrestoredSession(
@@ -3226,26 +2440,13 @@ void MainWindow::closeEvent(
     event->accept();
 }
 
-#ifndef WM_LOCALIZER_TOGGLE_LANG
-#define WM_LOCALIZER_TOGGLE_LANG   (WM_USER + 101)
-#endif
-#ifndef WM_LOCALIZER_RELOAD_DICT
-#define WM_LOCALIZER_RELOAD_DICT   (WM_USER + 102)
-#endif
 
 bool MainWindow::sendIpcCommandToHammer(unsigned int msgId) {
-    HWND hWnd = FindWindowExW(HWND_MESSAGE, NULL, L"CS2_HAMMER_LOCALIZER_IPC", L"CS2_Hammer_Localizer_MsgWnd");
-    if (!hWnd) {
-        hWnd = FindWindowW(L"CS2_HAMMER_LOCALIZER_IPC", L"CS2_Hammer_Localizer_MsgWnd");
-    }
-    if (!hWnd) {
-        return false;
-    }
-    return (PostMessageW(hWnd, msgId, 0, 0) != FALSE);
+    return HammerIpc::Send(msgId);
 }
 
 void MainWindow::onToggleLangClicked() {
-    if (sendIpcCommandToHammer(WM_LOCALIZER_TOGGLE_LANG)) {
+    if (HammerIpc::Send(HammerIpc::kMsgToggleLang)) {
         appendLog("[⚡] 已向运行中的 Hammer 发送【切换原文 / 翻译】指令", "#a6e22e");
     } else {
         appendLog("[!] 未检测到运行中的 Hammer 汉化模块 IPC 窗口（请确保 Hammer 正在运行）", "#f92672");
@@ -3254,7 +2455,7 @@ void MainWindow::onToggleLangClicked() {
 
 void MainWindow::writeAppDirPointer() {
     if (m_cs2Root.empty()) return;
-    fs::path cs2Bin = fs::path(m_cs2Root) / L"game" / L"bin" / L"win64";
+    fs::path cs2Bin = paths::Win64Bin(m_cs2Root);
     if (!fs::exists(cs2Bin)) return;
     fs::path pointerFile = cs2Bin / L"localizer_appdir.txt";
     bool useMachineTrans = (m_useMachineTransCheck != nullptr) ? m_useMachineTransCheck->isChecked() : true;
@@ -3278,8 +2479,8 @@ void MainWindow::setupFileWatcher() {
     connect(m_hotReloadDebounceTimer, &QTimer::timeout,
             this, &MainWindow::onDebouncedHotReload);
 
-    fs::path transDir = fs::path(m_workingDir) / L"translations";
-    fs::path parentTransDir = fs::path(m_workingDir) / L".." / L"translations";
+    fs::path transDir = fs::path(m_workingDir) / paths::kTranslationsDir;
+    fs::path parentTransDir = fs::path(m_workingDir) / L".." / paths::kTranslationsDir;
 
     QStringList filesToWatch;
     auto addDictFiles = [&](const fs::path& dir) {
@@ -3312,8 +2513,8 @@ void MainWindow::onWatchedFileChanged(const QString& path) {
 }
 
 void MainWindow::onDebouncedHotReload() {
-    fs::path transDir = fs::path(m_workingDir) / L"translations";
-    fs::path parentTransDir = fs::path(m_workingDir) / L".." / L"translations";
+    fs::path transDir = fs::path(m_workingDir) / paths::kTranslationsDir;
+    fs::path parentTransDir = fs::path(m_workingDir) / L".." / paths::kTranslationsDir;
 
     // 若在源码/开发目录中编辑了上层 translations，自动同步至当前程序运行目录
     if (fs::exists(parentTransDir)) {
@@ -3350,8 +2551,7 @@ void MainWindow::onDebouncedHotReload() {
         }
     }
 
-    HWND hWnd = FindWindowExW(HWND_MESSAGE, NULL, L"CS2_HAMMER_LOCALIZER_IPC", L"CS2_Hammer_Localizer_MsgWnd");
-    if (!hWnd) hWnd = FindWindowW(L"CS2_HAMMER_LOCALIZER_IPC", L"CS2_Hammer_Localizer_MsgWnd");
+    HWND hWnd = HammerIpc::FindIpcWindow();
 
     if (!m_isHammerRunning && !hWnd) {
         appendLog("[📝] 检测到程序目录词典保存更新（已就绪，将在 Hammer 运行时即刻生效）", "#8b949e");
@@ -3369,9 +2569,9 @@ bool MainWindow::performHotReload(bool silent) {
     bool useMachineTrans = (m_useMachineTransCheck != nullptr) ? m_useMachineTransCheck->isChecked() : true;
 
     // 2. 镜像同步与合并 qt_translations.jsonc 到游戏目录（保障本地 fallback 完整）
-    fs::path srcQtJson = resolveJsonPath(m_workingDir, L"qt_translations.jsonc");
-    fs::path srcQtFallback = resolveJsonPath(m_workingDir, L"qt_fallback.jsonc");
-    fs::path cs2Bin = fs::path(m_cs2Root) / L"game" / L"bin" / L"win64";
+    fs::path srcQtJson = ResolveDictionaryPath(m_workingDir, L"qt_translations.jsonc");
+    fs::path srcQtFallback = ResolveDictionaryPath(m_workingDir, L"qt_fallback.jsonc");
+    fs::path cs2Bin = paths::Win64Bin(m_cs2Root);
     fs::path destQtJson = cs2Bin / L"qt_translations.jsonc";
     fs::path destQtFallback = cs2Bin / L"qt_fallback.jsonc";
 
@@ -3397,11 +2597,11 @@ bool MainWindow::performHotReload(bool silent) {
     }
 
     // 3. 联动重新编译并部署 FGD（引入 fgd_fallback 兜底）
-    fs::path transDir = fs::path(m_workingDir) / L"translations";
-    fs::path backupDir = fs::path(m_workingDir) / L"backup";
-    fs::path fgdDictPath = resolveJsonPath(m_workingDir, L"fgd_translations.jsonc");
-    fs::path fgdOverridePath = resolveJsonPath(m_workingDir, L"fgd_override.jsonc");
-    fs::path fgdFallbackPath = resolveJsonPath(m_workingDir, L"fgd_fallback.jsonc");
+    fs::path transDir = fs::path(m_workingDir) / paths::kTranslationsDir;
+    fs::path backupDir = fs::path(m_workingDir) / paths::kBackupDir;
+    fs::path fgdDictPath = ResolveDictionaryPath(m_workingDir, L"fgd_translations.jsonc");
+    fs::path fgdOverridePath = ResolveDictionaryPath(m_workingDir, L"fgd_override.jsonc");
+    fs::path fgdFallbackPath = ResolveDictionaryPath(m_workingDir, L"fgd_fallback.jsonc");
 
     std::wstring fgdFallbackParam = (useMachineTrans && fs::exists(fgdFallbackPath)) ? fgdFallbackPath.wstring() : L"";
 
@@ -3419,7 +2619,7 @@ bool MainWindow::performHotReload(bool silent) {
     );
 
     // 4. 发送 IPC 消息给 Hammer
-    bool ipcOk = sendIpcCommandToHammer(WM_LOCALIZER_RELOAD_DICT);
+    bool ipcOk = HammerIpc::Send(HammerIpc::kMsgReloadDict);
 
     if (ipcOk) {
         if (fgdOk) {

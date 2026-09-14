@@ -1,4 +1,5 @@
 #include "cs2_detector.h"
+#include "path_constants.h"
 #include <windows.h>
 #include <tlhelp32.h>
 #include <filesystem>
@@ -25,43 +26,49 @@ bool Cs2Detector::IsProcessRunning(unsigned long pid) {
     return (waitRes == WAIT_TIMEOUT);
 }
 
-bool Cs2Detector::IsCs2ProcessRunning() {
+unsigned long Cs2Detector::FindCs2ProcessId() {
     HANDLE hSnapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
     if (hSnapshot == INVALID_HANDLE_VALUE) {
-        return false;
+        return 0;
     }
 
     PROCESSENTRY32W pe32;
     pe32.dwSize = sizeof(PROCESSENTRY32W);
 
-    bool isRunning = false;
+    unsigned long foundPid = 0;
     if (Process32FirstW(hSnapshot, &pe32)) {
         do {
             if (_wcsicmp(pe32.szExeFile, L"cs2.exe") == 0) {
-                isRunning = true;
+                foundPid = pe32.th32ProcessID;
                 break;
             }
         } while (Process32NextW(hSnapshot, &pe32));
     }
 
     CloseHandle(hSnapshot);
-    return isRunning;
+    return foundPid;
+}
+
+bool Cs2Detector::IsCs2ProcessRunning() {
+    return FindCs2ProcessId() != 0;
 }
 
 bool Cs2Detector::IsValidCs2Root(const std::wstring& rootPath) {
     if (rootPath.empty()) return false;
-    QDir dir(QString::fromStdWString(rootPath));
-    return dir.exists("game/bin/win64/cs2.exe") || dir.exists("game/bin/win64/Qt5Core.dll") || dir.exists("game/bin/win64");
+    const fs::path bin = paths::Win64Bin(rootPath);
+    return fs::exists(bin / paths::kCs2Exe)
+        || fs::exists(bin / paths::kQt5CoreDll)
+        || fs::exists(bin);
 }
 
 std::wstring Cs2Detector::GetWin64BinDir(const std::wstring& cs2Root) {
     fs::path p(cs2Root);
-    return (p / L"game" / L"bin" / L"win64").wstring();
+    return paths::Win64Bin(p).wstring();
 }
 
 std::wstring Cs2Detector::GetAddonsDir(const std::wstring& cs2Root) {
     fs::path p(cs2Root);
-    return (p / L"content" / L"csgo_addons").wstring();
+    return paths::Addons(p).wstring();
 }
 
 std::vector<std::wstring> Cs2Detector::GetAvailableAddons(const std::wstring& cs2Root) {
@@ -145,7 +152,7 @@ bool Cs2Detector::CheckRegistrySteam(std::wstring& outPath) {
     if (steamPath.isEmpty()) return false;
 
     std::wstring wSteamPath = steamPath.toStdWString();
-    fs::path vdfPath = fs::path(wSteamPath) / L"steamapps" / L"libraryfolders.vdf";
+    fs::path vdfPath = fs::path(wSteamPath) / paths::kSteamAppsDir / paths::kLibraryFoldersVdf;
     std::vector<std::wstring> libraries;
     libraries.push_back(wSteamPath);
 
@@ -154,7 +161,7 @@ bool Cs2Detector::CheckRegistrySteam(std::wstring& outPath) {
     }
 
     for (const auto& lib : libraries) {
-        fs::path cand = fs::path(lib) / L"steamapps" / L"common" / L"Counter-Strike Global Offensive";
+        fs::path cand = fs::path(lib) / paths::kSteamAppsDir / paths::kCommonDir / paths::kCs2InstallDir;
         if (IsValidCs2Root(cand.wstring())) {
             outPath = cand.wstring();
             return true;
@@ -165,12 +172,13 @@ bool Cs2Detector::CheckRegistrySteam(std::wstring& outPath) {
 }
 
 bool Cs2Detector::CheckCommonDrivePaths(std::wstring& outPath) {
-    const wchar_t* prefixes[] = {
-        L"SteamLibrary\\steamapps\\common\\Counter-Strike Global Offensive",
-        L"Program Files (x86)\\Steam\\steamapps\\common\\Counter-Strike Global Offensive",
-        L"Program Files\\Steam\\steamapps\\common\\Counter-Strike Global Offensive",
-        L"Steam\\steamapps\\common\\Counter-Strike Global Offensive",
-        L"Games\\SteamLibrary\\steamapps\\common\\Counter-Strike Global Offensive"
+    // 盘符根目录下的 Steam 常见安装位置，统一拼上 steamapps/common/<CS2 安装目录名>
+    const wchar_t* steamRoots[] = {
+        L"SteamLibrary",
+        L"Program Files (x86)\\Steam",
+        L"Program Files\\Steam",
+        L"Steam",
+        L"Games\\SteamLibrary"
     };
 
     // 枚举系统全部盘符，替代硬编码的 C:~H:
@@ -180,8 +188,9 @@ bool Cs2Detector::CheckCommonDrivePaths(std::wstring& outPath) {
         if (!drivePath.endsWith('/')) {
             drivePath += '/';
         }
-        for (const wchar_t* prefix : prefixes) {
-            fs::path cand = fs::path(drivePath.toStdWString()) / prefix;
+        for (const wchar_t* root : steamRoots) {
+            const fs::path cand = fs::path(drivePath.toStdWString()) / root
+                                / paths::kSteamAppsDir / paths::kCommonDir / paths::kCs2InstallDir;
             if (IsValidCs2Root(cand.wstring())) {
                 outPath = cand.wstring();
                 return true;

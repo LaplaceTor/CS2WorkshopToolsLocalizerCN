@@ -23,6 +23,9 @@ public:
     // 检测指定 PID 的进程是否在运行
     static bool IsProcessRunning(unsigned long pid);
 
+    // 查找当前运行的 CS2 进程 (cs2.exe) 的 PID；未运行返回 0
+    static unsigned long FindCs2ProcessId();
+
     // 检测系统当前是否有 CS2 进程 (cs2.exe) 在运行
     static bool IsCs2ProcessRunning();
 
