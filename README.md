@@ -116,14 +116,6 @@ cmake --build build --config Release
 
 调试时可直接运行构建目录中的 exe；若要生成可分发的绿色包，可自行执行 `windeployqt --release --no-translations --no-opengl-sw --no-system-dxc-compiler --no-compiler-runtime <exe>` 收集 Qt 运行时并打包（见 `.github/workflows/release.yml` 中的官方打包步骤）。
 
-**运行测试**
-
-```bash
-cmake --build build --config Release --target test_components
-```
-
-随后运行构建目录中生成的 `test_components` 可执行文件即可。
-
 ---
 
 ## 🚀 快速使用指南
@@ -471,7 +463,6 @@ Hammer 退出或点击"还原"时，从启动时建立的本地备份中恢复�
 - **开发环境**：Visual Studio 2022（MSVC）+ CMake ≥ 3.20 + Ninja + Qt 6.8.0 msvc2022_64，参见[从源码构建](#方式二从源码构建)。
 - **编码规范**：源码与注释统一 UTF-8（CMake 已为 MSVC 开启 `/utf-8`）；新增源文件请同步更新 `CMakeLists.txt`。
 - **提交信息**：建议遵循 [Conventional Commits](https://www.conventionalcommits.org/)，如 `feat: 支持词典热重载`、`fix: 修复还原失败`、`trans: 补充 Hammer 工具栏词条`。
-- **测试**：改动 `cs2_detector` / `pe_patcher` / `fgd_translator` / `backup_manager` / `dictionary_compiler` 后，请构建并运行 `test_components`。
 - **PR 说明**：请描述改动动机、验证方式（游戏版本 + 复现步骤），必要时附截图。
 
 ### CI 工作流
