@@ -375,6 +375,32 @@ static std::optional<std::string> TryStandaloneGroup(const std::string& code, co
     return prefix + "group" + eq + "\"" + GetTranslation(dict, gName) + "\"" + suffix;
 }
 
+// 3.2 实体工具分类声明：@EntityGroup "GroupName" { ... }
+static std::optional<std::string> TryEntityGroupDirective(const std::string& code, const FgdDict& dict) {
+    static const std::regex egRegex(R"re(^(\s*@EntityGroup\s+)"([^"]+)"(.*)$)re", std::regex_constants::icase);
+    std::smatch match;
+    if (!std::regex_match(code, match, egRegex)) {
+        return std::nullopt;
+    }
+    const std::string prefix = match[1].str();
+    const std::string groupName = match[2].str();
+    const std::string suffix = match[3].str();
+    return prefix + "\"" + GetTranslation(dict, groupName) + "\"" + suffix;
+}
+
+// 3.3 实体工具元数据：entity_tool_name / entity_tool_group / entity_tool_tip = "..."
+static std::optional<std::string> TryEntityToolMetadata(const std::string& code, const FgdDict& dict) {
+    static const std::regex toolRegex(R"re(^(\s*entity_tool_(?:name|group|tip)\s*=\s*)"([^"]*)(".*)$)re");
+    std::smatch match;
+    if (!std::regex_match(code, match, toolRegex)) {
+        return std::nullopt;
+    }
+    const std::string prefix = match[1].str();
+    const std::string text = match[2].str();
+    const std::string suffix = match[3].str();
+    return prefix + "\"" + GetTranslation(dict, text) + suffix;
+}
+
 // 4. 属性定义：prop(type) [attrs] {attrs} : "Display Name" [ : default [ : "Description" ]] [ = [ choices ] ]
 static std::optional<std::string> TryPropertyDefinition(
     const std::string& code, const FgdDict& dict, const FgdOverrideData& overrideData,
@@ -584,6 +610,8 @@ std::string FgdCore::TranslateLine(
         if (auto r = TryPendingClassDesc(code, dict, overrideData, inOutPendingClassDesc)) return r;
         if (auto r = TryClassDefinition(code, dict, overrideData, inOutCurrentClass, inOutPendingClassDesc)) return r;
         if (auto r = TryIoDefinition(code, dict, overrideData, inOutCurrentClass)) return r;
+        if (auto r = TryEntityGroupDirective(code, dict)) return r;
+        if (auto r = TryEntityToolMetadata(code, dict)) return r;
         if (auto r = TryDescMetadata(code, dict)) return r;
         if (auto r = TryStandaloneGroup(code, dict)) return r;
         if (auto r = TryPropertyDefinition(code, dict, overrideData, inOutCurrentClass)) return r;

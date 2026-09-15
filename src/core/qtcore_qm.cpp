@@ -72,6 +72,7 @@ static fnCUtlBuffer_SeekGet g_pfnCUtlBuffer_SeekGet = nullptr;
 static fnReadFileToBuffer g_o_ReadFileToBuffer = nullptr;
 static std::atomic<bool> g_bFileSystemHooked{false};
 static std::atomic<bool> g_bFileSystemHookFailed{false};
+static bool TryHookTier0();
 
 static void* g_pReloadFgdAction = nullptr;
 static std::mutex g_ReloadActionMutex;
@@ -961,7 +962,80 @@ static bool TryHookFileSystem() {
             MB_ICONWARNING | MB_OK
         );
     }
+    TryHookTier0();
     return ok;
+}
+
+// 2.2 Tier0 字符串比较兼容兜底 (防止 Hammer 实体分类比较中英不匹配)
+typedef int (__fastcall *fnV_stricmp_fast)(const char* s1, const char* s2);
+static fnV_stricmp_fast g_o_V_stricmp_fast = nullptr;
+static std::atomic<bool> g_bTier0Hooked{false};
+
+static int __fastcall hk_V_stricmp_fast(const char* s1, const char* s2) {
+    if (!s1 || !s2) {
+        if (g_o_V_stricmp_fast) return g_o_V_stricmp_fast(s1, s2);
+        return (s1 == s2) ? 0 : (s1 ? 1 : -1);
+    }
+
+    int res = g_o_V_stricmp_fast ? g_o_V_stricmp_fast(s1, s2) : _stricmp(s1, s2);
+    if (res == 0) return 0;
+
+    // 针对 Hammer 实体工具分类比对的兼容兜底：
+    // 当原版字符串不相等时，若调用方来自 hammer.dll，检查是否存在中英文互译映射
+    void* caller = _ReturnAddress();
+    wchar_t stem[64] = {0};
+    if (GetCallerModuleName(caller, stem, 64) && _wcsicmp(stem, L"hammer") == 0) {
+        std::lock_guard<std::mutex> lock(g_DictMutex);
+
+        // 1. s1 是英文，s2 是中文
+        auto it1 = g_CommonDict.find(s1);
+        if (it1 != g_CommonDict.end() && it1->second == s2) return 0;
+
+        // 2. s2 是英文，s1 是中文
+        auto it2 = g_CommonDict.find(s2);
+        if (it2 != g_CommonDict.end() && it2->second == s1) return 0;
+
+        // 3. 反向字典查找
+        auto itRev1 = g_CommonReverseDict.find(s1);
+        if (itRev1 != g_CommonReverseDict.end() && _stricmp(itRev1->second.c_str(), s2) == 0) return 0;
+
+        auto itRev2 = g_CommonReverseDict.find(s2);
+        if (itRev2 != g_CommonReverseDict.end() && _stricmp(itRev2->second.c_str(), s1) == 0) return 0;
+
+        // 4. FGD 字典查找
+        auto itFgd1 = g_FgdDict.find(s1);
+        if (itFgd1 != g_FgdDict.end() && itFgd1->second == s2) return 0;
+
+        auto itFgd2 = g_FgdDict.find(s2);
+        if (itFgd2 != g_FgdDict.end() && itFgd2->second == s1) return 0;
+    }
+
+    return res;
+}
+
+static bool TryHookTier0() {
+    if (g_bTier0Hooked.load(std::memory_order_relaxed)) return true;
+
+    HMODULE hTier0 = GetModuleHandleW(L"tier0.dll");
+    if (!hTier0) {
+        hTier0 = LoadLibraryW(L"tier0.dll");
+    }
+    if (!hTier0) return false;
+
+    void* pVStricmpFast = (void*)GetProcAddress(hTier0, "V_stricmp_fast");
+    if (pVStricmpFast) {
+        if (HookManager::Instance().InstallHook(
+            pVStricmpFast,
+            (void*)hk_V_stricmp_fast,
+            (void**)&g_o_V_stricmp_fast,
+            "tier0::V_stricmp_fast"
+        )) {
+            g_bTier0Hooked.store(true, std::memory_order_release);
+            LogHook("[HOOK] Successfully hooked tier0!V_stricmp_fast at %p", pVStricmpFast);
+            return true;
+        }
+    }
+    return false;
 }
 
 
@@ -2429,6 +2503,7 @@ static bool TryHookQtToolsModules() {
         }
     }
 
+    TryHookTier0();
     return (g_bWidgetsHooked.load() && g_bGuiHooked.load());
 }
 
