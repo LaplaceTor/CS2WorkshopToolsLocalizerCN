@@ -65,6 +65,7 @@ add_executable(CS2WorkshopToolsLocalizerCN WIN32
 
     src/service/localization_service.cpp
     src/service/dictionary_service.cpp
+    src/service/hammer_service.cpp
 
     src/core/cs2_detector.cpp
     src/core/pe_patcher.cpp

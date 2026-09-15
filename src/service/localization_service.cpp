@@ -1,6 +1,7 @@
 #include "service/localization_service.h"
 
 #include <filesystem>
+#include <fstream>
 
 #include <QThread>
 #include <QString>
@@ -419,5 +420,53 @@ bool LocalizationService::Restore(const Context& ctx, bool showLog, const LogSin
     }
 
     return true;
+}
+
+// ---------------------------------------------------------------------------
+
+RestoreCheck LocalizationService::CheckRestore(const Context& ctx, QString* reason) {
+    const auto validation = BackupManager::BackupMatchesCurrentGame(
+        ctx.cs2Root,
+        (fs::path(ctx.workingDir) / paths::kBackupDir).wstring()
+    );
+
+    if (validation.status == BackupMatchStatus::Matches) {
+        return RestoreCheck::Allowed;
+    }
+
+    if (reason) {
+        *reason = QString::fromStdWString(validation.reason);
+    }
+
+    return (validation.status == BackupMatchStatus::GameUpdated)
+               ? RestoreCheck::RejectedGameUpdated
+               : RestoreCheck::RejectedOther;
+}
+
+bool LocalizationService::HasPendingRecovery(const Context& ctx) {
+    const fs::path backupDir = fs::path(ctx.workingDir) / paths::kBackupDir;
+
+    return BackupManager::HasUnrestoredSession(ctx.workingDir) ||
+           (BackupManager::HasBackup(backupDir.wstring()) &&
+            BackupManager::IsPatchDeployed(ctx.cs2Root));
+}
+
+void LocalizationService::WriteAppDirPointer(const std::wstring& cs2Root,
+                                             const std::wstring& workingDir,
+                                             bool useMachineTrans) {
+    if (cs2Root.empty()) return;
+
+    const fs::path cs2Bin = paths::Win64Bin(cs2Root);
+    if (!fs::exists(cs2Bin)) return;
+
+    const fs::path pointerFile = cs2Bin / L"localizer_appdir.txt";
+
+    try {
+        std::wofstream ofs(pointerFile, std::ios::trunc);
+        if (ofs.is_open()) {
+            ofs << workingDir << L"\n";
+            ofs << L"use_machine_trans=" << (useMachineTrans ? 1 : 0) << L"\n";
+        }
+    } catch (...) {}
 }
 

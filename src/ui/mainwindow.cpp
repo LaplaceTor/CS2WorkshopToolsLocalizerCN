@@ -60,11 +60,7 @@ MainWindow::MainWindow(const std::wstring& cs2Root, QWidget *parent)
     , m_fileWatcher(nullptr)
     , m_hotReloadDebounceTimer(nullptr)
     , m_dictionaryService(new DictionaryService(this))
-    , m_hammerProcess(new QProcess(this))
-    , m_monitorTimer(new QTimer(this))
-        , m_isHammerRunning(false)
-    , m_hammerPid(0)
-    , m_hammerProcessHandle(nullptr)
+    , m_hammerService(new HammerService(this))
 {
     // 获取程序所在目录作为工作目录
     QString appDir = QApplication::applicationDirPath();
@@ -136,40 +132,50 @@ MainWindow::MainWindow(const std::wstring& cs2Root, QWidget *parent)
             this,
             [this](bool) {
                 saveSettings();
-                writeAppDirPointer();
-                if (m_isHammerRunning) {
+                LocalizationService::WriteAppDirPointer(
+                    m_cs2Root,
+                    m_workingDir,
+                    machineTranslationEnabled()
+                );
+                if (m_hammerService->isRunning()) {
                     performHotReload(false);
                 }
             }
         );
     }
 
+    m_hammerService->setLogSink(
+        [this](const QString& msg, const QString& color) {
+            appendLog(msg, color);
+        }
+    );
+
     connect(
-        m_hammerProcess,
-        &QProcess::started,
+        m_hammerService,
+        &HammerService::started,
         this,
         &MainWindow::onHammerStarted
     );
 
     connect(
-        m_hammerProcess,
-        QOverload<int, QProcess::ExitStatus>::of(&QProcess::finished),
+        m_hammerService,
+        &HammerService::terminated,
         this,
-        &MainWindow::onHammerFinished
+        &MainWindow::onHammerTerminated
     );
 
     connect(
-        m_hammerProcess,
-        &QProcess::errorOccurred,
+        m_hammerService,
+        &HammerService::startFailed,
         this,
-        &MainWindow::onHammerError
+        &MainWindow::onHammerStartFailed
     );
 
     connect(
-        m_monitorTimer,
-        &QTimer::timeout,
+        m_hammerService,
+        &HammerService::heartbeat,
         this,
-        &MainWindow::onCheckProcessState
+        &MainWindow::onHammerHeartbeat
     );
 
     appendLog(
@@ -237,22 +243,19 @@ MainWindow::MainWindow(const std::wstring& cs2Root, QWidget *parent)
     checkAndRecoverAbnormalExit();
 
     // 写入程序目录指针供注入模块直读，并挂载词典文件自动热重载监听
-    writeAppDirPointer();
+    LocalizationService::WriteAppDirPointer(
+        m_cs2Root,
+        m_workingDir,
+        machineTranslationEnabled()
+    );
+
     setupFileWatcher();
 
     // 根据恢复后的实际状态刷新按钮
     updateActionButtonState();
 }
 
-MainWindow::~MainWindow() {
-    if (m_hammerProcessHandle != nullptr) {
-        CloseHandle(
-            static_cast<HANDLE>(m_hammerProcessHandle)
-        );
-
-        m_hammerProcessHandle = nullptr;
-    }
-}
+MainWindow::~MainWindow() = default;
 
 void MainWindow::setupUi() {
     setWindowTitle(
@@ -779,7 +782,7 @@ void MainWindow::saveSettings() {
     LauncherSettings settings;
     settings.selectedAddon   = LauncherConfig::NormalizeAddonName(m_addonCombo->currentText());
     settings.launchArgs      = m_argsEdit->text();
-    settings.useMachineTrans = m_useMachineTransCheck ? m_useMachineTransCheck->isChecked() : true;
+    settings.useMachineTrans = machineTranslationEnabled();
 
     LauncherConfig::Save(m_workingDir, settings);
 }
@@ -945,20 +948,22 @@ bool MainWindow::isPatchDeployedAndValid() {
 }
 
 void MainWindow::updateActionButtonState() {
+    const bool hammerRunning = m_hammerService->isRunning();
+
     if (m_toggleLangBtn) {
-        m_toggleLangBtn->setEnabled(m_isHammerRunning);
-        m_toggleLangBtn->setToolTip(m_isHammerRunning ?
+        m_toggleLangBtn->setEnabled(hammerRunning);
+        m_toggleLangBtn->setToolTip(hammerRunning ?
             "一键向运行中的 Hammer 发送【切换原文 / 翻译】指令" :
             "需在 Hammer 运行中时使用（一键切换原文/翻译）");
     }
     if (m_hotReloadBtn) {
-        m_hotReloadBtn->setEnabled(m_isHammerRunning);
-        m_hotReloadBtn->setToolTip(m_isHammerRunning ?
+        m_hotReloadBtn->setEnabled(hammerRunning);
+        m_hotReloadBtn->setToolTip(hammerRunning ?
             "重新从磁盘读取翻译词典并即时生效，无需重启 Hammer" :
             "需在 Hammer 运行中时使用（免重启热重载词典）");
     }
 
-    if (m_isHammerRunning) {
+    if (hammerRunning) {
         // HAMMER 运行中：三个核心按钮全部禁用
         m_injectBtn->setEnabled(false);
         m_launchBtn->setEnabled(false);
@@ -1027,10 +1032,13 @@ void MainWindow::updateRestoreButtonState() {
     updateActionButtonState();
 }
 
+bool MainWindow::machineTranslationEnabled() const {
+    return (m_useMachineTransCheck != nullptr) ? m_useMachineTransCheck->isChecked() : true;
+}
+
 bool MainWindow::injectLocalization() {
     // 在 UI 线程读取控件状态，随后转入后台线程执行核心流程（核心流程禁止访问任何 UI 控件）
-    bool useMachineTrans =
-        (m_useMachineTransCheck != nullptr) ? m_useMachineTransCheck->isChecked() : true;
+    const bool useMachineTrans = machineTranslationEnabled();
 
     return runHeavyInWorker([this, useMachineTrans]() {
         return injectLocalizationCore(useMachineTrans);
@@ -1046,7 +1054,7 @@ bool MainWindow::injectLocalizationCore(bool useMachineTrans) {
 }
 
 void MainWindow::onInjectClicked() {
-    if (m_isHammerRunning) {
+    if (m_hammerService->isRunning()) {
         QMessageBox::warning(
             this,
             "警告",
@@ -1136,123 +1144,8 @@ void MainWindow::onInjectClicked() {
     updateActionButtonState();
 }
 
-bool MainWindow::startHammerProcess() {
-    fs::path cs2Bin = paths::Win64Bin(m_cs2Root);
-
-    QString selectedAddon =
-        m_addonCombo->currentText().trimmed();
-
-    if (selectedAddon.contains(" ")) {
-        selectedAddon =
-            selectedAddon.split(" ").first();
-    }
-
-    if (selectedAddon.isEmpty()) {
-        selectedAddon = "addon_template";
-    }
-
-    QString cs2ExePath =
-        QString::fromStdWString(
-            (cs2Bin / paths::kCs2Exe).wstring()
-        );
-
-    if (!QFileInfo::exists(cs2ExePath)) {
-        QMessageBox::critical(
-            this,
-            "启动错误",
-            "找不到 cs2.exe：\n" +
-            cs2ExePath
-        );
-
-        return false;
-    }
-
-    QStringList processArgs;
-
-    processArgs
-        << "-addon"
-        << selectedAddon
-        << "-tools";
-
-    QString customArgs =
-        m_argsEdit->text().trimmed();
-
-    if (!customArgs.isEmpty()) {
-        QStringList userTokens =
-            QProcess::splitCommand(
-                customArgs
-            );
-
-        processArgs.append(
-            userTokens
-        );
-    }
-
-    m_hammerProcess->setProgram(
-        cs2ExePath
-    );
-
-    m_hammerProcess->setArguments(
-        processArgs
-    );
-
-    m_hammerProcess->setWorkingDirectory(
-        QString::fromStdWString(
-            cs2Bin.wstring()
-        )
-    );
-
-    m_hammerProcess->setProcessChannelMode(
-        QProcess::ForwardedChannels
-    );
-
-    appendLog(
-        QString(
-            "[*] 执行 HAMMER 命令: %1 %2"
-        )
-            .arg(
-                cs2ExePath,
-                processArgs.join(" ")
-            ),
-        "#75715e"
-    );
-
-    // 保持 session_state 为已注入
-    if (!BackupManager::SaveSessionState(
-            m_workingDir,
-            true
-        )) {
-        appendLog(
-            "[-] 会话状态写入失败 (session_state.json)，异常退出后的自动恢复可能失效",
-            "#f92672"
-        );
-    }
-
-    m_isHammerRunning = true;
-    m_processMonitor.Reset();
-
-    m_statusLabel->setText(
-        "状态: Hammer 编辑器正在启动..."
-    );
-
-    m_launchBtn->setText(
-        "HAMMER 运行中..."
-    );
-
-    m_injectBtn->setEnabled(false);
-    m_launchBtn->setEnabled(false);
-    m_restoreBtn->setEnabled(false);
-    m_updateBtn->setEnabled(false);
-
-    m_hammerProcess->start();
-
-    m_monitorTimer->start(1000);
-
-    return true;
-}
-
 void MainWindow::onLaunchClicked() {
-    if (m_isHammerRunning) {
+    if (m_hammerService->isRunning()) {
         QMessageBox::information(
             this,
             "提示",
@@ -1326,8 +1219,22 @@ void MainWindow::onLaunchClicked() {
         "状态: 正在启动 HAMMER..."
     );
 
-    if (!startHammerProcess()) {
-        m_isHammerRunning = false;
+    // 读取 UI 上的 Addon 与附加参数后交给 Service 执行启动
+    HammerService::LaunchParams params;
+    params.cs2Root    = m_cs2Root;
+    params.workingDir = m_workingDir;
+    params.addon      = LauncherConfig::NormalizeAddonName(m_addonCombo->currentText());
+    params.extraArgs  = m_argsEdit->text();
+
+    const HammerService::LaunchResult launched =
+        m_hammerService->launch(params);
+
+    if (!launched.ok) {
+        QMessageBox::critical(
+            this,
+            "启动错误",
+            launched.error
+        );
 
         setUiBusy(false);
 
@@ -1335,37 +1242,22 @@ void MainWindow::onLaunchClicked() {
 
         return;
     }
+
+    m_statusLabel->setText(
+        "状态: Hammer 编辑器正在启动..."
+    );
+
+    m_launchBtn->setText(
+        "HAMMER 运行中..."
+    );
+
+    m_injectBtn->setEnabled(false);
+    m_launchBtn->setEnabled(false);
+    m_restoreBtn->setEnabled(false);
+    m_updateBtn->setEnabled(false);
 }
 
-void MainWindow::onHammerStarted() {
-    m_isHammerRunning = true;
-    m_processMonitor.Reset();
-
-    m_hammerPid =
-        m_hammerProcess->processId();
-
-    if (m_hammerProcessHandle != nullptr) {
-        CloseHandle(
-            static_cast<HANDLE>(
-                m_hammerProcessHandle
-            )
-        );
-
-        m_hammerProcessHandle = nullptr;
-    }
-
-    if (m_hammerPid > 0) {
-        m_hammerProcessHandle =
-            OpenProcess(
-                SYNCHRONIZE |
-                PROCESS_QUERY_LIMITED_INFORMATION,
-                FALSE,
-                static_cast<DWORD>(
-                    m_hammerPid
-                )
-            );
-    }
-
+void MainWindow::onHammerStarted(qint64 pid) {
     m_statusLabel->setText(
         "状态: Hammer 编辑器正在运行中 (退出后将自动恢复备份)"
     );
@@ -1374,66 +1266,20 @@ void MainWindow::onHammerStarted() {
         QString(
             "[+] CS2 Hammer 进程已成功启动 (PID: %1)！正在监听运行生命周期..."
         )
-            .arg(m_hammerPid),
+            .arg(pid),
         "#a6e22e"
     );
 
     updateActionButtonState();
 }
 
-void MainWindow::onHammerFinished(
-    int exitCode,
-    QProcess::ExitStatus exitStatus
-) {
-    Q_UNUSED(exitCode);
-    Q_UNUSED(exitStatus);
-
-    handleHammerProcessTerminated();
+void MainWindow::onHammerHeartbeat() {
+    m_statusLabel->setText(
+        "状态: Hammer 编辑器正在运行中 (退出后将自动恢复备份)"
+    );
 }
 
-void MainWindow::onCheckProcessState() {
-    if (!m_isHammerRunning) {
-        m_monitorTimer->stop();
-        return;
-    }
-
-    // 三路探测来源按优先级由 ProcessMonitor 判定（QProcess → 原生句柄 → PID）
-    ProcessMonitor::Source src;
-    src.qProcessRunning = (m_hammerProcess != nullptr) &&
-                          (m_hammerProcess->state() == QProcess::Running);
-    src.nativeHandle    = m_hammerProcessHandle;
-    src.pid             = static_cast<unsigned long>(m_hammerPid);
-
-    if (m_processMonitor.Sample(src)) {
-        m_statusLabel->setText(
-            "状态: Hammer 编辑器正在运行中 (退出后将自动恢复备份)"
-        );
-    } else if (m_processMonitor.ReachedTerminationThreshold()) {
-        handleHammerProcessTerminated();
-    }
-}
-
-void MainWindow::handleHammerProcessTerminated() {
-    if (!m_isHammerRunning) {
-        return;
-    }
-
-    m_monitorTimer->stop();
-
-    m_isHammerRunning = false;
-
-    if (m_hammerProcessHandle != nullptr) {
-        CloseHandle(
-            static_cast<HANDLE>(
-                m_hammerProcessHandle
-            )
-        );
-
-        m_hammerProcessHandle = nullptr;
-    }
-
-    m_hammerPid = 0;
-
+void MainWindow::onHammerTerminated() {
     appendLog(
         "[*] 检测到本程序启动的 CS2 与 Hammer 已退出，正在执行自动安全还原...",
         "#66d9ef"
@@ -1493,64 +1339,44 @@ void MainWindow::handleHammerProcessTerminated() {
     updateActionButtonState();
 }
 
-void MainWindow::onHammerError(
-    QProcess::ProcessError error
-) {
-    if (error == QProcess::FailedToStart) {
-        // startHammerProcess 在 start() 前已置 m_isHammerRunning = true，
-        // 而 FailedToStart 只触发 errorOccurred、不触发 finished，
-        // 必须在此立即回滚，否则只能依赖 1 秒轮询兜底
-        m_isHammerRunning = false;
-        m_monitorTimer->stop();
-        m_hammerPid = 0;
+void MainWindow::onHammerStartFailed(int errorCode) {
+    Q_UNUSED(errorCode);
 
-        appendLog(
-            QString(
-                "[-] 无法启动 Hammer 进程 (cs2.exe)，错误码: %1"
-            )
-                .arg(error),
-            "#f92672"
-        );
+    QMessageBox::critical(
+        this,
+        "启动错误",
+        "无法启动 cs2.exe 进程，请检查 CS2 路径与游戏完整性。"
+    );
 
-        QMessageBox::critical(
-            this,
-            "启动错误",
-            "无法启动 cs2.exe 进程，请检查 CS2 路径与游戏完整性。"
-        );
-
-        bool restored =
-            runHeavyInWorker(
-                [this]() {
-                    return doRestore(true);
-                }
-            );
-
-        if (restored) {
-            if (!BackupManager::ClearSessionState(
-                    m_workingDir
-                )) {
-                appendLog(
-                    "[-] 清除会话状态失败 (session_state.json)，下次启动可能重复执行自动恢复",
-                    "#f92672"
-                );
+    bool restored =
+        runHeavyInWorker(
+            [this]() {
+                return doRestore(true);
             }
+        );
+
+    if (restored) {
+        if (!BackupManager::ClearSessionState(
+                m_workingDir
+            )) {
+            appendLog(
+                "[-] 清除会话状态失败 (session_state.json)，下次启动可能重复执行自动恢复",
+                "#f92672"
+            );
         }
-
-        setUiBusy(false);
-
-        m_launchBtn->setText(
-            "启动 HAMMER"
-        );
-
-        m_statusLabel->setText(
-            "状态: 启动出错"
-        );
-
-        updateActionButtonState();
-        return;
     }
 
-    // 其他错误 (Crashed / TimedError 等)：交由 finished / 监控定时器路径统一处理，避免双重恢复
+    setUiBusy(false);
+
+    m_launchBtn->setText(
+        "启动 HAMMER"
+    );
+
+    m_statusLabel->setText(
+        "状态: 启动出错"
+    );
+
+    updateActionButtonState();
 }
 
 bool MainWindow::doRestore(bool showLog) {
@@ -1562,7 +1388,7 @@ bool MainWindow::doRestore(bool showLog) {
 }
 
 void MainWindow::onUpdateTranslationsClicked() {
-    if (m_isHammerRunning) {
+    if (m_hammerService->isRunning()) {
         QMessageBox::warning(
             this,
             "警告",
@@ -1694,7 +1520,7 @@ void MainWindow::onDictionariesUpdated(const DictionaryService::UpdateResult& re
 }
 
 void MainWindow::onRestoreClicked() {
-    if (m_isHammerRunning) {
+    if (m_hammerService->isRunning()) {
         QMessageBox::warning(
             this,
             "警告",
@@ -1749,21 +1575,18 @@ void MainWindow::onRestoreClicked() {
     );
 
     // 版本校验（含多次全文件 SHA256）与还原一并放入后台线程，避免 UI 冻结；
-    // 校验被拒绝时通过 rejectReason/rejected 回传具体原因
+    // 校验结论与拒绝原因由 LocalizationService 回传
+    const LocalizationService::Context ctx{m_cs2Root, m_workingDir};
+
     QString rejectReason;
-    bool rejected = false;
+    RestoreCheck decision = RestoreCheck::Allowed;
+
     bool restoreOk =
         runHeavyInWorker(
-            [this, &rejectReason, &rejected]() -> bool {
-                auto val =
-                    BackupManager::BackupMatchesCurrentGame(
-                        m_cs2Root,
-                        (fs::path(m_workingDir) / paths::kBackupDir).wstring()
-                    );
+            [this, ctx, &rejectReason, &decision]() -> bool {
+                decision = LocalizationService::CheckRestore(ctx, &rejectReason);
 
-                if (val.status != BackupMatchStatus::Matches) {
-                    rejectReason = QString::fromStdWString(val.reason);
-                    rejected = (val.status == BackupMatchStatus::GameUpdated);
+                if (decision != RestoreCheck::Allowed) {
                     return false;
                 }
 
@@ -1771,7 +1594,7 @@ void MainWindow::onRestoreClicked() {
             }
         );
 
-    if (!restoreOk && rejected) {
+    if (!restoreOk && decision == RestoreCheck::RejectedGameUpdated) {
         m_statusLabel->setText(
             "状态: 还原被拒绝"
         );
@@ -1791,7 +1614,7 @@ void MainWindow::onRestoreClicked() {
         return;
     }
 
-    if (!restoreOk && !rejectReason.isEmpty()) {
+    if (!restoreOk && decision == RestoreCheck::RejectedOther && !rejectReason.isEmpty()) {
         // 备份状态不允许安全还原（无清单/读取失败等）
         QMessageBox::warning(
             this,
@@ -1853,25 +1676,9 @@ void MainWindow::onRestoreClicked() {
 }
 
 void MainWindow::checkAndRecoverAbnormalExit() {
-    fs::path workPath(m_workingDir);
+    const LocalizationService::Context ctx{m_cs2Root, m_workingDir};
 
-    fs::path backupDir =
-        workPath / paths::kBackupDir;
-
-    bool hasUnrestored =
-        BackupManager::HasUnrestoredSession(
-            m_workingDir
-        ) ||
-        (
-            BackupManager::HasBackup(
-                backupDir.wstring()
-            ) &&
-            BackupManager::IsPatchDeployed(
-                m_cs2Root
-            )
-        );
-
-    if (!hasUnrestored) {
+    if (!LocalizationService::HasPendingRecovery(ctx)) {
         return;
     }
 
@@ -2069,7 +1876,7 @@ void MainWindow::onHelpClicked() {
 void MainWindow::closeEvent(
     QCloseEvent *event
 ) {
-    if (m_isHammerRunning) {
+    if (m_hammerService->isRunning()) {
 
         QMessageBox::warning(
             this,
@@ -2123,31 +1930,12 @@ void MainWindow::closeEvent(
 }
 
 
-bool MainWindow::sendIpcCommandToHammer(unsigned int msgId) {
-    return HammerIpc::Send(msgId);
-}
-
 void MainWindow::onToggleLangClicked() {
-    if (HammerIpc::Send(HammerIpc::kMsgToggleLang)) {
+    if (m_hammerService->sendToggleLanguage()) {
         appendLog("[⚡] 已向运行中的 Hammer 发送【切换原文 / 翻译】指令", "#a6e22e");
     } else {
         appendLog("[!] 未检测到运行中的 Hammer 汉化模块 IPC 窗口（请确保 Hammer 正在运行）", "#f92672");
     }
-}
-
-void MainWindow::writeAppDirPointer() {
-    if (m_cs2Root.empty()) return;
-    fs::path cs2Bin = paths::Win64Bin(m_cs2Root);
-    if (!fs::exists(cs2Bin)) return;
-    fs::path pointerFile = cs2Bin / L"localizer_appdir.txt";
-    bool useMachineTrans = (m_useMachineTransCheck != nullptr) ? m_useMachineTransCheck->isChecked() : true;
-    try {
-        std::wofstream ofs(pointerFile, std::ios::trunc);
-        if (ofs.is_open()) {
-            ofs << m_workingDir << L"\n";
-            ofs << L"use_machine_trans=" << (useMachineTrans ? 1 : 0) << L"\n";
-        }
-    } catch (...) {}
 }
 
 void MainWindow::setupFileWatcher() {
@@ -2235,7 +2023,7 @@ void MainWindow::onDebouncedHotReload() {
 
     HWND hWnd = HammerIpc::FindIpcWindow();
 
-    if (!m_isHammerRunning && !hWnd) {
+    if (!m_hammerService->isRunning() && !hWnd) {
         appendLog("[📝] 检测到程序目录词典保存更新（已就绪，将在 Hammer 运行时即刻生效）", "#8b949e");
         return;
     }
@@ -2245,79 +2033,31 @@ void MainWindow::onDebouncedHotReload() {
 }
 
 bool MainWindow::performHotReload(bool silent) {
+    const bool useMachineTrans = machineTranslationEnabled();
+
     // 1. 刷新路径指针（同步机翻兜底标志）
-    writeAppDirPointer();
+    LocalizationService::WriteAppDirPointer(m_cs2Root, m_workingDir, useMachineTrans);
 
-    bool useMachineTrans = (m_useMachineTransCheck != nullptr) ? m_useMachineTransCheck->isChecked() : true;
+    // 2. 镜像同步 Qt 词典、重新编译部署 FGD、IPC 通知运行中的 Hammer 刷新
+    const HammerService::ReloadResult result =
+        m_hammerService->reloadDictionaries(m_cs2Root, m_workingDir, useMachineTrans);
 
-    // 2. 镜像同步与合并 qt_translations.jsonc 到游戏目录（保障本地 fallback 完整）
-    fs::path srcQtJson = ResolveDictionaryPath(m_workingDir, L"qt_translations.jsonc");
-    fs::path srcQtFallback = ResolveDictionaryPath(m_workingDir, L"qt_fallback.jsonc");
-    fs::path cs2Bin = paths::Win64Bin(m_cs2Root);
-    fs::path destQtJson = cs2Bin / L"qt_translations.jsonc";
-    fs::path destQtFallback = cs2Bin / L"qt_fallback.jsonc";
-
-    if (fs::exists(cs2Bin)) {
-        // 同步 fallback 字典到游戏目录备份（如果存在）
-        if (fs::exists(srcQtFallback)) {
-            try {
-                fs::copy_file(srcQtFallback, destQtFallback, fs::copy_options::overwrite_existing);
-            } catch (...) {}
-        }
-        // 优先合并主词典与机翻兜底词典部署到游戏目录
-        std::wstring qtFallbackParam = (useMachineTrans && fs::exists(srcQtFallback)) ? srcQtFallback.wstring() : L"";
-        bool merged = false;
-        if (!qtFallbackParam.empty() && fs::exists(srcQtJson)) {
-            std::wstring mergeErr;
-            merged = DictionaryCompiler::MergeJsonFiles(srcQtJson.wstring(), qtFallbackParam, destQtJson.wstring(), mergeErr);
-        }
-        if (!merged && fs::exists(srcQtJson)) {
-            try {
-                fs::copy_file(srcQtJson, destQtJson, fs::copy_options::overwrite_existing);
-            } catch (...) {}
-        }
-    }
-
-    // 3. 联动重新编译并部署 FGD（引入 fgd_fallback 兜底）
-    fs::path transDir = fs::path(m_workingDir) / paths::kTranslationsDir;
-    fs::path backupDir = fs::path(m_workingDir) / paths::kBackupDir;
-    fs::path fgdDictPath = ResolveDictionaryPath(m_workingDir, L"fgd_translations.jsonc");
-    fs::path fgdOverridePath = ResolveDictionaryPath(m_workingDir, L"fgd_override.jsonc");
-    fs::path fgdFallbackPath = ResolveDictionaryPath(m_workingDir, L"fgd_fallback.jsonc");
-
-    std::wstring fgdFallbackParam = (useMachineTrans && fs::exists(fgdFallbackPath)) ? fgdFallbackPath.wstring() : L"";
-
-    std::vector<std::wstring> transFgd;
-    std::wstring err;
-    bool fgdOk = FgdTranslator::TranslateAndDeployAll(
-        m_cs2Root,
-        backupDir.wstring(),
-        transDir.wstring(),
-        fgdDictPath.wstring(),
-        fgdOverridePath.wstring(),
-        transFgd,
-        err,
-        fgdFallbackParam
-    );
-
-    // 4. 发送 IPC 消息给 Hammer
-    bool ipcOk = HammerIpc::Send(HammerIpc::kMsgReloadDict);
-
-    if (ipcOk) {
-        if (fgdOk) {
+    if (result.ipcOk) {
+        if (result.fgdOk) {
             appendLog(QString("[⚡] 全量热重载成功！已重新编译覆盖 %1 个 FGD 实体文件，并刷新 Hammer 界面翻译%2")
-                .arg(transFgd.size())
+                .arg(result.fgdFileCount)
                 .arg(useMachineTrans ? " (已载入机翻兜底)" : ""), "#a6e22e");
         } else {
-            appendLog(QString("[⚡] Qt 界面翻译已热重载生效（FGD 重新部署提示: %1）").arg(QString::fromStdWString(err)), "#e6db74");
+            appendLog(QString("[⚡] Qt 界面翻译已热重载生效（FGD 重新部署提示: %1）").arg(result.fgdError), "#e6db74");
         }
         return true;
-    } else {
-        if (!silent) {
-            appendLog("[!] 未检测到运行中的 Hammer 汉化模块 IPC 窗口（已在磁盘完成 FGD 重新编译与词典同步）", "#d29922");
-        }
-        return false;
     }
+
+    if (!silent) {
+        appendLog("[!] 未检测到运行中的 Hammer 汉化模块 IPC 窗口（已在磁盘完成 FGD 重新编译与词典同步）", "#d29922");
+    }
+
+    return false;
 }
 
 void MainWindow::onHotReloadClicked() {
