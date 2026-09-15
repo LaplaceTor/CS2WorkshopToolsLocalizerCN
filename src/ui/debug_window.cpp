@@ -19,6 +19,7 @@
 #include <QDateTime>
 #include <QProcess>
 #include <QDir>
+#include <QStringDecoder>
 #include <chrono>
 
 #ifndef WM_LOCALIZER_TOGGLE_LANG
@@ -484,15 +485,24 @@ void DebugWindow::onCheckCrashEventsClicked() {
     report += "--- [2. Windows 应用程序错误事件日志提取 (Event ID 1000)] ---\n";
     QProcess ps;
     QString psScript =
+        "[Console]::OutputEncoding = [System.Text.Encoding]::UTF8; "
+        "$OutputEncoding = [System.Text.Encoding]::UTF8; "
         "Get-WinEvent -FilterHashtable @{LogName='Application'; ProviderName='Application Error'; Id=1000} -MaxEvents 5 -ErrorAction SilentlyContinue | "
         "Where-Object { $_.Message -match 'cs2.exe|hammer.dll|propertyeditor.dll|qtcore_qm.dll' } | "
         "ForEach-Object { "
         "  [PSCustomObject]@{ Time=$_.TimeCreated; Message=$_.Message } "
         "} | Format-List";
 
-    ps.start("powershell", QStringList() << "-NoProfile" << "-NonInteractive" << "-Command" << psScript);
+    ps.start("powershell", QStringList() << "-NoProfile" << "-NonInteractive" << "-ExecutionPolicy" << "Bypass" << "-Command" << psScript);
     if (ps.waitForFinished(4000)) {
-        QString psOut = QString::fromUtf8(ps.readAllStandardOutput()).trimmed();
+        QByteArray outBytes = ps.readAllStandardOutput();
+        QString psOut;
+        QStringDecoder decoder(QStringDecoder::Utf8);
+        psOut = decoder(outBytes);
+        if (decoder.hasError()) {
+            psOut = QString::fromLocal8Bit(outBytes);
+        }
+        psOut = psOut.trimmed();
         if (psOut.isEmpty()) {
             report += "[OK] 最近 5 条 Application Error 事件中未发现属于 cs2.exe / hammer.dll 的崩溃记录。\n";
         } else {

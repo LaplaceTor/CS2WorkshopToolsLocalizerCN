@@ -350,11 +350,14 @@ void MainWindow::setupUi() {
 
     btnLayout->setSpacing(6);
 
-    // 第一行：仅注入 / 启动 HAMMER / 还原
-    QHBoxLayout* mainActionLayout =
-        new QHBoxLayout();
+    // 操作网格（第一行：仅注入 / 启动 HAMMER / 还原；第二行：在线更新 / 字典指南 / 调试监控）
+    QGridLayout* actionGridLayout =
+        new QGridLayout();
 
-    mainActionLayout->setSpacing(6);
+    actionGridLayout->setSpacing(6);
+    actionGridLayout->setColumnStretch(0, 1);
+    actionGridLayout->setColumnStretch(1, 1);
+    actionGridLayout->setColumnStretch(2, 1);
 
     // 仅注入
     m_injectBtn =
@@ -459,18 +462,7 @@ void MainWindow::setupUi() {
         "}"
     );
 
-    mainActionLayout->addWidget(m_injectBtn);
-    mainActionLayout->addWidget(m_launchBtn);
-    mainActionLayout->addWidget(m_restoreBtn);
-
-    btnLayout->addLayout(mainActionLayout);
-
-    // 第二行：在线更新 / 字典指南
-    QHBoxLayout* subBtnLayout =
-        new QHBoxLayout();
-
-    subBtnLayout->setSpacing(6);
-
+    // 第二行：在线更新 / 字典指南 / 调试监控
     m_updateBtn =
         new QPushButton(
             "🌐 更新在线翻译",
@@ -539,6 +531,10 @@ void MainWindow::setupUi() {
 
     m_debugBtn = new QPushButton("🐞 调试监控", centralWidget);
     m_debugBtn->setMinimumHeight(28);
+    m_debugBtn->setSizePolicy(
+        QSizePolicy::Expanding,
+        QSizePolicy::Preferred
+    );
     m_debugBtn->setToolTip("打开专用调试监控窗口，查看实时日志流、内存诊断、崩溃事件与快捷控制");
     m_debugBtn->setStyleSheet(
         "QPushButton {"
@@ -558,11 +554,17 @@ void MainWindow::setupUi() {
         "}"
     );
 
-    subBtnLayout->addWidget(m_updateBtn);
-    subBtnLayout->addWidget(m_helpBtn);
-    subBtnLayout->addWidget(m_debugBtn);
+    // 第一行添加至网格
+    actionGridLayout->addWidget(m_injectBtn, 0, 0);
+    actionGridLayout->addWidget(m_launchBtn, 0, 1);
+    actionGridLayout->addWidget(m_restoreBtn, 0, 2);
 
-    btnLayout->addLayout(subBtnLayout);
+    // 第二行添加至网格
+    actionGridLayout->addWidget(m_updateBtn, 1, 0);
+    actionGridLayout->addWidget(m_helpBtn, 1, 1);
+    actionGridLayout->addWidget(m_debugBtn, 1, 2);
+
+    btnLayout->addLayout(actionGridLayout);
 
     // 第三行：运行中实时联动控制（一键切换中英 / 免重启热重载）
     QHBoxLayout* liveControlLayout = new QHBoxLayout();
