@@ -173,9 +173,11 @@ static std::atomic<bool> g_bTranslationEnabled{true};
 static std::unordered_map<std::string, std::string> g_CommonDict;
 static std::unordered_map<std::string, std::string> g_CommonCache;
 static std::unordered_map<std::string, std::string> g_CommonReverseDict;
+static std::unordered_map<std::string, std::string> g_CommonReverseCache;
 static std::unordered_map<std::wstring, std::unordered_map<std::string, std::string>> g_ScopedDicts;
 static std::unordered_map<std::wstring, std::unordered_map<std::string, std::string>> g_ScopedCaches;
 static std::unordered_map<std::wstring, std::unordered_map<std::string, std::string>> g_ScopedReverseDicts;
+static std::unordered_map<std::wstring, std::unordered_map<std::string, std::string>> g_ScopedReverseCaches;
 static std::mutex g_DictMutex;
 static std::once_flag g_dictInitFlag;
 static std::atomic<bool> g_bDictLoaded{false};
@@ -562,12 +564,14 @@ static void LoadMasterTranslations() {
 
     // 同步构建反向字典（用于一键切回英文与控件还原）
     g_CommonReverseDict.clear();
+    g_CommonReverseCache.clear();
     for (const auto& kv : g_CommonDict) {
         if (!kv.first.empty() && !kv.second.empty()) {
             g_CommonReverseDict[kv.second] = kv.first;
         }
     }
     g_ScopedReverseDicts.clear();
+    g_ScopedReverseCaches.clear();
     for (const auto& sec : g_ScopedDicts) {
         auto& revMap = g_ScopedReverseDicts[sec.first];
         for (const auto& kv : sec.second) {
@@ -1557,24 +1561,132 @@ static bool FindReverseTranslationScoped(void* callerAddr, const char* text, std
     bool hasCaller = (callerAddr != nullptr && GetCallerModuleName(callerAddr, callerStemBuf, 64));
     std::wstring callerStem = hasCaller ? callerStemBuf : L"";
 
+    // 辅助 lambda：静态精确全词匹配与基础修剪、快捷键剥离、标点还原与反向哈希缓存
+    auto tryDirectScopedReverse = [&](const std::unordered_map<std::string, std::string>& revDict,
+                                      std::unordered_map<std::string, std::string>& revCache) -> bool {
+        // 1. 缓存快速短路命中
+        auto itCache = revCache.find(textStr);
+        if (itCache != revCache.end()) {
+            outResult = itCache->second;
+            return true;
+        }
+
+        // 2. 精确全字匹配
+        auto itDirect = revDict.find(textStr);
+        if (itDirect != revDict.end()) {
+            outResult = itDirect->second;
+            revCache[textStr] = outResult;
+            return true;
+        }
+
+        // 3. 去除前后空白匹配（如 " 使用实体报告搜索 " -> "使用实体报告搜索"）
+        size_t first = textStr.find_first_not_of(" \t\r\n");
+        if (first != std::string::npos) {
+            size_t last = textStr.find_last_not_of(" \t\r\n");
+            std::string prefixPad = textStr.substr(0, first);
+            std::string suffixPad = textStr.substr(last + 1);
+            std::string trimmed = textStr.substr(first, last - first + 1);
+
+            // 3.1 去除首尾空白后直接查
+            auto itTrimmed = revDict.find(trimmed);
+            if (itTrimmed != revDict.end()) {
+                outResult = prefixPad + itTrimmed->second + suffixPad;
+                revCache[textStr] = outResult;
+                return true;
+            }
+
+            // 3.2 剥离加速键 '&' 匹配 (如 "&保存" -> "保存")
+            if (trimmed.find('&') != std::string::npos) {
+                std::string stripped;
+                stripped.reserve(trimmed.length());
+                for (char c : trimmed) {
+                    if (c != '&') stripped.push_back(c);
+                }
+                auto itStrip = revDict.find(stripped);
+                if (itStrip != revDict.end()) {
+                    outResult = prefixPad + itStrip->second + suffixPad;
+                    revCache[textStr] = outResult;
+                    return true;
+                }
+            }
+
+            // 3.3 剥离尾部快捷键括号，例如 "保存(&S)" 或 "保存(S)"
+            size_t tLen = trimmed.length();
+            if (tLen >= 4 && trimmed.back() == ')') {
+                if (trimmed[tLen - 4] == '(' && trimmed[tLen - 3] == '&' &&
+                    isalnum(static_cast<unsigned char>(trimmed[tLen - 2]))) {
+                    std::string base = trimmed.substr(0, tLen - 4);
+                    size_t bLast = base.find_last_not_of(" \t");
+                    if (bLast != std::string::npos) base = base.substr(0, bLast + 1);
+                    auto itBase = revDict.find(base);
+                    if (itBase != revDict.end()) {
+                        outResult = prefixPad + itBase->second + suffixPad;
+                        revCache[textStr] = outResult;
+                        return true;
+                    }
+                } else if (tLen >= 3 && trimmed[tLen - 3] == '(' &&
+                           isalnum(static_cast<unsigned char>(trimmed[tLen - 2]))) {
+                    std::string base = trimmed.substr(0, tLen - 3);
+                    size_t bLast = base.find_last_not_of(" \t");
+                    if (bLast != std::string::npos) base = base.substr(0, bLast + 1);
+                    auto itBase = revDict.find(base);
+                    if (itBase != revDict.end()) {
+                        outResult = prefixPad + itBase->second + suffixPad;
+                        revCache[textStr] = outResult;
+                        return true;
+                    }
+                }
+            }
+
+            // 3.4 中英文省略号与冒号互转适配（"…" <=> "...", "：" <=> ":"）
+            // UTF-8: "…" 为 \xE2\x80\xA6, "：" 为 \xEF\xBC\x9A
+            static const std::string kCnEllipsis = "\xE2\x80\xA6";
+            static const std::string kEnEllipsis = "...";
+            static const std::string kCnColon = "\xEF\xBC\x9A";
+            static const std::string kEnColon = ":";
+
+            auto tryReplaceAndFind = [&](const std::string& from, const std::string& to) -> bool {
+                if (trimmed.find(from) == std::string::npos) return false;
+                std::string rep = trimmed;
+                size_t p = 0;
+                while ((p = rep.find(from, p)) != std::string::npos) {
+                    rep.replace(p, from.length(), to);
+                    p += to.length();
+                }
+                auto itRep = revDict.find(rep);
+                if (itRep != revDict.end()) {
+                    outResult = prefixPad + itRep->second + suffixPad;
+                    revCache[textStr] = outResult;
+                    return true;
+                }
+                return false;
+            };
+
+            if (tryReplaceAndFind(kCnEllipsis, kEnEllipsis)) return true;
+            if (tryReplaceAndFind(kEnEllipsis, kCnEllipsis)) return true;
+            if (tryReplaceAndFind(kCnColon, kEnColon)) return true;
+            if (tryReplaceAndFind(kEnColon, kCnColon)) return true;
+        }
+
+        return false;
+    };
+
     std::lock_guard<std::mutex> lock(g_DictMutex);
 
     // 1. 优先在 Caller 对应的 Scoped 反向字典中查找
     if (hasCaller) {
         auto itSec = g_ScopedReverseDicts.find(callerStem);
         if (itSec != g_ScopedReverseDicts.end()) {
-            auto it = itSec->second.find(textStr);
-            if (it != itSec->second.end()) {
-                outResult = it->second;
+            auto& secCache = g_ScopedReverseCaches[callerStem];
+            if (tryDirectScopedReverse(itSec->second, secCache)) {
                 return true;
             }
         }
         if (callerStem != L"hammer") {
             auto itHammer = g_ScopedReverseDicts.find(L"hammer");
             if (itHammer != g_ScopedReverseDicts.end()) {
-                auto it = itHammer->second.find(textStr);
-                if (it != itHammer->second.end()) {
-                    outResult = it->second;
+                auto& hammerCache = g_ScopedReverseCaches[L"hammer"];
+                if (tryDirectScopedReverse(itHammer->second, hammerCache)) {
                     return true;
                 }
             }
@@ -1582,10 +1694,10 @@ static bool FindReverseTranslationScoped(void* callerAddr, const char* text, std
     }
 
     // 2. 在公共反向字典中查找
-    auto itCommon = g_CommonReverseDict.find(textStr);
-    if (itCommon != g_CommonReverseDict.end()) {
-        outResult = itCommon->second;
-        return true;
+    if (!g_CommonReverseDict.empty()) {
+        if (tryDirectScopedReverse(g_CommonReverseDict, g_CommonReverseCache)) {
+            return true;
+        }
     }
 
     return false;
@@ -1802,7 +1914,9 @@ static void ReloadTranslations() {
         g_ScopedDicts.clear();
         g_ScopedCaches.clear();
         g_CommonReverseDict.clear();
+        g_CommonReverseCache.clear();
         g_ScopedReverseDicts.clear();
+        g_ScopedReverseCaches.clear();
         LoadMasterTranslations();
     }
 
