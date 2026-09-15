@@ -4,6 +4,7 @@
 #include "core/dictionary_paths.h"
 #include "core/launcher_config.h"
 #include "service/localization_service.h"
+#include "service/dictionary_service.h"
 #include "core/hammer_ipc.h"
 #include "core/process_monitor.h"
 #include "core/fgd_translator.h"
@@ -36,14 +37,7 @@
 #include <QTimer>
 #include <QFileInfo>
 #include <QDir>
-#include <QNetworkAccessManager>
-#include <QNetworkRequest>
-#include <QNetworkReply>
-#include <QJsonDocument>
-#include <QJsonObject>
-#include <QUrl>
 #include <QFile>
-#include <QSaveFile>
 #include <QCheckBox>
 #include <QtConcurrent>
 #include <QFutureWatcher>
@@ -65,7 +59,7 @@ MainWindow::MainWindow(const std::wstring& cs2Root, QWidget *parent)
     , m_debugBtn(nullptr)
     , m_fileWatcher(nullptr)
     , m_hotReloadDebounceTimer(nullptr)
-    , m_networkManager(new QNetworkAccessManager(this))
+    , m_dictionaryService(new DictionaryService(this))
     , m_hammerProcess(new QProcess(this))
     , m_monitorTimer(new QTimer(this))
         , m_isHammerRunning(false)
@@ -1567,201 +1561,6 @@ bool MainWindow::doRestore(bool showLog) {
         [this](const QString& msg, const QString& color) { appendLog(msg, color); });
 }
 
-void MainWindow::fetchUrlCandidates(
-    const QStringList& urls,
-    std::function<void(bool success, const QByteArray& data)> callback
-) {
-    if (urls.isEmpty()) {
-        callback(
-            false,
-            QByteArray()
-        );
-
-        return;
-    }
-
-    auto fetchNext =
-        std::make_shared<std::function<void(int)>>();
-
-    *fetchNext =
-        [this, urls, callback, fetchNext](int index) {
-
-        if (index >= urls.size()) {
-            callback(
-                false,
-                QByteArray()
-            );
-
-            return;
-        }
-
-        QUrl url(
-            urls[index]
-        );
-
-        QNetworkRequest request(url);
-
-        request.setAttribute(
-            QNetworkRequest::RedirectPolicyAttribute,
-            QNetworkRequest::NoLessSafeRedirectPolicy
-        );
-
-        request.setHeader(
-            QNetworkRequest::UserAgentHeader,
-            "CS2WorkshopToolsLocalizerCN"
-        );
-
-        request.setTransferTimeout(
-            10000
-        );
-
-        QNetworkReply* reply =
-            m_networkManager->get(
-                request
-            );
-
-        connect(
-            reply,
-            &QNetworkReply::finished,
-            this,
-            [reply, index, callback, fetchNext]() {
-
-                reply->deleteLater();
-
-                int statusCode =
-                    reply->attribute(
-                        QNetworkRequest::HttpStatusCodeAttribute
-                    ).toInt();
-
-                if (
-                    reply->error() ==
-                        QNetworkReply::NoError &&
-                    statusCode == 200
-                ) {
-
-                    QByteArray data =
-                        reply->readAll();
-
-                    if (!data.isEmpty()) {
-                        callback(
-                            true,
-                            data
-                        );
-
-                        return;
-                    }
-                }
-
-                (*fetchNext)(index + 1);
-            }
-        );
-    };
-
-    (*fetchNext)(0);
-}
-
-void MainWindow::reportDictionaryFetchFailure(const QString& dictName) {
-    appendLog(
-        QString("[-] 获取 %1 失败：%2").arg(dictName,"所有节点连接超时或不可达，请检查网络或代理设置。"),
-        "#f92672"
-    );
-
-    QMessageBox::critical(
-        this,
-        "更新失败",
-        QString("获取 %1 失败！\n%2").arg(dictName,"无法连接到 GitHub 仓库，请检查您的网络连接或代理设置。")
-    );
-
-    setUiBusy(false);
-    m_statusLabel->setText("状态: 词典更新失败");
-}
-
-void MainWindow::reportDictionaryParseFailure(
-    const QString& dictName,
-    const QString& parseErrorText
-) {
-    appendLog(
-        QString("[-] 解析 %1 失败: %2").arg(dictName, parseErrorText),
-        "#f92672"
-    );
-
-    QMessageBox::critical(
-        this,
-        "更新失败",
-        QString("下载的 %1 格式异常或内容为空，已放弃更新。").arg(dictName)
-    );
-
-    setUiBusy(false);
-    m_statusLabel->setText("状态: 词典校验失败");
-}
-
-// 剥离 JSONC 注释，使其可被 QJsonDocument 解析（含尾随逗号移除）
-static QByteArray StripJsonc(const QByteArray& input) {
-    const std::string stripped =
-        DictionaryCompiler::StripJsonComments(input.constData(), (size_t)input.size());
-    return QByteArray(stripped.data(), (qsizetype)stripped.size());
-}
-
-// 统计 fgd_override 词典的有效规则数：
-// properties / io / classes 三个子对象的键数之和，再加上其余非下划线开头的顶层键；
-// 三者合计为 0 时退化为顶层键总数。
-static qsizetype CountOverrideRules(const QJsonObject& obj) {
-    qsizetype count = 0;
-
-    for (const char* section : {"properties", "io", "classes"}) {
-        if (obj.contains(section) && obj[section].isObject()) {
-            count += obj[section].toObject().keys().size();
-        }
-    }
-
-    for (auto it = obj.begin(); it != obj.end(); ++it) {
-        if (it.key() != "properties" && it.key() != "io" && it.key() != "classes" &&
-            !it.key().startsWith("_")) {
-            ++count;
-        }
-    }
-
-    return (count == 0) ? obj.keys().size() : count;
-}
-
-void MainWindow::fetchOnlineDictionary(
-    const QStringList& urls,
-    const QString& stepLabel,
-    const QString& dictName,
-    const QString& desc,
-    std::function<qsizetype(const QJsonDocument&)> countOf,
-    std::function<void(const OnlineDictionary&)> onSuccess
-) {
-    appendLog(
-        QString("%1 正在获取 %2 (%3)...").arg(stepLabel, dictName, desc),
-        "#e6db74"
-    );
-
-    fetchUrlCandidates(
-        urls,
-        [this, dictName, countOf, onSuccess](bool ok, const QByteArray& data) {
-            if (!ok) {
-                reportDictionaryFetchFailure(dictName);
-                return;
-            }
-
-            QJsonParseError parseErr;
-            QJsonDocument doc = QJsonDocument::fromJson(StripJsonc(data), &parseErr);
-            if (parseErr.error != QJsonParseError::NoError ||
-                !doc.isObject() || doc.object().isEmpty()) {
-                reportDictionaryParseFailure(dictName, parseErr.errorString());
-                return;
-            }
-
-            OnlineDictionary result;
-            result.raw   = data;
-            result.doc   = doc;
-            result.count = countOf(doc);
-            onSuccess(result);
-        }
-    );
-}
-
 void MainWindow::onUpdateTranslationsClicked() {
     if (m_isHammerRunning) {
         QMessageBox::warning(
@@ -1800,215 +1599,98 @@ void MainWindow::onUpdateTranslationsClicked() {
         "#66d9ef"
     );
 
-    QStringList qtUrls = {
-        "https://raw.githubusercontent.com/LaplaceTor/CS2WorkshopToolsLocalizerCN/main/translations/qt_translations.jsonc",
-        "https://cdn.jsdelivr.net/gh/LaplaceTor/CS2WorkshopToolsLocalizerCN@main/translations/qt_translations.jsonc",
-    };
-
-    QStringList fgdUrls = {
-        "https://raw.githubusercontent.com/LaplaceTor/CS2WorkshopToolsLocalizerCN/main/translations/fgd_translations.jsonc",
-        "https://cdn.jsdelivr.net/gh/LaplaceTor/CS2WorkshopToolsLocalizerCN@main/translations/fgd_translations.jsonc",
-    };
-
-    QStringList overrideUrls = {
-        "https://raw.githubusercontent.com/LaplaceTor/CS2WorkshopToolsLocalizerCN/main/translations/fgd_override.jsonc",
-        "https://cdn.jsdelivr.net/gh/LaplaceTor/CS2WorkshopToolsLocalizerCN@main/translations/fgd_override.jsonc",
-    };
-
-
-    // 依次拉取三个在线词典：任一步失败都会中止（失败收尾由 fetchOnlineDictionary 统一处理）
-    fetchOnlineDictionary(
-        qtUrls,
-        "[1/3]",
-        "qt_translations.jsonc",
-        "界面词典",
-        [](const QJsonDocument& doc) { return doc.object().keys().size(); },
-        [this, fgdUrls, overrideUrls](const OnlineDictionary& qt) {
-            appendLog(
-                QString("[+] qt_translations.jsonc 获取成功，有效词条: %1 条").arg(qt.count),
-                "#a6e22e"
-            );
-
-            fetchOnlineDictionary(
-                fgdUrls,
-                "[2/3]",
-                "fgd_translations.jsonc",
-                "实体定义词典",
-                [](const QJsonDocument& doc) { return doc.object().keys().size(); },
-                [this, overrideUrls, qt](const OnlineDictionary& fgd) {
-                    appendLog(
-                        QString("[+] fgd_translations.jsonc 获取成功，有效词条: %1 条").arg(fgd.count),
-                        "#a6e22e"
-                    );
-
-                    fetchOnlineDictionary(
-                        overrideUrls,
-                        "[3/3]",
-                        "fgd_override.jsonc",
-                        "实体覆盖词典",
-                        [](const QJsonDocument& doc) { return CountOverrideRules(doc.object()); },
-                        [this, qt, fgd](const OnlineDictionary& ovr) {
-                            appendLog(
-                                QString("[+] fgd_override.jsonc 获取成功，有效规则: %1 条").arg(ovr.count),
-                                "#a6e22e"
-                            );
-
-                            // 原子保存
-                            auto atomicSave =
-                                [this](
-                                    const QString& localPath,
-                                    const QByteArray& data,
-                                    const QString& name
-                                ) -> bool {
-
-                                std::string clean =
-                                    DictionaryCompiler::StripJsonComments(
-                                        data.constData(),
-                                        data.size()
-                                    );
-
-                                QJsonParseError parseErr;
-                                QJsonDocument doc =
-                                    QJsonDocument::fromJson(
-                                        QByteArray(clean.data(), static_cast<qsizetype>(clean.size())),
-                                        &parseErr
-                                    );
-
-                                if (parseErr.error != QJsonParseError::NoError || doc.isNull() || !doc.isObject()) {
-                                    appendLog(
-                                        QString("[-] 词典数据校验未通过，已放弃写入 %1: %2").arg(name, parseErr.errorString()),
-                                        "#f92672"
-                                    );
-                                    return false;
-                                }
-
-                                QSaveFile saveFile(localPath);
-                                if (!saveFile.open(QIODevice::WriteOnly | QIODevice::Truncate)) {
-                                    appendLog(
-                                        QString("[-] 无法以安全原子模式打开文件 %1: %2").arg(localPath, saveFile.errorString()),
-                                        "#f92672"
-                                    );
-                                    return false;
-                                }
-
-                                qint64 written = saveFile.write(data);
-                                if (written != data.size()) {
-                                    saveFile.cancelWriting();
-                                    appendLog(
-                                        QString("[-] 写入数据不完整 (%1): 预期 %2 字节，实际写入 %3 字节").arg(localPath).arg(data.size()).arg(written),
-                                        "#f92672"
-                                    );
-                                    return false;
-                                }
-
-                                if (!saveFile.commit()) {
-                                    appendLog(
-                                        QString("[-] 提交安全写入失败 (%1): %2").arg(localPath, saveFile.errorString()),
-                                        "#f92672"
-                                    );
-                                    return false;
-                                }
-
-                                return true;
-                            };
-
-                            fs::path transDir = fs::path(m_workingDir) / paths::kTranslationsDir;
-                            std::error_code ec;
-                            fs::create_directories(transDir, ec);
-
-                            QString qtLocalPath =
-                                QString::fromStdWString(
-                                    (transDir / L"qt_translations.jsonc").wstring()
-                                );
-
-                            QString fgdLocalPath =
-                                QString::fromStdWString(
-                                    (transDir / L"fgd_translations.jsonc").wstring()
-                                );
-
-                            QString overrideLocalPath =
-                                QString::fromStdWString(
-                                    (transDir / L"fgd_override.jsonc").wstring()
-                                );
-
-                            if (
-                                !atomicSave(
-                                    qtLocalPath,
-                                    qt.raw,
-                                    "qt_translations.jsonc"
-                                ) ||
-                                !atomicSave(
-                                    fgdLocalPath,
-                                    fgd.raw,
-                                    "fgd_translations.jsonc"
-                                ) ||
-                                !atomicSave(
-                                    overrideLocalPath,
-                                    ovr.raw,
-                                    "fgd_override.jsonc"
-                                )
-                            ) {
-
-                                QMessageBox::critical(
-                                    this,
-                                    "写入失败",
-                                    "保存或校验更新词典失败，请检查文件写入权限。"
-                                );
-
-                                setUiBusy(false);
-
-                                m_statusLabel->setText(
-                                    "状态: 写入失败"
-                                );
-
-                                return;
-                            }
-
-                            appendLog(
-                                QString(
-                                    "[SUCCESS] 翻译词典原子更新成功！(界面: %1, 实体: %2, 覆盖: %3)"
-                                )
-                                    .arg(
-                                        qt.count
-                                    )
-                                    .arg(
-                                        fgd.count
-                                    )
-                                    .arg(
-                                        ovr.count
-                                    ),
-                                "#a6e22e"
-                            );
-
-                            m_statusLabel->setText(
-                                "状态: 在线词典更新成功"
-                            );
-
-                            setUiBusy(false);
-
-                            QMessageBox::information(
-                                this,
-                                "更新成功",
-                                QString(
-                                    "已成功从 GitHub 获取并更新最新汉化词典！\n\n"
-                                    "- 界面词典 (qt_translations.jsonc): %1 条\n"
-                                    "- 实体词典 (fgd_translations.jsonc): %2 条\n"
-                                    "- 覆盖词典 (fgd_override.jsonc): %3 条\n\n"
-                                    "当前可使用“仅注入”或“启动 HAMMER”应用最新汉化。"
-                                )
-                                    .arg(qt.count)
-                                    .arg(fgd.count)
-                                    .arg(ovr.count)
-                            );
-
-                            updateActionButtonState();
-
-                        }
-                    );
-                }
-            );
-        }
+    m_dictionaryService->updateDictionaries(
+        m_workingDir,
+        [this](const QString& msg, const QString& color) { appendLog(msg, color); },
+        [this](const DictionaryService::UpdateResult& result) { onDictionariesUpdated(result); }
     );
+}
+
+void MainWindow::onDictionariesUpdated(const DictionaryService::UpdateResult& result) {
+    if (result.ok) {
+        appendLog(
+            QString(
+                "[SUCCESS] 翻译词典原子更新成功！(界面: %1, 实体: %2, 覆盖: %3)"
+            )
+                .arg(result.qtCount)
+                .arg(result.fgdCount)
+                .arg(result.overrideCount),
+            "#a6e22e"
+        );
+
+        m_statusLabel->setText(
+            "状态: 在线词典更新成功"
+        );
+
+        setUiBusy(false);
+
+        QMessageBox::information(
+            this,
+            "更新成功",
+            QString(
+                "已成功从 GitHub 获取并更新最新汉化词典！\n\n"
+                "- 界面词典 (qt_translations.jsonc): %1 条\n"
+                "- 实体词典 (fgd_translations.jsonc): %2 条\n"
+                "- 覆盖词典 (fgd_override.jsonc): %3 条\n\n"
+                "当前可使用“仅注入”或“启动 HAMMER”应用最新汉化。"
+            )
+                .arg(result.qtCount)
+                .arg(result.fgdCount)
+                .arg(result.overrideCount)
+        );
+
+        updateActionButtonState();
+        return;
+    }
+
+    switch (result.failure) {
+    case DictionaryService::Failure::Fetch:
+        appendLog(
+            QString("[-] 获取 %1 失败：%2")
+                .arg(result.dictName, "所有节点连接超时或不可达，请检查网络或代理设置。"),
+            "#f92672"
+        );
+
+        QMessageBox::critical(
+            this,
+            "更新失败",
+            QString("获取 %1 失败！\n%2")
+                .arg(result.dictName, "无法连接到 GitHub 仓库，请检查您的网络连接或代理设置。")
+        );
+
+        m_statusLabel->setText("状态: 词典更新失败");
+        break;
+
+    case DictionaryService::Failure::Parse:
+        appendLog(
+            QString("[-] 解析 %1 失败: %2").arg(result.dictName, result.detail),
+            "#f92672"
+        );
+
+        QMessageBox::critical(
+            this,
+            "更新失败",
+            QString("下载的 %1 格式异常或内容为空，已放弃更新。").arg(result.dictName)
+        );
+
+        m_statusLabel->setText("状态: 词典校验失败");
+        break;
+
+    case DictionaryService::Failure::Save:
+        QMessageBox::critical(
+            this,
+            "写入失败",
+            "保存或校验更新词典失败，请检查文件写入权限。"
+        );
+
+        m_statusLabel->setText("状态: 写入失败");
+        break;
+
+    case DictionaryService::Failure::None:
+        break;
+    }
+
+    setUiBusy(false);
 }
 
 void MainWindow::onRestoreClicked() {

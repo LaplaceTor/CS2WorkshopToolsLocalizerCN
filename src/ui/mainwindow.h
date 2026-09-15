@@ -1,12 +1,11 @@
 #pragma once
 
 #include <QMainWindow>
-#include <QJsonDocument>
-#include <QByteArray>
 #include <QProcess>
 #include <string>
 #include "core/process_monitor.h"
 #include "core/hammer_ipc.h"
+#include "service/dictionary_service.h"
 
 class QComboBox;
 class QLineEdit;
@@ -14,7 +13,6 @@ class QCheckBox;
 class QPushButton;
 class QTextEdit;
 class QLabel;
-class QNetworkAccessManager;
 
 class MainWindow : public QMainWindow {
     Q_OBJECT
@@ -77,38 +75,8 @@ private:
     void checkAndRecoverAbnormalExit();
     void handleHammerProcessTerminated();
 
-    void fetchUrlCandidates(
-        const QStringList& urls,
-        std::function<void(bool success, const QByteArray& data)> callback
-    );
-
-    // 在线词典「下载失败」的统一收尾：记日志 + 弹窗 + 恢复 UI
-    void reportDictionaryFetchFailure(const QString& dictName);
-
-    // 在线词典「解析失败」的统一收尾：记日志（含解析错误描述）+ 弹窗 + 恢复 UI
-    void reportDictionaryParseFailure(
-        const QString& dictName,
-        const QString& parseErrorText
-    );
-
-    // 一个在线词典的拉取结果
-    struct OnlineDictionary {
-        QByteArray    raw;    // 原始下载内容（落盘时使用）
-        QJsonDocument doc;    // 剥离注释并解析后的文档（校验与计数使用）
-        qsizetype     count;  // 有效条目数（日志与结果提示使用）
-    };
-
-    // 在线词典的统一下载流程：尝试多个候选 URL → 剥离 JSONC 注释 → 解析 → 校验。
-    // 失败时已完成日志、弹窗与 UI 恢复，且不会调用 onSuccess；
-    // 成功时把结果交给 onSuccess 继续下一步（三个词典需串行拉取，故用回调串联）。
-    void fetchOnlineDictionary(
-        const QStringList& urls,
-        const QString& stepLabel,                                  // 如 "[1/3]"
-        const QString& dictName,                                   // 如 "qt_translations.jsonc"
-        const QString& desc,                                       // 如 "界面词典"
-        std::function<qsizetype(const QJsonDocument&)> countOf,     // 有效条目数如何统计
-        std::function<void(const OnlineDictionary&)> onSuccess
-    );
+    // 在线词典更新的统一收尾：按 Service 返回的失败原因记日志 + 弹窗 + 恢复 UI
+    void onDictionariesUpdated(const DictionaryService::UpdateResult& result);
 
     std::wstring m_cs2Root;
     std::wstring m_workingDir;
@@ -145,7 +113,9 @@ private:
     QLabel* m_statusLabel;
     QLabel* m_cs2PathLabel;
 
-    QNetworkAccessManager* m_networkManager;
+    // Service 层：业务流程编排，MainWindow 只负责传参与展示结果
+    DictionaryService* m_dictionaryService;
+
     QProcess* m_hammerProcess;
     class QTimer* m_monitorTimer;
 
