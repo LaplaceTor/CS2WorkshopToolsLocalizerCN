@@ -47,4 +47,11 @@ public:
     static void WriteAppDirPointer(const std::wstring& cs2Root,
                                    const std::wstring& workingDir,
                                    bool useMachineTrans);
+
+    // 清除「已注入」会话标记（还原成功后调用）
+    static bool ClearSessionState(const std::wstring& workingDir);
+
+    // 若在源码/开发目录（工作目录的上一级 translations/）中编辑了词典，
+    // 按修改时间同步覆盖到当前程序运行目录
+    static void SyncDictionariesFromParent(const std::wstring& workingDir);
 };

@@ -6,17 +6,12 @@
 #include "service/localization_service.h"
 #include "service/dictionary_service.h"
 #include "core/hammer_ipc.h"
-#include "core/process_monitor.h"
 #include "core/fgd_translator.h"
-#include "core/pe_patcher.h"
 #include "core/backup_manager.h"
-#include "core/dictionary_compiler.h"
 #include "ui/debug_window.h"
 
 #include <windows.h>
-#include <psapi.h>
 #include <thread>
-#include <fstream>
 #include <QFileSystemWatcher>
 
 #include <QVBoxLayout>
@@ -1297,7 +1292,7 @@ void MainWindow::onHammerTerminated() {
         );
 
     if (restoreOk) {
-        if (!BackupManager::ClearSessionState(
+        if (!LocalizationService::ClearSessionState(
                 m_workingDir
             )) {
             appendLog(
@@ -1356,7 +1351,7 @@ void MainWindow::onHammerStartFailed(int errorCode) {
         );
 
     if (restored) {
-        if (!BackupManager::ClearSessionState(
+        if (!LocalizationService::ClearSessionState(
                 m_workingDir
             )) {
             appendLog(
@@ -1632,7 +1627,7 @@ void MainWindow::onRestoreClicked() {
 
     if (restoreOk) {
 
-        if (!BackupManager::ClearSessionState(
+        if (!LocalizationService::ClearSessionState(
                 m_workingDir
             )) {
             appendLog(
@@ -1729,7 +1724,7 @@ void MainWindow::checkAndRecoverAbnormalExit() {
             }
         )) {
 
-        if (!BackupManager::ClearSessionState(
+        if (!LocalizationService::ClearSessionState(
                 m_workingDir
             )) {
             appendLog(
@@ -1987,19 +1982,7 @@ void MainWindow::onDebouncedHotReload() {
     fs::path parentTransDir = fs::path(m_workingDir) / L".." / paths::kTranslationsDir;
 
     // 若在源码/开发目录中编辑了上层 translations，自动同步至当前程序运行目录
-    if (fs::exists(parentTransDir)) {
-        for (const auto& name : { L"qt_translations.jsonc", L"qt_fallback.jsonc", L"fgd_translations.jsonc", L"fgd_override.jsonc", L"fgd_fallback.jsonc" }) {
-            fs::path pSrc = parentTransDir / name;
-            fs::path pDst = transDir / name;
-            if (fs::exists(pSrc)) {
-                try {
-                    if (!fs::exists(pDst) || fs::last_write_time(pSrc) > fs::last_write_time(pDst)) {
-                        fs::copy_file(pSrc, pDst, fs::copy_options::overwrite_existing);
-                    }
-                } catch (...) {}
-            }
-        }
-    }
+    LocalizationService::SyncDictionariesFromParent(m_workingDir);
 
     // 重新挂载可能因原子写入丢失的监视路径
     QStringList filesToWatch;

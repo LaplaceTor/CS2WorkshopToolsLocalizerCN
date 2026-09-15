@@ -410,17 +410,28 @@ translations/
 
 ```text
 CS2WorkshopToolsLocalizerCN/
-├── src/                    # C++ 源码
+├── src/                    # C++ 源码（src/ 为项目内部 include 根）
 │   ├── main.cpp            # 程序入口（支持 --debug）
-│   ├── mainwindow.*        # 主界面与全部业务流程
-│   ├── debug_window.*      # 调试监控窗口
-│   ├── cs2_detector.*      # CS2 / Addon 目录检测（注册表 + 库文件夹 + 常见路径）
-│   ├── backup_manager.*    # 原版文件备份与一致性校验（SHA256）
-│   ├── fgd_translator.*    # FGD 实体定义汉化
-│   ├── pe_patcher.*        # Qt5Core.dll 的 PE Code Cave 注入与重定向
-│   ├── hook_manager.*      # MinHook 封装
-│   ├── dictionary_compiler.*# JSONC 词典解析、模块子块与 fallback 合并
-│   └── qtcore_qm.cpp       # 注入到 Workshop Tools 进程的 Qt 汉化模块
+│   ├── ui/                 # UI 层：只负责控件、状态刷新与用户提示
+│   │   ├── mainwindow.*    # 主界面（读取 UI 状态 → 调用 Service → 展示结果）
+│   │   └── debug_window.*  # 调试监控窗口
+│   ├── service/            # Service 层：业务流程编排，不依赖任何 Qt 控件
+│   │   ├── localization_service.*  # 备份 → FGD 汉化 → Qt 补丁 → 还原
+│   │   ├── dictionary_service.*    # 在线词典下载 / JSONC 校验 / 原子落盘
+│   │   └── hammer_service.*        # HAMMER 启动、进程监控、IPC、热重载
+│   ├── core/               # Core 层：具体功能实现，不反向依赖 UI
+│   │   ├── cs2_detector.*      # CS2 / Addon 目录检测（注册表 + 库文件夹 + 常见路径）
+│   │   ├── backup_manager.*    # 原版文件备份与一致性校验（SHA256）
+│   │   ├── fgd_translator.*    # FGD 实体定义汉化
+│   │   ├── pe_patcher.*        # Qt5Core.dll 的 PE Code Cave 注入与重定向
+│   │   ├── dictionary_compiler.*# JSONC 词典解析、模块子块与 fallback 合并
+│   │   ├── process_monitor.*   # HAMMER 进程存活性三路探测
+│   │   ├── hammer_ipc.*        # 与运行中的 HAMMER 通信
+│   │   ├── launcher_config.*   # 启动器配置持久化（config.ini）
+│   │   ├── hook_manager.*      # MinHook 封装
+│   │   ├── path_constants.* / dictionary_paths.* / encoding_util.*  # 路径与编码工具
+│   │   └── qtcore_qm.cpp       # 注入到 Workshop Tools 进程的 Qt 汉化模块
+│   └── ...
 ├── third_party/minhook/    # Git 子模块
 ├── translations/           # 汉化词典（社区贡献主战场）
 ├── scripts/                # Python 辅助脚本
@@ -430,6 +441,10 @@ CS2WorkshopToolsLocalizerCN/
 
 **注入流程**：`① 校验游戏版本并备份原版文件（FGD + Qt5Core.dll）` → `② 汉化并部署 FGD` → `③ 部署 qtcore_qm.dll 并对 Qt5Core.dll 做 PE 补丁`。
 Hammer 退出或点击"还原"时，从启动时建立的本地备份中恢复全部原版文件并清理补丁，游戏目录保持纯净（备份目录仅存在于本地，不纳入版本库）。
+
+**分层约定**：依赖方向只能是 `UI → Service → Core`。UI 层不直接实现 FGD / PE 补丁 / 备份 / 网络 / 进程管理，
+Service 层不弹对话框、不碰控件（结果通过返回值、回调或信号外抛），Core 层不反向依赖 UI。
+项目内部引用统一写 `#include "core/xxx.h"` / `"service/xxx.h"` / `"ui/xxx.h"`。
 
 ---
 

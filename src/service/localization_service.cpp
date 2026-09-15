@@ -451,6 +451,40 @@ bool LocalizationService::HasPendingRecovery(const Context& ctx) {
             BackupManager::IsPatchDeployed(ctx.cs2Root));
 }
 
+bool LocalizationService::ClearSessionState(const std::wstring& workingDir) {
+    return BackupManager::ClearSessionState(workingDir);
+}
+
+void LocalizationService::SyncDictionariesFromParent(const std::wstring& workingDir) {
+    const fs::path transDir       = fs::path(workingDir) / paths::kTranslationsDir;
+    const fs::path parentTransDir = fs::path(workingDir) / L".." / paths::kTranslationsDir;
+
+    if (!fs::exists(parentTransDir)) {
+        return;
+    }
+
+    for (const auto& name : {
+             L"qt_translations.jsonc",
+             L"qt_fallback.jsonc",
+             L"fgd_translations.jsonc",
+             L"fgd_override.jsonc",
+             L"fgd_fallback.jsonc"
+         }) {
+        const fs::path pSrc = parentTransDir / name;
+        const fs::path pDst = transDir / name;
+
+        if (!fs::exists(pSrc)) {
+            continue;
+        }
+
+        try {
+            if (!fs::exists(pDst) || fs::last_write_time(pSrc) > fs::last_write_time(pDst)) {
+                fs::copy_file(pSrc, pDst, fs::copy_options::overwrite_existing);
+            }
+        } catch (...) {}
+    }
+}
+
 void LocalizationService::WriteAppDirPointer(const std::wstring& cs2Root,
                                              const std::wstring& workingDir,
                                              bool useMachineTrans) {
