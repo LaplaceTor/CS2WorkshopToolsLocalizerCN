@@ -332,15 +332,11 @@ bool BackupManager::CreateOrUpdateBackup(const std::wstring& cs2Root, const std:
     fs::remove_all(oldBackupPath, ec);
 
     std::vector<std::wstring> stagedFiles;
-    if (!BackupFgdFiles(cs2Root, stagingPath.wstring(), stagedFiles, outError)) {
-        fs::remove_all(stagingPath, ec);
-        return false;
-    }
-
     if (!BackupQtCore(cs2Root, stagingPath.wstring(), outError)) {
         fs::remove_all(stagingPath, ec);
         return false;
     }
+    stagedFiles.push_back(paths::Qt5Core(cs2Root).wstring());
 
     fs::path backupQtCore = paths::Qt5Core(stagingPath);
     if (!fs::exists(backupQtCore)) {

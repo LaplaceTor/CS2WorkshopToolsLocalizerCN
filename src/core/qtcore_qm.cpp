@@ -9,6 +9,7 @@
 #include <memory>
 #include <algorithm>
 #include <atomic>
+#include <functional>
 #include <stdio.h>
 #include "core/hook_manager.h"
 #include "core/pe_patcher.h"
@@ -59,6 +60,9 @@ typedef bool (__fastcall *fnReadFileToBuffer)(
 );
 
 typedef void (__fastcall *fnQAction_activate)(void* pAction, int event);
+typedef void (__fastcall *fnQWidget_insertAction)(void* pWidget, void* pBefore, void* pAction);
+typedef void (__fastcall *fnQWidget_addAction)(void* pWidget, void* pAction);
+typedef void* (__fastcall *fnQWidget_find)(uint64_t wid);
 
 static fnCUtlBuffer_EnsureCapacity g_pfnCUtlBuffer_EnsureCapacity = nullptr;
 static fnCUtlBuffer_Put g_pfnCUtlBuffer_Put = nullptr;
@@ -116,9 +120,18 @@ static fnQAction_setText g_o_QAction_setText = nullptr;
 static fnQAction_setToolTip g_o_QAction_setToolTip = nullptr;
 static fnQAction_setStatusTip g_o_QAction_setStatusTip = nullptr;
 static fnQAction_setWhatsThis g_o_QAction_setWhatsThis = nullptr;
+static fnQWidget_insertAction g_o_QWidget_insertAction = nullptr;
+static fnQWidget_addAction g_o_QWidget_addAction = nullptr;
+static fnQAction_activate g_o_QAction_activate = nullptr;
+static fnQWidget_find g_pfn_QWidget_find = nullptr;
 
 // 安全探测/更新标记：处于安全探测期间发生的异常属于预期的 SEH 捕获，VEH 绝对不应判定为崩溃或停用 Hook
 static std::atomic<bool> g_bInSafeProbe{false};
+
+struct SafeProbeScope {
+    SafeProbeScope() { g_bInSafeProbe.store(true, std::memory_order_relaxed); }
+    ~SafeProbeScope() { g_bInSafeProbe.store(false, std::memory_order_relaxed); }
+};
 
 static fnQAbstractButton_setText g_o_QAbstractButton_setText = nullptr;
 static fnQLabel_setText g_o_QLabel_setText = nullptr;
@@ -947,25 +960,6 @@ static bool TryHookFileSystem() {
     return ok;
 }
 
-static void TriggerReloadFgdAction() {
-    void* pAction = nullptr;
-    {
-        std::lock_guard<std::mutex> lock(g_ReloadActionMutex);
-        pAction = g_pReloadFgdAction;
-    }
-    if (pAction) {
-        HMODULE hQtWidgets = GetModuleHandleW(L"Qt5Widgets.dll");
-        if (hQtWidgets && !g_pfn_QAction_activate) {
-            g_pfn_QAction_activate = (fnQAction_activate)GetProcAddress(hQtWidgets, "?activate@QAction@@QEAAXW4ActionEvent@1@@Z");
-        }
-        if (g_pfn_QAction_activate) {
-            LogHook("[FGD] Automatically triggering QAction 'Reload .FGD Files' at %p", pAction);
-            g_pfn_QAction_activate(pAction, 0); // 0 = QAction::Trigger
-        }
-    } else {
-        LogHook("[FGD] Reload .FGD Files action not cached yet");
-    }
-}
 
 // ==============================================================================
 // 3. 递归智能拆分与快捷键/后缀匹配算法
@@ -1621,6 +1615,164 @@ static bool FindReverseTranslationScopedW(void* callerAddr, const wchar_t* wstr,
     return false;
 }
 
+static inline bool SafeProbeActionCmdId(void* pAction, uint32_t& outCmdId) {
+    if (!pAction || (uintptr_t)pAction < 0x10000) return false;
+    __try {
+        outCmdId = *(uint32_t*)((char*)pAction + 0x20);
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+}
+
+static void CheckAndCacheReloadActionPtr(void* pAction) {
+    if (!pAction || (uintptr_t)pAction < 0x10000) return;
+    if (g_pReloadFgdAction) return;
+
+    SafeProbeScope probeScope;
+    uint32_t cmdId = 0;
+    if (!SafeProbeActionCmdId(pAction, cmdId)) return;
+
+    // Hammer 为 'Reload .FGD Files' 专属分配的内部 CommandID (0x49285562)
+    if (cmdId == 0x49285562) {
+        std::lock_guard<std::mutex> lock(g_ReloadActionMutex);
+        if (g_pReloadFgdAction != pAction) {
+            g_pReloadFgdAction = pAction;
+            LogHook("[FGD] Cached 'Reload .FGD Files' QAction pointer via CommandID 0x49285562: %p", pAction);
+        }
+    }
+}
+
+static inline bool SafeGetWidgetActions(void* pWidget, void**& outItems, int& outCount) {
+    if (!pWidget || (uintptr_t)pWidget < 0x10000) return false;
+    __try {
+        void* d_ptr = *(void**)((char*)pWidget + 8);
+        if (!d_ptr || (uintptr_t)d_ptr < 0x10000) return false;
+        void* listData = *(void**)((char*)d_ptr + 0x190);
+        if (!listData || (uintptr_t)listData < 0x10000) return false;
+        int begin = *(int*)((char*)listData + 8);
+        int end = *(int*)((char*)listData + 12);
+        if (begin >= 0 && end > begin && (end - begin) < 5000) {
+            outItems = (void**)((char*)listData + 16) + begin;
+            outCount = end - begin;
+            return true;
+        }
+        return false;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+}
+
+static inline void* SafeFindWidget(fnQWidget_find pfn, uint64_t wid) {
+    if (!pfn || !wid) return nullptr;
+    __try {
+        return pfn(wid);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return nullptr;
+    }
+}
+
+static inline bool SafeActivateAction(fnQAction_activate pfnActivate, void* pAction) {
+    if (!pfnActivate || !pAction) return false;
+    __try {
+        pfnActivate(pAction, 0);
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+}
+
+static void ScanWindowTreeForReloadAction() {
+    if (g_pReloadFgdAction) return;
+    HMODULE hQtWidgets = GetModuleHandleW(L"Qt5Widgets.dll");
+    if (!hQtWidgets) return;
+    if (!g_pfn_QWidget_find) {
+        g_pfn_QWidget_find = (fnQWidget_find)GetProcAddress(hQtWidgets, "?find@QWidget@@SAPEAV1@_K@Z");
+    }
+    if (!g_pfn_QWidget_find) return;
+
+    SafeProbeScope probeScope;
+
+    EnumWindows([](HWND hwnd, LPARAM lParam) -> BOOL {
+        if (g_pReloadFgdAction) return FALSE;
+        DWORD pid = 0;
+        GetWindowThreadProcessId(hwnd, &pid);
+        if (pid != GetCurrentProcessId()) return TRUE;
+
+        auto InspectWidget = [](void* pWidget) {
+            if (!pWidget || g_pReloadFgdAction) return;
+            void** items = nullptr;
+            int count = 0;
+            if (SafeGetWidgetActions(pWidget, items, count) && items && count > 0) {
+                for (int i = 0; i < count; ++i) {
+                    void* pAction = items[i];
+                    if (pAction) {
+                        CheckAndCacheReloadActionPtr(pAction);
+                        if (g_pReloadFgdAction) return;
+                    }
+                }
+            }
+        };
+
+        void* pTop = SafeFindWidget(g_pfn_QWidget_find, (uint64_t)hwnd);
+        if (pTop) {
+            InspectWidget(pTop);
+        }
+
+        EnumChildWindows(hwnd, [](HWND childHwnd, LPARAM) -> BOOL {
+            if (g_pReloadFgdAction) return FALSE;
+            void* pChild = SafeFindWidget(g_pfn_QWidget_find, (uint64_t)childHwnd);
+            if (pChild) {
+                void** items = nullptr;
+                int count = 0;
+                if (SafeGetWidgetActions(pChild, items, count) && items && count > 0) {
+                    for (int i = 0; i < count; ++i) {
+                        void* pAction = items[i];
+                        if (pAction) {
+                            CheckAndCacheReloadActionPtr(pAction);
+                            if (g_pReloadFgdAction) return FALSE;
+                        }
+                    }
+                }
+            }
+            return TRUE;
+        }, 0);
+
+        return TRUE;
+    }, 0);
+}
+
+static void TriggerReloadFgdAction() {
+    void* pAction = nullptr;
+    {
+        std::lock_guard<std::mutex> lock(g_ReloadActionMutex);
+        pAction = g_pReloadFgdAction;
+    }
+    if (!pAction) {
+        ScanWindowTreeForReloadAction();
+        std::lock_guard<std::mutex> lock(g_ReloadActionMutex);
+        pAction = g_pReloadFgdAction;
+    }
+    if (pAction) {
+        HMODULE hQtWidgets = GetModuleHandleW(L"Qt5Widgets.dll");
+        if (hQtWidgets && !g_pfn_QAction_activate) {
+            g_pfn_QAction_activate = (fnQAction_activate)GetProcAddress(hQtWidgets, "?activate@QAction@@QEAAXW4ActionEvent@1@@Z");
+        }
+        fnQAction_activate pfnActivate = g_o_QAction_activate ? g_o_QAction_activate : g_pfn_QAction_activate;
+        if (pfnActivate) {
+            LogHook("[FGD] Automatically triggering QAction 'Reload .FGD Files' at %p", pAction);
+            SafeProbeScope probeScope;
+            if (SafeActivateAction(pfnActivate, pAction)) {
+                LogHook("[FGD] Successfully triggered 'Reload .FGD Files' QAction");
+            } else {
+                LogHook("[FGD] Exception caught while activating 'Reload .FGD Files' QAction");
+            }
+        }
+    } else {
+        LogHook("[FGD] Reload .FGD Files action not cached yet");
+    }
+}
+
 static void ToggleLanguage() {
     bool current = g_bTranslationEnabled.load(std::memory_order_acquire);
     bool next = !current;
@@ -1804,13 +1956,19 @@ static void __fastcall hk_QTextDocument_setHtml(void* pDoc, const void* pQString
 }
 
 static inline void CheckAndCacheReloadAction(void* pAction, const void* pQString) {
-    if (!pAction || !pQString || !g_pfn_utf16) return;
-    const wchar_t* wstr = nullptr;
-    if (SafeGetUtf16(g_pfn_utf16, pQString, wstr) && wstr) {
-        if (wcsstr(wstr, L"Reload .FGD") != nullptr || wcsstr(wstr, L"重新加载 .FGD") != nullptr) {
-            std::lock_guard<std::mutex> lock(g_ReloadActionMutex);
-            g_pReloadFgdAction = pAction;
-            LogHook("[FGD] Cached 'Reload .FGD Files' QAction pointer: %p", pAction);
+    if (!pAction) return;
+    CheckAndCacheReloadActionPtr(pAction);
+    if (!g_pReloadFgdAction && pQString && g_pfn_utf16) {
+        const wchar_t* wstr = nullptr;
+        if (SafeGetUtf16(g_pfn_utf16, pQString, wstr) && wstr) {
+            if ((wcsstr(wstr, L"FGD") != nullptr || wcsstr(wstr, L"fgd") != nullptr) &&
+                (wcsstr(wstr, L"Reload") != nullptr || wcsstr(wstr, L"重载") != nullptr || wcsstr(wstr, L"重新加载") != nullptr)) {
+                std::lock_guard<std::mutex> lock(g_ReloadActionMutex);
+                if (g_pReloadFgdAction != pAction) {
+                    g_pReloadFgdAction = pAction;
+                    LogHook("[FGD] Cached 'Reload .FGD Files' QAction pointer via explicit text ('%ls'): %p", wstr, pAction);
+                }
+            }
         }
     }
 }
@@ -1890,6 +2048,33 @@ static void* __fastcall hk_QAction_ctor_icon(void* pAction, const void* pIcon, c
         result = g_o_QAction_ctor_icon(pAction, pIcon, text, pParent);
     });
     return result;
+}
+
+static void __fastcall hk_QWidget_insertAction(void* pWidget, void* pBefore, void* pAction) {
+    if (g_o_QWidget_insertAction) {
+        g_o_QWidget_insertAction(pWidget, pBefore, pAction);
+    }
+    if (pAction && !g_pReloadFgdAction) {
+        CheckAndCacheReloadActionPtr(pAction);
+    }
+}
+
+static void __fastcall hk_QWidget_addAction(void* pWidget, void* pAction) {
+    if (g_o_QWidget_addAction) {
+        g_o_QWidget_addAction(pWidget, pAction);
+    }
+    if (pAction && !g_pReloadFgdAction) {
+        CheckAndCacheReloadActionPtr(pAction);
+    }
+}
+
+static void __fastcall hk_QAction_activate(void* pAction, int event) {
+    if (pAction && !g_pReloadFgdAction) {
+        CheckAndCacheReloadActionPtr(pAction);
+    }
+    if (g_o_QAction_activate) {
+        g_o_QAction_activate(pAction, event);
+    }
 }
 
 // 4. 列表 / 树 / 表格 / 下拉框项文本
@@ -2060,6 +2245,10 @@ static bool TryHookQtToolsModules() {
             void* pComboInsertItem = (void*)GetProcAddress(hQtWidgets, "?insertItem@QComboBox@@QEAAXHAEBVQString@@AEBVQVariant@@@Z");
             void* pComboInsertItemIcon = (void*)GetProcAddress(hQtWidgets, "?insertItem@QComboBox@@QEAAXHAEBVQIcon@@AEBVQString@@AEBVQVariant@@@Z");
 
+            void* pInsertAction    = (void*)GetProcAddress(hQtWidgets, "?insertAction@QWidget@@QEAAXPEAVQAction@@0@Z");
+            void* pAddAction       = (void*)GetProcAddress(hQtWidgets, "?addAction@QWidget@@QEAAXPEAVQAction@@@Z");
+            void* pActivate        = (void*)GetProcAddress(hQtWidgets, "?activate@QAction@@QEAAXW4ActionEvent@1@@Z");
+
             std::vector<HookRequest> widgetRequests = {
                 { pActionCtorText,      (void*)hk_QAction_ctor,             (void**)&g_o_QAction_ctor,             "QAction::QAction(text)" },
                 { pActionCtorIcon,      (void*)hk_QAction_ctor_icon,        (void**)&g_o_QAction_ctor_icon,        "QAction::QAction(icon,text)" },
@@ -2067,6 +2256,9 @@ static bool TryHookQtToolsModules() {
                 { pActionSetTip,        (void*)hk_QAction_setToolTip,       (void**)&g_o_QAction_setToolTip,       "QAction::setToolTip" },
                 { pActionSetStatus,     (void*)hk_QAction_setStatusTip,     (void**)&g_o_QAction_setStatusTip,     "QAction::setStatusTip" },
                 { pActionSetWhats,      (void*)hk_QAction_setWhatsThis,     (void**)&g_o_QAction_setWhatsThis,     "QAction::setWhatsThis" },
+                { pInsertAction,        (void*)hk_QWidget_insertAction,     (void**)&g_o_QWidget_insertAction,     "QWidget::insertAction" },
+                { pAddAction,           (void*)hk_QWidget_addAction,        (void**)&g_o_QWidget_addAction,        "QWidget::addAction" },
+                { pActivate,            (void*)hk_QAction_activate,         (void**)&g_o_QAction_activate,         "QAction::activate" },
                 { pButtonSetText,       (void*)hk_QAbstractButton_setText,  (void**)&g_o_QAbstractButton_setText,  "QAbstractButton::setText" },
                 { pLabelSetText,        (void*)hk_QLabel_setText,           (void**)&g_o_QLabel_setText,           "QLabel::setText" },
                 { pSetTitle,            (void*)hk_QWidget_setWindowTitle,   (void**)&g_o_QWidget_setWindowTitle,   "QWidget::setWindowTitle" },

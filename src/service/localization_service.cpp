@@ -174,10 +174,7 @@ bool LocalizationService::Inject(const Context& ctx, bool useMachineTrans, const
     }
 
     log(
-        QString(
-            "[+] 成功捕获并绑定 %1 个原版 FGD 与 Qt5Core.dll"
-        )
-            .arg(backedFgd.size()),
+        "[+] 成功捕获并绑定官方原版 Qt5Core.dll（FGD 采用纯内存引擎，免磁盘备份）",
         "#a6e22e"
     );
 
