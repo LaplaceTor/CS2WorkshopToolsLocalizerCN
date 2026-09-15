@@ -406,7 +406,7 @@ translations/
 
 ---
 
-## 🏗️ 项目结构与工作原理
+## 🏗️ 项目结构
 
 ```text
 CS2WorkshopToolsLocalizerCN/
@@ -438,13 +438,6 @@ CS2WorkshopToolsLocalizerCN/
 ├── tests/                  # 组件测试
 └── .github/workflows/      # CI：词典查重、Release 打包
 ```
-
-**注入流程**：`① 校验游戏版本并备份原版文件（FGD + Qt5Core.dll）` → `② 汉化并部署 FGD` → `③ 部署 qtcore_qm.dll 并对 Qt5Core.dll 做 PE 补丁`。
-Hammer 退出或点击"还原"时，从启动时建立的本地备份中恢复全部原版文件并清理补丁，游戏目录保持纯净（备份目录仅存在于本地，不纳入版本库）。
-
-**分层约定**：依赖方向只能是 `UI → Service → Core`。UI 层不直接实现 FGD / PE 补丁 / 备份 / 网络 / 进程管理，
-Service 层不弹对话框、不碰控件（结果通过返回值、回调或信号外抛），Core 层不反向依赖 UI。
-项目内部引用统一写 `#include "core/xxx.h"` / `"service/xxx.h"` / `"ui/xxx.h"`。
 
 ---
 
@@ -479,13 +472,6 @@ Service 层不弹对话框、不碰控件（结果通过返回值、回调或信
 - **编码规范**：源码与注释统一 UTF-8（CMake 已为 MSVC 开启 `/utf-8`）；新增源文件请同步更新 `CMakeLists.txt`。
 - **提交信息**：建议遵循 [Conventional Commits](https://www.conventionalcommits.org/)，如 `feat: 支持词典热重载`、`fix: 修复还原失败`、`trans: 补充 Hammer 工具栏词条`。
 - **PR 说明**：请描述改动动机、验证方式（游戏版本 + 复现步骤），必要时附截图。
-
-### CI 工作流
-
-| 工作流 | 触发条件 | 作用 |
-| :--- | :--- | :--- |
-| `check-translations.yml` | 推送/PR 中改动 `*.json` 或 `scripts/check_duplicates.py` | 检测词典重复 Key，失败会阻断合并 |
-| `release.yml` | 手动 `workflow_dispatch`，输入版本号（如 `v1.0.0`） | 构建、windeployqt、打 ZIP 并发布 GitHub Release |
 
 ---
 
