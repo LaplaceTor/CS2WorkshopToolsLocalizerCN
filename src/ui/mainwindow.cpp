@@ -1946,23 +1946,22 @@ bool MainWindow::performHotReload(bool silent) {
     // 1. 刷新路径指针（同步机翻兜底标志）
     LocalizationService::WriteAppDirPointer(m_cs2Root, m_workingDir, useMachineTrans);
 
-    // 2. 镜像同步 Qt 词典、重新编译部署 FGD、IPC 通知运行中的 Hammer 刷新
+    // 2. 镜像同步 Qt 词典、通过 IPC 通知运行中的 Hammer 刷新（纯内存预编译 FGD 与界面重绘）
     const HammerService::ReloadResult result =
         m_hammerService->reloadDictionaries(m_cs2Root, m_workingDir, useMachineTrans);
 
     if (result.ipcOk) {
         if (result.fgdOk) {
-            appendLog(QString("[⚡] 全量热重载成功！已重新编译覆盖 %1 个 FGD 实体文件，并刷新 Hammer 界面翻译%2")
-                .arg(result.fgdFileCount)
+            appendLog(QString("[⚡] 全量热重载成功！已刷新纯内存 FGD 实体汉化并重绘 Hammer 界面翻译%1")
                 .arg(useMachineTrans ? " (已载入机翻兜底)" : ""), "#a6e22e");
         } else {
-            appendLog(QString("[⚡] Qt 界面翻译已热重载生效（FGD 重新部署提示: %1）").arg(result.fgdError), "#e6db74");
+            appendLog(QString("[⚡] Qt 界面翻译已热重载生效（FGD 刷新提示: %1）").arg(result.fgdError), "#e6db74");
         }
         return true;
     }
 
     if (!silent) {
-        appendLog("[!] 未检测到运行中的 Hammer 汉化模块 IPC 窗口（已在磁盘完成 FGD 重新编译与词典同步）", "#d29922");
+        appendLog("[!] 未检测到运行中的 Hammer 汉化模块 IPC 窗口（已完成本地词典与路径指针同步）", "#d29922");
     }
 
     return false;

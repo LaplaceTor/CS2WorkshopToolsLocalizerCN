@@ -14,7 +14,12 @@
 #include "core/pe_patcher.h"
 #include "core/dictionary_compiler.h"
 #include "core/encoding_util.h"
+#include "core/fgd_core.h"
 #include "hde/hde64.h"
+#include <filesystem>
+#include <fstream>
+
+namespace fs = std::filesystem;
 
 #pragma intrinsic(_ReturnAddress)
 
@@ -28,6 +33,45 @@ typedef void* (__fastcall *fnQMetaObject_tr)(const void* pMetaObject, void* pOut
 typedef void* (__fastcall *fnQString_fromUtf8)(void* pOutQString, const char* utf8, int size);
 typedef const wchar_t* (__fastcall *fnQString_utf16)(const void* pQString);
 typedef void (__fastcall *fnQString_dtor)(void* pQString);
+
+// ==============================================================================
+// 1.1 Source 2 引擎文件系统与 CUtlBuffer 函数指针
+// ==============================================================================
+enum BufferSeekType_t {
+    SEEK_HEAD = 0,
+    SEEK_CURRENT = 1,
+    SEEK_TAIL = 2
+};
+
+typedef void (__fastcall *fnCUtlBuffer_EnsureCapacity)(void* pBuffer, int num);
+typedef void (__fastcall *fnCUtlBuffer_Put)(void* pBuffer, const void* pMem, int size);
+typedef void (__fastcall *fnCUtlBuffer_SeekPut)(void* pBuffer, int type, int offset);
+typedef void (__fastcall *fnCUtlBuffer_SeekGet)(void* pBuffer, int type, int offset);
+
+typedef bool (__fastcall *fnReadFileToBuffer)(
+    void* pThis,
+    const char* pFileName,
+    const char* pPathID,
+    void* pBuffer,
+    int maxBytes,
+    int startingOffset,
+    void* pfnAlloc
+);
+
+typedef void (__fastcall *fnQAction_activate)(void* pAction, int event);
+
+static fnCUtlBuffer_EnsureCapacity g_pfnCUtlBuffer_EnsureCapacity = nullptr;
+static fnCUtlBuffer_Put g_pfnCUtlBuffer_Put = nullptr;
+static fnCUtlBuffer_SeekPut g_pfnCUtlBuffer_SeekPut = nullptr;
+static fnCUtlBuffer_SeekGet g_pfnCUtlBuffer_SeekGet = nullptr;
+
+static fnReadFileToBuffer g_o_ReadFileToBuffer = nullptr;
+static std::atomic<bool> g_bFileSystemHooked{false};
+static std::atomic<bool> g_bFileSystemHookFailed{false};
+
+static void* g_pReloadFgdAction = nullptr;
+static std::mutex g_ReloadActionMutex;
+static fnQAction_activate g_pfn_QAction_activate = nullptr;
 
 typedef void* (__fastcall *fnQAction_ctor)(void* pAction, const void* pQString, void* pParent);
 typedef void* (__fastcall *fnQAction_ctor_icon)(void* pAction, const void* pIcon, const void* pQString, void* pParent);
@@ -198,16 +242,13 @@ static bool IsVerboseLogEnabled() {
     return enabled;
 }
 
-static void LogHookV(const char* fmt, va_list args) {
-    if (!IsVerboseLogEnabled()) return; // 非 DEBUG 状态完全不创建/写 hook_runtime.log
-
+static void LogHookAlwaysV(const char* fmt, va_list args) {
     static std::mutex s_logMtx;
     std::lock_guard<std::mutex> lock(s_logMtx);
 
     std::wstring binDir = GetBinDirectory();
     std::wstring logPath = binDir + L"hook_runtime.log";
 
-    // DEBUG 模式下限制日志体积：每 256 次写入抽查一次，超过 8MB 轮转为 .old，避免无限增长
     static std::atomic<int> s_writeCount{0};
     if ((s_writeCount.fetch_add(1, std::memory_order_relaxed) & 0xFF) == 0) {
         WIN32_FILE_ATTRIBUTE_DATA fad;
@@ -232,17 +273,25 @@ static void LogHookV(const char* fmt, va_list args) {
     fclose(fp);
 }
 
+static void LogHookAlways(const char* fmt, ...) {
+    va_list args;
+    va_start(args, fmt);
+    LogHookAlwaysV(fmt, args);
+    va_end(args);
+}
+
 static void LogHook(const char* fmt, ...) {
     va_list args;
     va_start(args, fmt);
-    LogHookV(fmt, args);
+    LogHookAlwaysV(fmt, args);
     va_end(args);
 }
 
 static inline void LogVerboseTr(const char* fmt, ...) {
+    if (!IsVerboseLogEnabled()) return;
     va_list args;
     va_start(args, fmt);
-    LogHookV(fmt, args);
+    LogHookAlwaysV(fmt, args);
     va_end(args);
 }
 
@@ -521,6 +570,397 @@ static void EnsureDictionaryLoaded() {
         LoadMasterTranslations();
         g_bDictLoaded.store(true, std::memory_order_release);
     });
+}
+
+// ==============================================================================
+// 2.1 运行时纯内存 FGD 预编译缓存与 VFileSystem017 挂钩
+// ==============================================================================
+
+static std::string NormalizeFgdKey(const std::string& path) {
+    if (path.empty()) return "";
+    std::string key = path;
+    for (char& c : key) {
+        if (c == '\\') c = '/';
+        c = (char)::tolower((unsigned char)c);
+    }
+    size_t lastSlash = key.find_last_of('/');
+    if (lastSlash != std::string::npos) {
+        return key.substr(lastSlash + 1);
+    }
+    return key;
+}
+
+static bool IsFgdPath(const char* pFileName) {
+    if (!pFileName) return false;
+    size_t len = strlen(pFileName);
+    if (len < 4) return false;
+    const char* ext = pFileName + len - 4;
+    return (_stricmp(ext, ".fgd") == 0);
+}
+
+static std::unordered_map<std::string, std::string> g_FgdMemoryCache;
+static std::mutex g_FgdCacheMutex;
+static std::atomic<bool> g_bFgdCacheLoaded{false};
+
+static std::unordered_map<std::string, std::string> g_FgdDict;
+static FgdOverrideData g_FgdOverrideData;
+static std::mutex g_FgdDictMutex;
+static std::atomic<bool> g_bFgdDictLoaded{false};
+
+static void LoadFgdOverridePureCpp(const std::wstring& path, FgdOverrideData& outOverride) {
+    outOverride = FgdOverrideData();
+    std::ifstream inFile(path, std::ios::binary);
+    if (!inFile.is_open()) return;
+    std::string rawData((std::istreambuf_iterator<char>(inFile)), std::istreambuf_iterator<char>());
+    inFile.close();
+
+    std::unordered_map<std::string, std::string> common;
+    std::unordered_map<std::wstring, std::unordered_map<std::string, std::string>> scoped;
+    std::wstring err;
+    if (!DictionaryCompiler::ParseJsoncStringToMaps(rawData, common, scoped, err)) {
+        return;
+    }
+
+    for (const auto& kv : common) {
+        outOverride.globalProperties[kv.first].description = kv.second;
+    }
+
+    auto itProps = scoped.find(L"properties");
+    if (itProps != scoped.end()) {
+        for (const auto& kv : itProps->second) {
+            outOverride.globalProperties[kv.first].description = kv.second;
+        }
+    }
+
+    auto itIo = scoped.find(L"io");
+    if (itIo != scoped.end()) {
+        for (const auto& kv : itIo->second) {
+            outOverride.ioOverrides[kv.first] = kv.second;
+        }
+    }
+
+    auto itClasses = scoped.find(L"classes");
+    if (itClasses != scoped.end()) {
+        for (const auto& kv : itClasses->second) {
+            outOverride.classDescriptions[kv.first] = kv.second;
+        }
+    }
+}
+
+static void EnsureFgdDictLoaded() {
+    if (g_bFgdDictLoaded.load(std::memory_order_acquire)) return;
+    std::lock_guard<std::mutex> lock(g_FgdDictMutex);
+    if (g_bFgdDictLoaded.load(std::memory_order_relaxed)) return;
+
+    std::wstring binDir = GetBinDirectory();
+    std::wstring appDir = L"";
+    bool useMachineTrans = true;
+
+    std::wstring appDirPointerPath = binDir + L"localizer_appdir.txt";
+    FILE* fpPointer = _wfopen(appDirPointerPath.c_str(), L"r, ccs=UTF-8");
+    if (!fpPointer) fpPointer = _wfopen(appDirPointerPath.c_str(), L"r");
+    if (fpPointer) {
+        wchar_t lineBuf[MAX_PATH] = {0};
+        if (fgetws(lineBuf, MAX_PATH, fpPointer)) {
+            size_t len = wcslen(lineBuf);
+            while (len > 0 && (lineBuf[len - 1] == L'\r' || lineBuf[len - 1] == L'\n' || lineBuf[len - 1] == L' ' || lineBuf[len - 1] == L'\t')) {
+                lineBuf[--len] = L'\0';
+            }
+            if (len > 0 && (lineBuf[len - 1] == L'\\' || lineBuf[len - 1] == L'/')) {
+                lineBuf[--len] = L'\0';
+            }
+            if (len > 0) appDir = lineBuf;
+        }
+        while (fgetws(lineBuf, MAX_PATH, fpPointer)) {
+            std::wstring opt = lineBuf;
+            if (opt.find(L"use_machine_trans=0") != std::wstring::npos) useMachineTrans = false;
+            else if (opt.find(L"use_machine_trans=1") != std::wstring::npos) useMachineTrans = true;
+        }
+        fclose(fpPointer);
+    }
+
+    std::wstring fgdDictPath = binDir + L"fgd_translations.jsonc";
+    std::wstring fgdOverridePath = binDir + L"fgd_override.jsonc";
+    std::wstring fgdFallbackPath = binDir + L"fgd_fallback.jsonc";
+
+    if (!appDir.empty()) {
+        std::wstring p1 = appDir + L"\\translations\\fgd_translations.jsonc";
+        if (GetFileAttributesW(p1.c_str()) != INVALID_FILE_ATTRIBUTES) fgdDictPath = p1;
+        std::wstring p2 = appDir + L"\\translations\\fgd_override.jsonc";
+        if (GetFileAttributesW(p2.c_str()) != INVALID_FILE_ATTRIBUTES) fgdOverridePath = p2;
+        if (useMachineTrans) {
+            std::wstring p3 = appDir + L"\\translations\\fgd_fallback.jsonc";
+            if (GetFileAttributesW(p3.c_str()) != INVALID_FILE_ATTRIBUTES) fgdFallbackPath = p3;
+        }
+    } else {
+        std::wstring p1 = binDir + L"translations\\fgd_translations.jsonc";
+        if (GetFileAttributesW(p1.c_str()) != INVALID_FILE_ATTRIBUTES) fgdDictPath = p1;
+        std::wstring p2 = binDir + L"translations\\fgd_override.jsonc";
+        if (GetFileAttributesW(p2.c_str()) != INVALID_FILE_ATTRIBUTES) fgdOverridePath = p2;
+        if (useMachineTrans) {
+            std::wstring p3 = binDir + L"translations\\fgd_fallback.jsonc";
+            if (GetFileAttributesW(p3.c_str()) != INVALID_FILE_ATTRIBUTES) fgdFallbackPath = p3;
+        }
+    }
+
+    if (!useMachineTrans || GetFileAttributesW(fgdFallbackPath.c_str()) == INVALID_FILE_ATTRIBUTES) {
+        fgdFallbackPath = L"";
+    }
+
+    std::unordered_map<std::wstring, std::unordered_map<std::string, std::string>> dummyScoped;
+    std::wstring err;
+    DictionaryCompiler::ParseJsoncFileToMaps(fgdDictPath, g_FgdDict, dummyScoped, err, fgdFallbackPath);
+    LoadFgdOverridePureCpp(fgdOverridePath, g_FgdOverrideData);
+
+    LogHook("[FGD] Loaded %zu FGD translation keys (dict=%ls, fallback=%ls), %zu override keys",
+            g_FgdDict.size(), fgdDictPath.c_str(), fgdFallbackPath.c_str(),
+            g_FgdOverrideData.globalProperties.size() + g_FgdOverrideData.ioOverrides.size() + g_FgdOverrideData.classDescriptions.size());
+
+    g_bFgdDictLoaded.store(true, std::memory_order_release);
+}
+
+static void PrecompileFgdBuffers() {
+    EnsureFgdDictLoaded();
+
+    std::wstring binDir = GetBinDirectory();
+    fs::path binPath(binDir);
+    fs::path gameRoot = binPath.parent_path().parent_path();
+
+    std::unordered_map<std::string, std::string> newCache;
+    size_t fileCount = 0;
+
+    std::vector<fs::path> targetDirs = {
+        gameRoot / "game" / "core",
+        gameRoot / "game" / "csgo",
+        gameRoot / "game" / "csgo_core"
+    };
+
+    for (const auto& dir : targetDirs) {
+        if (!fs::exists(dir)) continue;
+        try {
+            for (const auto& entry : fs::recursive_directory_iterator(dir)) {
+                if (entry.is_regular_file() && entry.path().extension() == ".fgd") {
+                    std::ifstream inFile(entry.path(), std::ios::binary);
+                    if (inFile.is_open()) {
+                        std::string rawContent((std::istreambuf_iterator<char>(inFile)), std::istreambuf_iterator<char>());
+                        inFile.close();
+
+                        std::string transContent;
+                        if (FgdCore::TranslateContent(rawContent, transContent, g_FgdDict, g_FgdOverrideData) && !transContent.empty()) {
+                            std::string filenameLower = entry.path().filename().string();
+                            std::transform(filenameLower.begin(), filenameLower.end(), filenameLower.begin(), ::tolower);
+                            newCache[filenameLower] = transContent;
+
+                            std::string relPath = fs::relative(entry.path(), gameRoot).string();
+                            for (char& c : relPath) {
+                                if (c == '\\') c = '/';
+                                c = (char)::tolower((unsigned char)c);
+                            }
+                            newCache[relPath] = transContent;
+                            fileCount++;
+                        }
+                    }
+                }
+            }
+        } catch (const std::exception& e) {
+            LogHook("[FGD] Exception scanning FGD directory: %s", e.what());
+        }
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(g_FgdCacheMutex);
+        g_FgdMemoryCache = std::move(newCache);
+        g_bFgdCacheLoaded.store(true, std::memory_order_release);
+    }
+    LogHook("[FGD] Precompiled %zu FGD files into in-memory cache", fileCount);
+}
+
+static bool SafeGetBufferMemory(void* pBuffer, char*& outPtr, int& outSize) {
+    if (!pBuffer) return false;
+    __try {
+        outPtr = (char*)((void**)pBuffer)[1];
+        outSize = *(int*)((uint8_t*)pBuffer + 0x14);
+        return (outPtr != nullptr && outSize > 0);
+    } __except(EXCEPTION_EXECUTE_HANDLER) {
+        outPtr = nullptr;
+        outSize = 0;
+        return false;
+    }
+}
+
+static bool __fastcall hk_ReadFileToBuffer(
+    void* pThis,
+    const char* pFileName,
+    const char* pPathID,
+    void* pBuffer,
+    int maxBytes,
+    int startingOffset,
+    void* pfnAlloc
+) {
+    bool bRet = g_o_ReadFileToBuffer(pThis, pFileName, pPathID, pBuffer, maxBytes, startingOffset, pfnAlloc);
+    if (!bRet || !pFileName || !pBuffer) return bRet;
+    if (!g_bTranslationEnabled.load(std::memory_order_relaxed)) return bRet;
+
+    if (!IsFgdPath(pFileName)) {
+        return bRet;
+    }
+
+    std::string normKey = NormalizeFgdKey(pFileName);
+    std::string transData;
+    bool found = false;
+
+    {
+        std::lock_guard<std::mutex> lock(g_FgdCacheMutex);
+        auto it = g_FgdMemoryCache.find(normKey);
+        if (it != g_FgdMemoryCache.end() && !it->second.empty()) {
+            transData = it->second;
+            found = true;
+        }
+    }
+
+    // JIT 即时兜底：如果缓存还未就绪（如 Hammer 刚启动立即读取），直接现场翻译！
+    if (!found) {
+        EnsureFgdDictLoaded();
+        char* pRawData = nullptr;
+        int rawSize = 0;
+        if (SafeGetBufferMemory(pBuffer, pRawData, rawSize) && pRawData && rawSize > 0) {
+            std::string rawContent(pRawData, static_cast<size_t>(rawSize));
+            std::string jitTrans;
+            if (FgdCore::TranslateContent(rawContent, jitTrans, g_FgdDict, g_FgdOverrideData) && !jitTrans.empty()) {
+                transData = std::move(jitTrans);
+                found = true;
+                std::lock_guard<std::mutex> lock(g_FgdCacheMutex);
+                g_FgdMemoryCache[normKey] = transData;
+                LogHook("[FGD] JIT translated '%s' (%d -> %zu bytes)", pFileName, rawSize, transData.size());
+            }
+        }
+    }
+
+    if (found && !transData.empty()) {
+        if (g_pfnCUtlBuffer_SeekPut && g_pfnCUtlBuffer_EnsureCapacity && g_pfnCUtlBuffer_Put && g_pfnCUtlBuffer_SeekGet) {
+            g_pfnCUtlBuffer_SeekPut(pBuffer, SEEK_HEAD, 0);
+            g_pfnCUtlBuffer_EnsureCapacity(pBuffer, static_cast<int>(transData.size()) + 2);
+            g_pfnCUtlBuffer_Put(pBuffer, transData.data(), static_cast<int>(transData.size()));
+            // 确保结尾有安全 null 字符
+            char* pMem = (char*)((void**)pBuffer)[1];
+            if (pMem) {
+                pMem[transData.size()] = '\0';
+            }
+            g_pfnCUtlBuffer_SeekGet(pBuffer, SEEK_HEAD, 0);
+
+            LogHook("[FGD] In-memory injected '%s' (%zu bytes) into CUtlBuffer at %p",
+                    pFileName, transData.size(), pBuffer);
+            return true;
+        }
+    }
+
+    return bRet;
+}
+
+static bool TryHookFileSystem() {
+    if (g_bFileSystemHooked.load(std::memory_order_relaxed)) return true;
+    if (g_bFileSystemHookFailed.load(std::memory_order_relaxed)) return false;
+
+    HMODULE hFileSystem = GetModuleHandleW(L"filesystem_stdio.dll");
+    if (!hFileSystem) {
+        hFileSystem = LoadLibraryW(L"filesystem_stdio.dll");
+    }
+    if (!hFileSystem) {
+        return false;
+    }
+
+    typedef void* (*CreateInterfaceFn)(const char* pName, int* pReturnCode);
+    CreateInterfaceFn pfnCreateInterface = (CreateInterfaceFn)GetProcAddress(hFileSystem, "CreateInterface");
+    if (!pfnCreateInterface) {
+        LogHook("[FGD] filesystem_stdio.dll has no CreateInterface export!");
+        return false;
+    }
+
+    void* pFileSystem = pfnCreateInterface("VFileSystem017", nullptr);
+    if (!pFileSystem) {
+        LogHook("[FGD] CreateInterface('VFileSystem017') returned null!");
+        return false;
+    }
+
+    void** vtable = *(void***)pFileSystem;
+    if (!vtable) {
+        LogHook("[FGD] VFileSystem017 has null vtable!");
+        return false;
+    }
+
+    void* pTargetReadFile = vtable[25];
+    if (!pTargetReadFile) {
+        LogHook("[FGD] vtable[25] is null!");
+        return false;
+    }
+
+    HMODULE hTier0 = GetModuleHandleW(L"tier0.dll");
+    if (!hTier0) {
+        hTier0 = LoadLibraryW(L"tier0.dll");
+    }
+    if (hTier0) {
+        g_pfnCUtlBuffer_EnsureCapacity = (fnCUtlBuffer_EnsureCapacity)GetProcAddress(hTier0, "?EnsureCapacity@CUtlBuffer@@QEAAXH@Z");
+        g_pfnCUtlBuffer_Put = (fnCUtlBuffer_Put)GetProcAddress(hTier0, "?Put@CUtlBuffer@@QEAAXPEBXH@Z");
+        g_pfnCUtlBuffer_SeekPut = (fnCUtlBuffer_SeekPut)GetProcAddress(hTier0, "?SeekPut@CUtlBuffer@@QEAAXW4SeekType_t@1@H@Z");
+        g_pfnCUtlBuffer_SeekGet = (fnCUtlBuffer_SeekGet)GetProcAddress(hTier0, "?SeekGet@CUtlBuffer@@QEAAXW4SeekType_t@1@H@Z");
+    }
+
+    if (!g_pfnCUtlBuffer_EnsureCapacity || !g_pfnCUtlBuffer_Put || !g_pfnCUtlBuffer_SeekPut || !g_pfnCUtlBuffer_SeekGet) {
+        LogHook("[FGD] Failed to resolve CUtlBuffer exports from tier0.dll!");
+        g_bFileSystemHookFailed.store(true, std::memory_order_release);
+        MessageBoxW(
+            NULL,
+            L"CS2 创意工坊工具汉化模块未能成功解析 tier0.dll 中的 CUtlBuffer 接口。\n\n"
+            L"FGD 实体汉化可能无法在内存中完全生效，请检查游戏是否发生更新。",
+            L"CS2 Workshop Tools Localizer - 警告",
+            MB_ICONWARNING | MB_OK
+        );
+        return false;
+    }
+
+    bool ok = HookManager::Instance().InstallHook(
+        pTargetReadFile,
+        (void*)hk_ReadFileToBuffer,
+        (void**)&g_o_ReadFileToBuffer,
+        "VFileSystem017::ReadFileToBuffer"
+    );
+
+    if (ok) {
+        g_bFileSystemHooked.store(true, std::memory_order_release);
+        LogHook("[FGD] Successfully hooked VFileSystem017::ReadFileToBuffer at %p", pTargetReadFile);
+    } else {
+        g_bFileSystemHookFailed.store(true, std::memory_order_release);
+        LogHook("[FGD] Failed to hook VFileSystem017::ReadFileToBuffer at %p!", pTargetReadFile);
+        MessageBoxW(
+            NULL,
+            L"CS2 创意工坊工具汉化模块未能成功挂钩 VFileSystem017::ReadFileToBuffer。\n\n"
+            L"原因：当前游戏版本的文件系统接口特征可能发生了变动。\n"
+            L"FGD 实体汉化将临时降级为原版英文显示，建议检查启动器是否有新版本更新。",
+            L"CS2 Workshop Tools Localizer - 警告",
+            MB_ICONWARNING | MB_OK
+        );
+    }
+    return ok;
+}
+
+static void TriggerReloadFgdAction() {
+    void* pAction = nullptr;
+    {
+        std::lock_guard<std::mutex> lock(g_ReloadActionMutex);
+        pAction = g_pReloadFgdAction;
+    }
+    if (pAction) {
+        HMODULE hQtWidgets = GetModuleHandleW(L"Qt5Widgets.dll");
+        if (hQtWidgets && !g_pfn_QAction_activate) {
+            g_pfn_QAction_activate = (fnQAction_activate)GetProcAddress(hQtWidgets, "?activate@QAction@@QEAAXW4ActionEvent@1@@Z");
+        }
+        if (g_pfn_QAction_activate) {
+            LogHook("[FGD] Automatically triggering QAction 'Reload .FGD Files' at %p", pAction);
+            g_pfn_QAction_activate(pAction, 0); // 0 = QAction::Trigger
+        }
+    } else {
+        LogHook("[FGD] Reload .FGD Files action not cached yet");
+    }
 }
 
 // ==============================================================================
@@ -1207,6 +1647,12 @@ static void ReloadTranslations() {
         LoadMasterTranslations();
     }
 
+    // 重新预编译所有 FGD 内存缓存
+    PrecompileFgdBuffers();
+
+    // 自动触发 Hammer 原生 'Reload .FGD Files'
+    TriggerReloadFgdAction();
+
     // 广播重绘所有 CS2/Hammer 窗口，使最新词典即刻渲染
     EnumWindows([](HWND hwnd, LPARAM lParam) -> BOOL {
         DWORD pid = 0;
@@ -1217,7 +1663,7 @@ static void ReloadTranslations() {
         return TRUE;
     }, 0);
 
-    LogHook("[RELOAD] Translations reloaded successfully");
+    LogHook("[RELOAD] Translations and FGD buffers reloaded successfully");
 }
 
 extern "C" __declspec(dllexport) bool InitializeTranslator();
@@ -1350,8 +1796,21 @@ static void __fastcall hk_QTextDocument_setHtml(void* pDoc, const void* pQString
     });
 }
 
+static inline void CheckAndCacheReloadAction(void* pAction, const void* pQString) {
+    if (!pAction || !pQString || !g_pfn_utf16) return;
+    const wchar_t* wstr = nullptr;
+    if (SafeGetUtf16(g_pfn_utf16, pQString, wstr) && wstr) {
+        if (wcsstr(wstr, L"Reload .FGD") != nullptr || wcsstr(wstr, L"重新加载 .FGD") != nullptr) {
+            std::lock_guard<std::mutex> lock(g_ReloadActionMutex);
+            g_pReloadFgdAction = pAction;
+            LogHook("[FGD] Cached 'Reload .FGD Files' QAction pointer: %p", pAction);
+        }
+    }
+}
+
 static void __fastcall hk_QAction_setText(void* pAction, const void* pQString) {
     void* caller = _ReturnAddress();
+    CheckAndCacheReloadAction(pAction, pQString);
     ForwardTranslatedQString(caller, pQString, TranslationSource::StaticUI, [&](const void* text) {
         if (g_o_QAction_setText) g_o_QAction_setText(pAction, text);
     });
@@ -1408,6 +1867,7 @@ static void __fastcall hk_QGroupBox_setTitle(void* pBox, const void* pQString) {
 
 static void* __fastcall hk_QAction_ctor(void* pAction, const void* pQString, void* pParent) {
     void* caller = _ReturnAddress();
+    CheckAndCacheReloadAction(pAction, pQString);
     void* result = nullptr;
     ForwardTranslatedQString(caller, pQString, TranslationSource::StaticUI, [&](const void* text) {
         result = g_o_QAction_ctor(pAction, text, pParent);
@@ -1417,6 +1877,7 @@ static void* __fastcall hk_QAction_ctor(void* pAction, const void* pQString, voi
 
 static void* __fastcall hk_QAction_ctor_icon(void* pAction, const void* pIcon, const void* pQString, void* pParent) {
     void* caller = _ReturnAddress();
+    CheckAndCacheReloadAction(pAction, pQString);
     void* result = nullptr;
     ForwardTranslatedQString(caller, pQString, TranslationSource::StaticUI, [&](const void* text) {
         result = g_o_QAction_ctor_icon(pAction, pIcon, text, pParent);
@@ -1833,6 +2294,10 @@ static DWORD WINAPI ToolsHookThread(LPVOID lpParam) {
     EnsureDictionaryLoaded();
     ScanKnownToolModules();
 
+    // 预编译内存中的 FGD 翻译缓存并挂钩文件系统
+    PrecompileFgdBuffers();
+    TryHookFileSystem();
+
     HANDLE waitHandles[2] = { g_hWakeHookEvent, g_hCrashReportEvent };
 
     while (!g_bStopHookThread.load(std::memory_order_relaxed)) {
@@ -1845,6 +2310,9 @@ static DWORD WINAPI ToolsHookThread(LPVOID lpParam) {
 
         if (!g_bWidgetsHooked.load(std::memory_order_relaxed) || !g_bGuiHooked.load(std::memory_order_relaxed)) {
             TryHookQtToolsModules();
+        }
+        if (!g_bFileSystemHooked.load(std::memory_order_relaxed) && !g_bFileSystemHookFailed.load(std::memory_order_relaxed)) {
+            TryHookFileSystem();
         }
         ScanKnownToolModules();
 
@@ -1872,7 +2340,7 @@ static DWORD WINAPI ToolsHookThread(LPVOID lpParam) {
             break;
         }
 
-        DWORD timeout = (g_bWidgetsHooked.load() && g_bGuiHooked.load()) ? 500 : 50;
+        DWORD timeout = (g_bWidgetsHooked.load() && g_bGuiHooked.load() && g_bFileSystemHooked.load()) ? 500 : 50;
         DWORD waitRes = MsgWaitForMultipleObjectsEx(2, waitHandles, timeout, QS_ALLINPUT, MWMO_INPUTAVAILABLE);
         if (waitRes == WAIT_OBJECT_0 + 1) {
             ProcessCrashReportAsync();
@@ -2042,6 +2510,9 @@ extern "C" __declspec(dllexport) bool InitializeTranslator() {
     }
 
     LogHook("[INIT] Qt5Core=%p, fromUtf8=%p, utf16=%p, dtor=%p, orig_tr=%p", hQtCore, g_pfn_fromUtf8, g_pfn_utf16, g_pfn_QString_dtor, g_o_QMetaObject_tr);
+
+    // 立即挂钩 VFileSystem017::ReadFileToBuffer，抢在 Hammer 加载 FGD 前就绪
+    TryHookFileSystem();
 
     // 2. 创建异步唤醒事件与崩溃报告事件，并注册 DLL 通知
     if (!g_hWakeHookEvent) {

@@ -40,6 +40,7 @@ add_library(qtcore_qm SHARED
     src/core/hook_manager.cpp
     src/core/pe_patcher.cpp
     src/core/dictionary_compiler.cpp
+    src/core/fgd_core.cpp
     third_party/minhook/src/buffer.c
     third_party/minhook/src/hook.c
     third_party/minhook/src/trampoline.c
@@ -69,6 +70,7 @@ add_executable(CS2WorkshopToolsLocalizerCN WIN32
 
     src/core/cs2_detector.cpp
     src/core/pe_patcher.cpp
+    src/core/fgd_core.cpp
     src/core/fgd_translator.cpp
     src/core/backup_manager.cpp
     src/core/dictionary_compiler.cpp

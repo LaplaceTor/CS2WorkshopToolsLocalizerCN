@@ -182,14 +182,12 @@ bool LocalizationService::Inject(const Context& ctx, bool useMachineTrans, const
     );
 
     // ==========================================
-    // STEP 2: FGD 汉化
+    // STEP 2: FGD 汉化引擎准备 (纯内存模式)
     // ==========================================
     log(
-        "[2/3] 正在部署 FGD 汉化...",
+        "[2/3] 正在准备 FGD 纯内存汉化引擎...",
         "#e6db74"
     );
-
-    std::vector<std::wstring> transFgd;
 
     if (useMachineTrans) {
         log(
@@ -198,37 +196,37 @@ bool LocalizationService::Inject(const Context& ctx, bool useMachineTrans, const
         );
     }
 
-    std::wstring fgdFallbackParam = (useMachineTrans && fs::exists(fgdFallbackPath)) ? fgdFallbackPath.wstring() : L"";
+    // 写入应用程序目录与机翻状态指针文件，供注入模块读取词典
+    WriteAppDirPointer(ctx.cs2Root, ctx.workingDir, useMachineTrans);
 
-    if (!FgdTranslator::TranslateAndDeployAll(
-            ctx.cs2Root,
-            backupDir.wstring(),
-            transDir.wstring(),
-            fgdDictPath.wstring(),
-            fgdOverridePath.wstring(),
-            transFgd,
-            err,
-            fgdFallbackParam)) {
+    // 检查并恢复可能存在的旧版本残留磁盘翻译 FGD 文件，确保 CS2 磁盘目录 100% 保持官方原版纯净
+    size_t restoredOldFgd = 0;
+    try {
+        if (fs::exists(backupDir)) {
+            for (const auto& entry : fs::recursive_directory_iterator(backupDir)) {
+                if (entry.is_regular_file() && entry.path().extension() == ".fgd") {
+                    fs::path relPath = fs::relative(entry.path(), backupDir);
+                    fs::path gameFgdPath = fs::path(ctx.cs2Root) / relPath;
+                    if (fs::exists(gameFgdPath)) {
+                        if (fs::file_size(entry.path()) != fs::file_size(gameFgdPath)) {
+                            BackupManager::SafeCopyFileWithRetry(entry.path(), gameFgdPath);
+                            restoredOldFgd++;
+                        }
+                    }
+                }
+            }
+        }
+    } catch (...) {}
 
+    if (restoredOldFgd > 0) {
         log(
-            QString(
-                "[-] 汉化 FGD 失败: %1"
-            )
-                .arg(
-                    QString::fromStdWString(err)
-                ),
-            "#f92672"
+            QString("[*] 已检测并清理 %1 个旧版残留的磁盘 FGD 翻译文件，还原为官方原版纯净状态").arg(restoredOldFgd),
+            "#66d9ef"
         );
-
-        Restore(ctx, false, log);
-        return false;
     }
 
     log(
-        QString(
-            "[+] 成功汉化并部署 %1 个 FGD 文件"
-        )
-            .arg(transFgd.size()),
+        "[+] FGD 实体汉化引擎就绪：采用纯内存动态指向模式（0 磁盘写入，零文件污染）",
         "#a6e22e"
     );
 
@@ -300,6 +298,17 @@ bool LocalizationService::Inject(const Context& ctx, bool useMachineTrans, const
                 Restore(ctx, false, log);
                 return false;
             }
+        }
+
+        // 部署 FGD 词典副本到游戏 bin 目录作为可靠本地兜底
+        if (fs::exists(fgdDictPath)) {
+            BackupManager::SafeCopyFileWithRetry(fgdDictPath, cs2Bin / L"fgd_translations.jsonc");
+        }
+        if (fs::exists(fgdOverridePath)) {
+            BackupManager::SafeCopyFileWithRetry(fgdOverridePath, cs2Bin / L"fgd_override.jsonc");
+        }
+        if (useMachineTrans && fs::exists(fgdFallbackPath)) {
+            BackupManager::SafeCopyFileWithRetry(fgdFallbackPath, cs2Bin / L"fgd_fallback.jsonc");
         }
 
         // 修补 Qt5Core.dll

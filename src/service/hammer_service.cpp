@@ -159,32 +159,10 @@ HammerService::ReloadResult HammerService::reloadDictionaries(const std::wstring
         }
     }
 
-    // 2. 联动重新编译并部署 FGD（引入 fgd_fallback 兜底）
-    const fs::path transDir        = fs::path(workingDir) / paths::kTranslationsDir;
-    const fs::path backupDir       = fs::path(workingDir) / paths::kBackupDir;
-    const fs::path fgdDictPath     = ResolveDictionaryPath(workingDir, L"fgd_translations.jsonc");
-    const fs::path fgdOverridePath = ResolveDictionaryPath(workingDir, L"fgd_override.jsonc");
-    const fs::path fgdFallbackPath = ResolveDictionaryPath(workingDir, L"fgd_fallback.jsonc");
-
-    const std::wstring fgdFallbackParam =
-        (useMachineTrans && fs::exists(fgdFallbackPath)) ? fgdFallbackPath.wstring() : L"";
-
-    std::vector<std::wstring> transFgd;
-    std::wstring err;
-
-    result.fgdOk = FgdTranslator::TranslateAndDeployAll(
-        cs2Root,
-        backupDir.wstring(),
-        transDir.wstring(),
-        fgdDictPath.wstring(),
-        fgdOverridePath.wstring(),
-        transFgd,
-        err,
-        fgdFallbackParam
-    );
-
-    result.fgdFileCount = static_cast<qsizetype>(transFgd.size());
-    result.fgdError     = QString::fromStdWString(err);
+    // 2. 纯内存模式：无需向磁盘重新写入 FGD 文件
+    // 注入模块收到 IPC 消息后，会自动在内存中预编译最新 FGD 并触发 Hammer 原生 Reload .FGD Files
+    result.fgdOk = true;
+    result.fgdFileCount = 0;
 
     // 3. 发送 IPC 消息给 Hammer
     result.ipcOk = HammerIpc::Send(HammerIpc::kMsgReloadDict);
