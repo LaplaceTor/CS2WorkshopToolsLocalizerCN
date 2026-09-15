@@ -57,9 +57,6 @@ private:
     // 更新“仅注入 / 启动 HAMMER / 还原”三个核心按钮状态
     void updateActionButtonState();
 
-    // 保留旧接口，内部转发到统一状态更新
-    void updateRestoreButtonState();
-
     // 判断当前是否处于有效的“已注入”状态（对 core 的只读状态查询 + 本地异步校验缓存）
     bool isPatchDeployedAndValid();
 

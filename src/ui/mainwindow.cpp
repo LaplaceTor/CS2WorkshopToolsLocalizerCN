@@ -1023,10 +1023,6 @@ void MainWindow::updateActionButtonState() {
     }
 }
 
-void MainWindow::updateRestoreButtonState() {
-    updateActionButtonState();
-}
-
 bool MainWindow::machineTranslationEnabled() const {
     return (m_useMachineTransCheck != nullptr) ? m_useMachineTransCheck->isChecked() : true;
 }
