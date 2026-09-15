@@ -119,7 +119,7 @@ QHBoxLayout* DebugWindow::createControlToolbar() {
     m_btnHotReload->setStyleSheet("QPushButton { background-color: #8957e5; color: white; font-weight: bold; padding: 6px 12px; border-radius: 4px; } QPushButton:hover { background-color: #a371f7; }");
 
     m_btnLaunchDebug = new QPushButton("🚀 启动调试版 Hammer", this);
-    m_btnLaunchDebug->setToolTip("启动带 -debug -verbosehook 参数的 cs2.exe -tools -addons test");
+    m_btnLaunchDebug->setToolTip("启动带 -vulkan -debug -verbosehook 参数的 cs2.exe -tools -addons test");
     m_btnLaunchDebug->setStyleSheet("QPushButton { background-color: #238636; color: white; font-weight: bold; padding: 6px 12px; border-radius: 4px; } QPushButton:hover { background-color: #2ea043; }");
 
     m_btnCopyReport = new QPushButton("📋 复制完整诊断报告", this);
@@ -438,11 +438,11 @@ void DebugWindow::onLaunchDebugHammerClicked() {
     }
 
     QStringList args;
-    args << "-tools" << "-addons" << "test" << "-debug" << "-verbosehook";
+    args << "-tools" << "-addons" << "test" << "-vulkan" << "-debug" << "-verbosehook";
 
     bool ok = QProcess::startDetached(cs2Exe, args, QString::fromStdWString(paths::Win64Bin(m_cs2Root).wstring()) + "/");
     if (ok) {
-        m_txtHookLog->appendPlainText("[CLIENT] 🚀 已拉起调试版 Hammer: cs2.exe -tools -addons test -debug -verbosehook");
+        m_txtHookLog->appendPlainText("[CLIENT] 🚀 已拉起调试版 Hammer: cs2.exe -tools -addons test -vulkan -debug -verbosehook");
     } else {
         m_txtHookLog->appendPlainText("[CLIENT] ❌ 启动调试版 Hammer 失败");
     }

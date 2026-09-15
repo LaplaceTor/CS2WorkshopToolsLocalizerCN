@@ -62,7 +62,7 @@ public:
     // 列出指定 CS2 安装目录下的可用 Addon 模组（供启动配置下拉框使用）
     static std::vector<std::wstring> availableAddons(const std::wstring& cs2Root);
 
-    // 启动 HAMMER（cs2.exe -addon <addon> -tools [用户参数]）。
+    // 启动 HAMMER（cs2.exe -addon <addon> -tools -vulkan [用户参数]）。
     // 返回 true 仅代表进程已成功发起启动，后续失败通过 startFailed 信号外抛。
     LaunchResult launch(const LaunchParams& params);
 

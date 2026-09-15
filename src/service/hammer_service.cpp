@@ -73,11 +73,16 @@ HammerService::LaunchResult HammerService::launch(const LaunchParams& params) {
     }
 
     QStringList processArgs;
-    processArgs << "-addon" << selectedAddon << "-tools";
+    processArgs << "-addon" << selectedAddon << "-tools" << "-vulkan";
 
     const QString customArgs = params.extraArgs.trimmed();
     if (!customArgs.isEmpty()) {
-        processArgs.append(QProcess::splitCommand(customArgs));
+        const QStringList customList = QProcess::splitCommand(customArgs);
+        for (const QString& arg : customList) {
+            if (arg.compare("-vulkan", Qt::CaseInsensitive) != 0) {
+                processArgs.append(arg);
+            }
+        }
     }
 
     m_process->setProgram(cs2ExePath);

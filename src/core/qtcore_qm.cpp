@@ -428,6 +428,10 @@ static void ScanKnownToolModules() {
         L"engine2.dll",
         L"client.dll",
         L"server.dll",
+        L"rendersystemvulkan.dll",
+        L"rendersystemdx11.dll",
+        L"scenesystem.dll",
+        L"tier0.dll",
         L"qt5widgets.dll",
         L"qt5gui.dll",
         L"qt5core.dll"
@@ -1622,6 +1626,9 @@ static void ToggleLanguage() {
     bool next = !current;
     g_bTranslationEnabled.store(next, std::memory_order_release);
     LogHook("[LANG] Translation toggled: %s", next ? "ENABLED (Chinese)" : "DISABLED (English)");
+
+    // 自动触发 Hammer 原生 'Reload .FGD Files'，重读实体定义（中英双向即刻生效）
+    TriggerReloadFgdAction();
 
     // 广播重绘所有 CS2/Hammer 窗口，触发 QPainter 毫秒级双向无伤重绘，0 跨线程调用，0 堆踩踏风险
     EnumWindows([](HWND hwnd, LPARAM lParam) -> BOOL {
