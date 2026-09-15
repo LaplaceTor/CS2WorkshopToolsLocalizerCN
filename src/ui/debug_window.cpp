@@ -1,8 +1,8 @@
-#include "debug_window.h"
-#include "mainwindow.h"
-#include "cs2_detector.h"
-#include "hammer_ipc.h"
-#include "path_constants.h"
+#include "ui/debug_window.h"
+#include "ui/mainwindow.h"
+#include "core/cs2_detector.h"
+#include "core/hammer_ipc.h"
+#include "core/path_constants.h"
 #include <windows.h>
 #include <psapi.h>
 #include <tlhelp32.h>

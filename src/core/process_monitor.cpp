@@ -1,6 +1,6 @@
-#include "process_monitor.h"
+#include "core/process_monitor.h"
 
-#include "cs2_detector.h"
+#include "core/cs2_detector.h"
 
 #ifndef NOMINMAX
 #define NOMINMAX

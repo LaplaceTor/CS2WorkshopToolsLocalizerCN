@@ -1,6 +1,6 @@
-#include "fgd_translator.h"
-#include "dictionary_compiler.h"
-#include "backup_manager.h"
+#include "core/fgd_translator.h"
+#include "core/dictionary_compiler.h"
+#include "core/backup_manager.h"
 #include <windows.h>
 #include <fstream>
 #include <sstream>

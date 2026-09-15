@@ -10,10 +10,10 @@
 #include <algorithm>
 #include <atomic>
 #include <stdio.h>
-#include "hook_manager.h"
-#include "pe_patcher.h"
-#include "dictionary_compiler.h"
-#include "encoding_util.h"
+#include "core/hook_manager.h"
+#include "core/pe_patcher.h"
+#include "core/dictionary_compiler.h"
+#include "core/encoding_util.h"
 #include "hde/hde64.h"
 
 #pragma intrinsic(_ReturnAddress)

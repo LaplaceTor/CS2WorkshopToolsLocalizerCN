@@ -1,16 +1,16 @@
-#include "localization_service.h"
+#include "service/localization_service.h"
 
 #include <filesystem>
 
 #include <QThread>
 #include <QString>
 
-#include "backup_manager.h"
-#include "dictionary_compiler.h"
-#include "dictionary_paths.h"
-#include "fgd_translator.h"
-#include "path_constants.h"
-#include "pe_patcher.h"
+#include "core/backup_manager.h"
+#include "core/dictionary_compiler.h"
+#include "core/dictionary_paths.h"
+#include "core/fgd_translator.h"
+#include "core/path_constants.h"
+#include "core/pe_patcher.h"
 
 namespace fs = std::filesystem;
 bool LocalizationService::Inject(const Context& ctx, bool useMachineTrans, const LogSink& log) {

@@ -5,8 +5,8 @@
 #include <QByteArray>
 #include <QProcess>
 #include <string>
-#include "process_monitor.h"
-#include "hammer_ipc.h"
+#include "core/process_monitor.h"
+#include "core/hammer_ipc.h"
 
 class QComboBox;
 class QLineEdit;

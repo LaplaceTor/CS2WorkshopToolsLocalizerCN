@@ -1,8 +1,8 @@
 #include <QApplication>
 #include <QMessageBox>
 #include <QStyleFactory>
-#include "mainwindow.h"
-#include "cs2_detector.h"
+#include "ui/mainwindow.h"
+#include "core/cs2_detector.h"
 
 int main(int argc, char *argv[]) {
     // 启用高 DPI 缩放支持

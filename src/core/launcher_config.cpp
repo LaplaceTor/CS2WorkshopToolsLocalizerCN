@@ -1,4 +1,4 @@
-#include "launcher_config.h"
+#include "core/launcher_config.h"
 
 #include <filesystem>
 

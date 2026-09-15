@@ -1,4 +1,4 @@
-#include "hammer_ipc.h"
+#include "core/hammer_ipc.h"
 
 HWND HammerIpc::FindIpcWindow() {
     HWND hWnd = FindWindowExW(HWND_MESSAGE, NULL, kWindowClass, kWindowTitle);

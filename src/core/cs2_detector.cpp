@@ -1,5 +1,5 @@
-#include "cs2_detector.h"
-#include "path_constants.h"
+#include "core/cs2_detector.h"
+#include "core/path_constants.h"
 #include <windows.h>
 #include <tlhelp32.h>
 #include <filesystem>

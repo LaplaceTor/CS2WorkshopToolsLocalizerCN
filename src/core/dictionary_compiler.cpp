@@ -1,6 +1,6 @@
-#include "dictionary_compiler.h"
+#include "core/dictionary_compiler.h"
 // 引入 UTF-8/UTF-16 转换工具（内部已带 NOMINMAX 与 windows.h，供 MoveFileExW 等使用）
-#include "encoding_util.h"
+#include "core/encoding_util.h"
 #include <fstream>
 #include <algorithm>
 #include <cstring>

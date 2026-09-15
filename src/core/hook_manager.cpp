@@ -1,5 +1,5 @@
-#include "hook_manager.h"
-#include "../third_party/minhook/include/MinHook.h"
+#include "core/hook_manager.h"
+#include "MinHook.h"
 #include <stdio.h>
 #include <algorithm>
 

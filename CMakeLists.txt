@@ -29,18 +29,24 @@ endif()
 # 版本号，默认 "dev"，CI 通过 -DAPP_VERSION=v1.0.0 传入
 set(APP_VERSION "dev" CACHE STRING "Application version string")
 
+# 源码按 ui / service / core 三层组织，src/ 作为项目内部 include 根：
+#   #include "core/xxx.h" / "service/xxx.h" / "ui/xxx.h"
+# 依赖方向只允许 UI -> Service -> Core，Core 不得反向依赖 UI。
+set(LAYERED_INCLUDE_ROOT ${CMAKE_CURRENT_SOURCE_DIR}/src)
+
 # 1. 编译注入 DLL qtcore_qm.dll
 add_library(qtcore_qm SHARED
-    src/qtcore_qm.cpp
-    src/hook_manager.cpp
-    src/pe_patcher.cpp
-    src/dictionary_compiler.cpp
+    src/core/qtcore_qm.cpp
+    src/core/hook_manager.cpp
+    src/core/pe_patcher.cpp
+    src/core/dictionary_compiler.cpp
     third_party/minhook/src/buffer.c
     third_party/minhook/src/hook.c
     third_party/minhook/src/trampoline.c
     third_party/minhook/src/hde/hde64.c
 )
 target_include_directories(qtcore_qm PRIVATE
+    ${LAYERED_INCLUDE_ROOT}
     third_party/minhook/include
     third_party/minhook/src
 )
@@ -53,23 +59,30 @@ set_target_properties(qtcore_qm PROPERTIES
 # 2. 编译主启动器图形界面程序
 add_executable(CS2WorkshopToolsLocalizerCN WIN32
     src/main.cpp
-    src/mainwindow.cpp
-    src/debug_window.cpp
-    src/cs2_detector.cpp
-    src/pe_patcher.cpp
-    src/fgd_translator.cpp
-    src/backup_manager.cpp
-    src/dictionary_compiler.cpp
-    src/launcher_config.cpp
-    src/localization_service.cpp
-    src/process_monitor.cpp
-    src/hammer_ipc.cpp
+
+    src/ui/mainwindow.cpp
+    src/ui/debug_window.cpp
+
+    src/service/localization_service.cpp
+
+    src/core/cs2_detector.cpp
+    src/core/pe_patcher.cpp
+    src/core/fgd_translator.cpp
+    src/core/backup_manager.cpp
+    src/core/dictionary_compiler.cpp
+    src/core/launcher_config.cpp
+    src/core/process_monitor.cpp
+    src/core/hammer_ipc.cpp
 )
 
 set_target_properties(CS2WorkshopToolsLocalizerCN PROPERTIES
     AUTOMOC ON
     AUTORCC ON
     AUTOUIC ON
+)
+
+target_include_directories(CS2WorkshopToolsLocalizerCN PRIVATE
+    ${LAYERED_INCLUDE_ROOT}
 )
 
 target_compile_definitions(CS2WorkshopToolsLocalizerCN PRIVATE

@@ -1,6 +1,6 @@
-#include "backup_manager.h"
-#include "pe_patcher.h"
-#include "path_constants.h"
+#include "core/backup_manager.h"
+#include "core/pe_patcher.h"
+#include "core/path_constants.h"
 #include <windows.h>
 #include <winver.h>
 #include <filesystem>
