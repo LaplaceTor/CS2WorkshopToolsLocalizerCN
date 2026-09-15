@@ -7,6 +7,7 @@
 #include <QString>
 
 #include "core/backup_manager.h"
+#include "core/cs2_detector.h"
 #include "core/dictionary_compiler.h"
 #include "core/dictionary_paths.h"
 #include "core/fgd_translator.h"
@@ -453,6 +454,37 @@ bool LocalizationService::HasPendingRecovery(const Context& ctx) {
 
 bool LocalizationService::ClearSessionState(const std::wstring& workingDir) {
     return BackupManager::ClearSessionState(workingDir);
+}
+
+bool LocalizationService::IsCs2Running() {
+    return Cs2Detector::IsCs2ProcessRunning();
+}
+
+bool LocalizationService::HasBackup(const Context& ctx) {
+    return BackupManager::HasBackup((fs::path(ctx.workingDir) / paths::kBackupDir).wstring());
+}
+
+bool LocalizationService::IsPatchDeployed(const Context& ctx) {
+    // 没有备份，不认为当前处于有效的已注入状态
+    if (!HasBackup(ctx)) {
+        return false;
+    }
+
+    // session_state 是否标记为已注入
+    const bool sessionPatched = BackupManager::HasUnrestoredSession(ctx.workingDir);
+
+    // CS2 目录中是否存在实际补丁文件
+    const bool patchFilesPresent = BackupManager::IsPatchDeployed(ctx.cs2Root);
+
+    return sessionPatched || patchFilesPresent;
+}
+
+bool LocalizationService::IsBackupMatching(const Context& ctx) {
+    const auto validation = BackupManager::BackupMatchesCurrentGame(
+        ctx.cs2Root,
+        (fs::path(ctx.workingDir) / paths::kBackupDir).wstring()
+    );
+    return validation.status == BackupMatchStatus::Matches;
 }
 
 void LocalizationService::SyncDictionariesFromParent(const std::wstring& workingDir) {

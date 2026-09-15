@@ -9,6 +9,7 @@
 
 #include <functional>
 #include <string>
+#include <vector>
 
 #include <QObject>
 #include <QProcess>
@@ -52,6 +53,14 @@ public:
 
     bool   isRunning() const { return m_isRunning; }
     qint64 processId() const { return m_pid; }
+
+    // 运行中的 Hammer 是否可通过 IPC 通信。
+    // 与 isRunning() 的区别：Hammer 可能由用户自行启动（而非本程序拉起），
+    // 此时 isRunning() 为 false 但 IPC 窗口存在，热重载仍然可以送达。
+    bool isIpcAvailable() const;
+
+    // 列出指定 CS2 安装目录下的可用 Addon 模组（供启动配置下拉框使用）
+    static std::vector<std::wstring> availableAddons(const std::wstring& cs2Root);
 
     // 启动 HAMMER（cs2.exe -addon <addon> -tools [用户参数]）。
     // 返回 true 仅代表进程已成功发起启动，后续失败通过 startFailed 信号外抛。

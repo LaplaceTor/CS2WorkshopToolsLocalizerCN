@@ -42,6 +42,30 @@ public:
     // 是否存在「上次异常退出遗留的未还原补丁」，供启动时的自动恢复流程判断
     static bool HasPendingRecovery(const Context& ctx);
 
+    // -----------------------------------------------------------------------
+    // 只读状态查询
+    //
+    // 原先 MainWindow 直接调用 Cs2Detector / BackupManager 拼装这几个判断
+    // （"当前是否已注入"、"能不能还原"、"CS2 是否在运行"），
+    // 导致 UI 层既要懂业务流程又要懂底层文件布局。
+    // 这里统一收口：UI 只问「现在是什么状态」，不再关心由谁判定、怎么判定。
+    // -----------------------------------------------------------------------
+
+    // CS2 / Hammer 进程是否正在运行（内部会遍历进程快照，属于较重操作）
+    static bool IsCs2Running();
+
+    // 工作目录下是否存在可用的原版备份
+    static bool HasBackup(const Context& ctx);
+
+    // 当前是否处于「已注入」状态（轻量判断，不涉及校验和）。
+    // 判定规则：存在备份，且「会话标记已注入」或「CS2 目录中实际存在补丁文件」——
+    // 异常关闭后 session_state 可能被破坏，此时只要补丁文件仍在就仍算已注入。
+    static bool IsPatchDeployed(const Context& ctx);
+
+    // 备份内容是否与当前游戏版本一致。
+    // 内含多次全文件 SHA256，属于重 IO，应在后台线程调用。
+    static bool IsBackupMatching(const Context& ctx);
+
     // 把工作目录与机翻开关写入游戏目录的 localizer_appdir.txt，
     // 供注入模块直读定位词典文件
     static void WriteAppDirPointer(const std::wstring& cs2Root,

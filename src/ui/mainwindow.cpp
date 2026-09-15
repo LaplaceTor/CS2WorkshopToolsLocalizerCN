@@ -1,13 +1,13 @@
 #include "ui/mainwindow.h"
-#include "core/cs2_detector.h"
-#include "core/path_constants.h"
-#include "core/dictionary_paths.h"
+
+// MainWindow 只依赖 Service 层与少量「无业务逻辑」的 core 设施：
+//   - path_constants.h：纯路径常量（文件监视列表等）
+//   - launcher_config.h：启动器自身设置的读写入口
+// 进程探测、备份状态、词典模板等一律经由 Service，不再直接触碰 core。
 #include "core/launcher_config.h"
-#include "service/localization_service.h"
+#include "core/path_constants.h"
 #include "service/dictionary_service.h"
-#include "core/hammer_ipc.h"
-#include "core/fgd_translator.h"
-#include "core/backup_manager.h"
+#include "service/localization_service.h"
 #include "ui/debug_window.h"
 
 #include <windows.h>
@@ -194,44 +194,9 @@ MainWindow::MainWindow(const std::wstring& cs2Root, QWidget *parent)
         "#f8f8f2"
     );
 
-    // 检查并生成翻译字典文件
-    fs::path fgdPath = ResolveDictionaryPath(m_workingDir, L"fgd_translations.jsonc");
-    fs::path fgdOverridePath = ResolveDictionaryPath(m_workingDir, L"fgd_override.jsonc");
-    fs::path qtPath = ResolveDictionaryPath(m_workingDir, L"qt_translations.jsonc");
-
-    std::wstring notice;
-
-    if (FgdTranslator::EnsureFgdDictionaryExists(
-            fgdPath.wstring(),
-            L"",
-            notice)) {
-
-        appendLog(
-            "[i] " + QString::fromStdWString(notice),
-            "#66d9ef"
-        );
-    }
-
-    if (FgdTranslator::EnsureFgdOverrideDictionaryExists(
-            fgdOverridePath.wstring(),
-            L"",
-            notice)) {
-
-        appendLog(
-            "[i] " + QString::fromStdWString(notice),
-            "#66d9ef"
-        );
-    }
-
-    if (FgdTranslator::EnsureQtDictionaryExists(
-            qtPath.wstring(),
-            L"",
-            notice)) {
-
-        appendLog(
-            "[i] " + QString::fromStdWString(notice),
-            "#66d9ef"
-        );
+    // 词典缺失时自动生成带范例的模板
+    for (const QString& notice : DictionaryService::ensureTemplates(m_workingDir)) {
+        appendLog("[i] " + notice, "#66d9ef");
     }
 
     // 检查上一次是否异常退出并执行安全恢复
@@ -722,7 +687,7 @@ void MainWindow::populateAddons() {
     m_addonCombo->clear();
 
     std::vector<std::wstring> addons =
-        Cs2Detector::GetAvailableAddons(
+        HammerService::availableAddons(
             m_cs2Root
         );
 
@@ -861,57 +826,25 @@ void MainWindow::setUiBusy(bool busy) {
 }
 
 bool MainWindow::isPatchDeployedAndValid() {
-    fs::path backupDir =
-        fs::path(m_workingDir) / paths::kBackupDir;
+    const LocalizationService::Context ctx{m_cs2Root, m_workingDir};
 
-    // 没有备份，不认为当前处于有效的已注入状态
-    if (!BackupManager::HasBackup(
-            backupDir.wstring())) {
-
-        return false;
-    }
-
-    // 当前目录是否存在实际补丁文件
-    bool patchFilesPresent =
-        BackupManager::IsPatchDeployed(
-            m_cs2Root
-        );
-
-    // session_state 是否标记为已注入
-    bool sessionPatched =
-        BackupManager::HasUnrestoredSession(
-            m_workingDir
-        );
-
-    /*
-     * 正常状态：
-     *
-     * session_state.json:
-     *   "is_patched": true
-     *
-     * 并且 CS2 目录中存在实际补丁文件。
-     *
-     * 对于异常关闭后残留的情况，
-     * 即使 session_state 被破坏，只要补丁文件仍存在，
-     * 也继续认为当前目录处于注入状态。
-     */
-    if (!sessionPatched && !patchFilesPresent) {
+    // 轻量判断：备份是否存在 + 补丁文件 / 会话标记二选一（不涉及校验和）。
+    // "当前是否已注入"的判定规则归 LocalizationService 所有，UI 只取结论。
+    if (!LocalizationService::IsPatchDeployed(ctx)) {
         return false;
     }
 
     /*
-     * BackupMatchesCurrentGame 内含 4 次全文件 SHA256（cs2.exe / Qt5Core / 备份 Qt5Core），
-     * 属于重 IO：这里仅做轻量判断，重量级校验放后台异步执行并缓存结果（15 秒有效期），
-     * 校验完成后再刷新一次按钮状态。校验未到达期间沿用缓存值（初始为 false，保守视为未注入）。
+     * 备份一致性校验内含 4 次全文件 SHA256（cs2.exe / Qt5Core / 备份 Qt5Core），
+     * 属于重 IO：这里只做上面那次轻量判断，重量级校验放后台异步执行并缓存结果
+     * （15 秒有效期），校验完成后再刷新一次按钮状态。
+     * 校验未到达期间沿用缓存值（初始为 false，保守视为未注入）。
      */
-    qint64 nowMs = QDateTime::currentMSecsSinceEpoch();
+    const qint64 nowMs = QDateTime::currentMSecsSinceEpoch();
     if (!m_validationPending &&
         (m_lastValidationMs == 0 || nowMs - m_lastValidationMs > 15000)) {
 
         m_validationPending = true;
-
-        std::wstring cs2Root = m_cs2Root;
-        std::wstring workingDir = m_workingDir;
 
         auto* watcher = new QFutureWatcher<bool>(this);
         QObject::connect(
@@ -929,17 +862,15 @@ bool MainWindow::isPatchDeployedAndValid() {
             }
         );
 
+        // ctx 按值捕获：worker 线程不得引用 UI 侧的任何状态
         watcher->setFuture(
-            QtConcurrent::run([cs2Root, workingDir]() -> bool {
-                auto validation = BackupManager::BackupMatchesCurrentGame(
-                    cs2Root,
-                    (fs::path(workingDir) / paths::kBackupDir).wstring());
-                return validation.status == BackupMatchStatus::Matches;
+            QtConcurrent::run([ctx]() -> bool {
+                return LocalizationService::IsBackupMatching(ctx);
             })
         );
     }
 
-    return (sessionPatched || patchFilesPresent) && m_cachedValidationValid;
+    return m_cachedValidationValid;
 }
 
 void MainWindow::updateActionButtonState() {
@@ -1063,7 +994,7 @@ void MainWindow::onInjectClicked() {
         return;
     }
 
-    if (Cs2Detector::IsCs2ProcessRunning()) {
+    if (LocalizationService::IsCs2Running()) {
         QMessageBox::warning(
             this,
             "警告",
@@ -1156,7 +1087,7 @@ void MainWindow::onLaunchClicked() {
         return;
     }
 
-    if (Cs2Detector::IsCs2ProcessRunning()) {
+    if (LocalizationService::IsCs2Running()) {
         QMessageBox::warning(
             this,
             "提示",
@@ -1521,7 +1452,7 @@ void MainWindow::onRestoreClicked() {
         return;
     }
 
-    if (Cs2Detector::IsCs2ProcessRunning()) {
+    if (LocalizationService::IsCs2Running()) {
         QMessageBox::warning(
             this,
             "警告",
@@ -1680,7 +1611,7 @@ void MainWindow::checkAndRecoverAbnormalExit() {
 
     // 检查 CS2 是否仍在运行
     while (
-        Cs2Detector::IsCs2ProcessRunning()
+        LocalizationService::IsCs2Running()
     ) {
 
         int ret =
@@ -2000,9 +1931,7 @@ void MainWindow::onDebouncedHotReload() {
         }
     }
 
-    HWND hWnd = HammerIpc::FindIpcWindow();
-
-    if (!m_hammerService->isRunning() && !hWnd) {
+    if (!m_hammerService->isRunning() && !m_hammerService->isIpcAvailable()) {
         appendLog("[📝] 检测到程序目录词典保存更新（已就绪，将在 Hammer 运行时即刻生效）", "#8b949e");
         return;
     }

@@ -8,6 +8,7 @@
 #include <windows.h>
 
 #include "core/backup_manager.h"
+#include "core/cs2_detector.h"
 #include "core/dictionary_compiler.h"
 #include "core/dictionary_paths.h"
 #include "core/fgd_translator.h"
@@ -110,6 +111,14 @@ HammerService::LaunchResult HammerService::launch(const LaunchParams& params) {
 
 bool HammerService::sendToggleLanguage() {
     return HammerIpc::Send(HammerIpc::kMsgToggleLang);
+}
+
+bool HammerService::isIpcAvailable() const {
+    return HammerIpc::FindIpcWindow() != nullptr;
+}
+
+std::vector<std::wstring> HammerService::availableAddons(const std::wstring& cs2Root) {
+    return Cs2Detector::GetAvailableAddons(cs2Root);
 }
 
 HammerService::ReloadResult HammerService::reloadDictionaries(const std::wstring& cs2Root,

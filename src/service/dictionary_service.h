@@ -55,6 +55,12 @@ public:
                             const LogSink& log,
                             const DoneCallback& done);
 
+    // 首次运行时为 qt / fgd / override 三个词典生成带范例的模板文件。
+    // 返回本次新生成的文件所对应的提示信息；文件已存在时返回空列表。
+    // 原先这段逻辑直接写在 MainWindow 构造函数里，UI 层因此要知道每个词典
+    // 的模板由 FgdTranslator 的哪个函数生成，现在收口到本服务。
+    static QStringList ensureTemplates(const std::wstring& workingDir);
+
 private:
     // 一个在线词典的拉取结果
     struct OnlineDictionary {

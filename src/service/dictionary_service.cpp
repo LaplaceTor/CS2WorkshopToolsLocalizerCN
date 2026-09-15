@@ -10,6 +10,7 @@
 
 #include "core/dictionary_compiler.h"
 #include "core/dictionary_paths.h"
+#include "core/fgd_translator.h"
 #include "core/path_constants.h"
 
 namespace fs = std::filesystem;
@@ -70,6 +71,29 @@ qsizetype CountOverrideRules(const QJsonObject& obj) {
 DictionaryService::DictionaryService(QObject* parent)
     : QObject(parent)
     , m_networkManager(new QNetworkAccessManager(this)) {}
+
+QStringList DictionaryService::ensureTemplates(const std::wstring& workingDir) {
+    // 三个词典的模板生成函数签名一致，用表驱动避免三份复制粘贴
+    struct TemplateSpec {
+        const wchar_t* fileName;
+        bool (*ensure)(const std::wstring&, const std::wstring&, std::wstring&);
+    };
+
+    const TemplateSpec specs[] = {
+        { L"fgd_translations.jsonc", &FgdTranslator::EnsureFgdDictionaryExists },
+        { L"fgd_override.jsonc",     &FgdTranslator::EnsureFgdOverrideDictionaryExists },
+        { paths::kQtDictFile,        &FgdTranslator::EnsureQtDictionaryExists },
+    };
+
+    QStringList notices;
+    std::wstring notice;
+    for (const TemplateSpec& spec : specs) {
+        if (spec.ensure(ResolveDictionaryPath(workingDir, spec.fileName).wstring(), L"", notice)) {
+            notices << QString::fromStdWString(notice);
+        }
+    }
+    return notices;
+}
 
 void DictionaryService::updateDictionaries(const std::wstring& workingDir,
                                            const LogSink& log,
