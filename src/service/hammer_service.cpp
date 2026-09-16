@@ -9,9 +9,6 @@
 
 #include "core/backup_manager.h"
 #include "core/cs2_detector.h"
-#include "core/dictionary_compiler.h"
-#include "core/dictionary_paths.h"
-#include "core/fgd_translator.h"
 #include "core/hammer_ipc.h"
 #include "core/path_constants.h"
 
@@ -126,50 +123,18 @@ std::vector<std::wstring> HammerService::availableAddons(const std::wstring& cs2
     return Cs2Detector::GetAvailableAddons(cs2Root);
 }
 
-HammerService::ReloadResult HammerService::reloadDictionaries(const std::wstring& cs2Root,
-                                                              const std::wstring& workingDir,
-                                                              bool useMachineTrans) {
+HammerService::ReloadResult HammerService::reloadDictionaries(const std::wstring& /*cs2Root*/,
+                                                              const std::wstring& /*workingDir*/,
+                                                              bool /*useMachineTrans*/) {
     ReloadResult result;
 
-    // 1. 镜像同步与合并 qt_translations.jsonc 到游戏目录（保障本地 fallback 完整）
-    const fs::path srcQtJson     = ResolveDictionaryPath(workingDir, L"qt_translations.jsonc");
-    const fs::path srcQtFallback = ResolveDictionaryPath(workingDir, L"qt_fallback.jsonc");
-    const fs::path cs2Bin        = paths::Win64Bin(cs2Root);
-    const fs::path destQtJson     = cs2Bin / L"qt_translations.jsonc";
-    const fs::path destQtFallback = cs2Bin / L"qt_fallback.jsonc";
-
-    if (fs::exists(cs2Bin)) {
-        // 同步 fallback 字典到游戏目录备份（如果存在）
-        if (fs::exists(srcQtFallback)) {
-            try {
-                fs::copy_file(srcQtFallback, destQtFallback, fs::copy_options::overwrite_existing);
-            } catch (...) {}
-        }
-
-        // 优先合并主词典与机翻兜底词典部署到游戏目录
-        const std::wstring qtFallbackParam =
-            (useMachineTrans && fs::exists(srcQtFallback)) ? srcQtFallback.wstring() : L"";
-
-        bool merged = false;
-        if (!qtFallbackParam.empty() && fs::exists(srcQtJson)) {
-            std::wstring mergeErr;
-            merged = DictionaryCompiler::MergeJsonFiles(
-                srcQtJson.wstring(), qtFallbackParam, destQtJson.wstring(), mergeErr);
-        }
-
-        if (!merged && fs::exists(srcQtJson)) {
-            try {
-                fs::copy_file(srcQtJson, destQtJson, fs::copy_options::overwrite_existing);
-            } catch (...) {}
-        }
-    }
-
-    // 2. 纯内存模式：无需向磁盘重新写入 FGD 文件
-    // 注入模块收到 IPC 消息后，会自动在内存中预编译最新 FGD 并触发 Hammer 原生 Reload .FGD Files
+    // 纯内存模式：无需向 CS2 目录写入任何 JSON 词典或 FGD 文件
+    // 注入模块收到 IPC 消息后，会自动从启动器程序目录直读最新词典，
+    // 在内存中重载并预编译最新 FGD，最后触发 Hammer 原生 Reload .FGD Files 并重绘所有窗口
     result.fgdOk = true;
     result.fgdFileCount = 0;
 
-    // 3. 发送 IPC 消息给 Hammer
+    // 发送 IPC 消息给 Hammer 注入模块
     result.ipcOk = HammerIpc::Send(HammerIpc::kMsgReloadDict);
 
     return result;

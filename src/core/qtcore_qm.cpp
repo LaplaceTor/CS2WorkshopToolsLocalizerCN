@@ -488,9 +488,8 @@ static bool GetCallerModuleName(void* callerAddr, wchar_t* outBuf, size_t maxLen
 // ==============================================================================
 static void LoadMasterTranslations() {
     std::wstring binDir = GetBinDirectory();
-    std::wstring jsoncPath = binDir + L"qt_translations.jsonc";
+    std::wstring jsoncPath = L"";
     std::wstring fallbackPath = L"";
-    std::wstring sourceOrigin = L"local game directory";
     bool useMachineTrans = true;
 
     // 优先尝试从 localizer_appdir.txt 读取启动器程序目录与机翻兜底选项，实现程序目录直读
@@ -527,37 +526,31 @@ static void LoadMasterTranslations() {
         fclose(fpPointer);
     }
 
-    if (!appDir.empty()) {
-        std::wstring launcherJsonc = appDir + L"\\translations\\qt_translations.jsonc";
-        DWORD dwAttrib = GetFileAttributesW(launcherJsonc.c_str());
-        if (dwAttrib != INVALID_FILE_ATTRIBUTES && !(dwAttrib & FILE_ATTRIBUTE_DIRECTORY)) {
-            jsoncPath = launcherJsonc;
-            sourceOrigin = L"launcher program directory";
-        }
+    if (appDir.empty()) {
+        LogHook("[DICT] Error: Cannot find launcher appDir pointer from %ls", appDirPointerPath.c_str());
+        return;
     }
 
+    std::wstring launcherJsonc = appDir + L"\\translations\\qt_translations.jsonc";
+    DWORD dwAttrib = GetFileAttributesW(launcherJsonc.c_str());
+    if (dwAttrib == INVALID_FILE_ATTRIBUTES || (dwAttrib & FILE_ATTRIBUTE_DIRECTORY)) {
+        LogHook("[DICT] Error: Primary Qt dictionary not found at %ls", launcherJsonc.c_str());
+        return;
+    }
+    jsoncPath = launcherJsonc;
+
     if (useMachineTrans) {
-        // 查找 qt_fallback.jsonc 兜底词典（优先从启动器目录获取，其次从游戏目录回退）
-        if (!appDir.empty()) {
-            std::wstring launcherFallback = appDir + L"\\translations\\qt_fallback.jsonc";
-            DWORD dwAttrib = GetFileAttributesW(launcherFallback.c_str());
-            if (dwAttrib != INVALID_FILE_ATTRIBUTES && !(dwAttrib & FILE_ATTRIBUTE_DIRECTORY)) {
-                fallbackPath = launcherFallback;
-            }
-        }
-        if (fallbackPath.empty()) {
-            std::wstring localFallback = binDir + L"qt_fallback.jsonc";
-            DWORD dwAttrib = GetFileAttributesW(localFallback.c_str());
-            if (dwAttrib != INVALID_FILE_ATTRIBUTES && !(dwAttrib & FILE_ATTRIBUTE_DIRECTORY)) {
-                fallbackPath = localFallback;
-            }
+        std::wstring launcherFallback = appDir + L"\\translations\\qt_fallback.jsonc";
+        DWORD fbAttrib = GetFileAttributesW(launcherFallback.c_str());
+        if (fbAttrib != INVALID_FILE_ATTRIBUTES && !(fbAttrib & FILE_ATTRIBUTE_DIRECTORY)) {
+            fallbackPath = launcherFallback;
         }
     }
 
     std::wstring err;
     if (DictionaryCompiler::ParseJsoncFileToMaps(jsoncPath, g_CommonDict, g_ScopedDicts, err, fallbackPath)) {
-        LogHook("[DICT] Loaded JSONC dictionary from %ls (%ls, fallback: %ls): %zu common, %zu scoped modules",
-            sourceOrigin.c_str(), jsoncPath.c_str(), fallbackPath.empty() ? L"none" : fallbackPath.c_str(),
+        LogHook("[DICT] Loaded JSONC dictionary from %ls (fallback: %ls): %zu common, %zu scoped modules",
+            jsoncPath.c_str(), fallbackPath.empty() ? L"none" : fallbackPath.c_str(),
             g_CommonDict.size(), g_ScopedDicts.size());
     } else {
         LogHook("[DICT] Failed to load JSONC dictionary from %ls: %ls", jsoncPath.c_str(), err.c_str());
@@ -701,41 +694,40 @@ static void EnsureFgdDictLoaded() {
         fclose(fpPointer);
     }
 
-    std::wstring fgdDictPath = binDir + L"fgd_translations.jsonc";
-    std::wstring fgdOverridePath = binDir + L"fgd_override.jsonc";
-    std::wstring fgdFallbackPath = binDir + L"fgd_fallback.jsonc";
+    if (appDir.empty()) {
+        LogHook("[FGD] Error: Cannot find launcher appDir pointer for FGD dictionaries from %ls", appDirPointerPath.c_str());
+        return;
+    }
 
-    if (!appDir.empty()) {
-        std::wstring p1 = appDir + L"\\translations\\fgd_translations.jsonc";
-        if (GetFileAttributesW(p1.c_str()) != INVALID_FILE_ATTRIBUTES) fgdDictPath = p1;
-        std::wstring p2 = appDir + L"\\translations\\fgd_override.jsonc";
-        if (GetFileAttributesW(p2.c_str()) != INVALID_FILE_ATTRIBUTES) fgdOverridePath = p2;
-        if (useMachineTrans) {
-            std::wstring p3 = appDir + L"\\translations\\fgd_fallback.jsonc";
-            if (GetFileAttributesW(p3.c_str()) != INVALID_FILE_ATTRIBUTES) fgdFallbackPath = p3;
-        }
-    } else {
-        std::wstring p1 = binDir + L"translations\\fgd_translations.jsonc";
-        if (GetFileAttributesW(p1.c_str()) != INVALID_FILE_ATTRIBUTES) fgdDictPath = p1;
-        std::wstring p2 = binDir + L"translations\\fgd_override.jsonc";
-        if (GetFileAttributesW(p2.c_str()) != INVALID_FILE_ATTRIBUTES) fgdOverridePath = p2;
-        if (useMachineTrans) {
-            std::wstring p3 = binDir + L"translations\\fgd_fallback.jsonc";
-            if (GetFileAttributesW(p3.c_str()) != INVALID_FILE_ATTRIBUTES) fgdFallbackPath = p3;
+    std::wstring fgdDictPath = appDir + L"\\translations\\fgd_translations.jsonc";
+    std::wstring fgdOverridePath = appDir + L"\\translations\\fgd_override.jsonc";
+    std::wstring fgdFallbackPath = L"";
+
+    if (GetFileAttributesW(fgdDictPath.c_str()) == INVALID_FILE_ATTRIBUTES) {
+        LogHook("[FGD] Error: fgd_translations.jsonc not found at %ls", fgdDictPath.c_str());
+        fgdDictPath.clear();
+    }
+    if (GetFileAttributesW(fgdOverridePath.c_str()) == INVALID_FILE_ATTRIBUTES) {
+        fgdOverridePath.clear();
+    }
+    if (useMachineTrans) {
+        std::wstring pFallback = appDir + L"\\translations\\fgd_fallback.jsonc";
+        if (GetFileAttributesW(pFallback.c_str()) != INVALID_FILE_ATTRIBUTES) {
+            fgdFallbackPath = pFallback;
         }
     }
 
-    if (!useMachineTrans || GetFileAttributesW(fgdFallbackPath.c_str()) == INVALID_FILE_ATTRIBUTES) {
-        fgdFallbackPath = L"";
+    if (!fgdDictPath.empty()) {
+        std::unordered_map<std::wstring, std::unordered_map<std::string, std::string>> dummyScoped;
+        std::wstring err;
+        DictionaryCompiler::ParseJsoncFileToMaps(fgdDictPath, g_FgdDict, dummyScoped, err, fgdFallbackPath);
     }
-
-    std::unordered_map<std::wstring, std::unordered_map<std::string, std::string>> dummyScoped;
-    std::wstring err;
-    DictionaryCompiler::ParseJsoncFileToMaps(fgdDictPath, g_FgdDict, dummyScoped, err, fgdFallbackPath);
-    LoadFgdOverridePureCpp(fgdOverridePath, g_FgdOverrideData);
+    if (!fgdOverridePath.empty()) {
+        LoadFgdOverridePureCpp(fgdOverridePath, g_FgdOverrideData);
+    }
 
     LogHook("[FGD] Loaded %zu FGD translation keys (dict=%ls, fallback=%ls), %zu override keys",
-            g_FgdDict.size(), fgdDictPath.c_str(), fgdFallbackPath.c_str(),
+            g_FgdDict.size(), fgdDictPath.empty() ? L"none" : fgdDictPath.c_str(), fgdFallbackPath.empty() ? L"none" : fgdFallbackPath.c_str(),
             g_FgdOverrideData.globalProperties.size() + g_FgdOverrideData.ioOverrides.size() + g_FgdOverrideData.classDescriptions.size());
 
     g_bFgdDictLoaded.store(true, std::memory_order_release);

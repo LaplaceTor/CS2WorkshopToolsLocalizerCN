@@ -518,18 +518,10 @@ bool BackupManager::RestoreAll(const std::wstring& cs2Root, const std::wstring& 
         // 2. 清理临时部署的注入文件 (带重试机制)
         fs::path win64Bin = paths::Win64Bin(cs2Path);
         fs::path tempQmDll = win64Bin / paths::kInjectDll;
-        fs::path tempJsonc = win64Bin / paths::kQtDictFile;
         fs::path tempPointer = win64Bin / L"localizer_appdir.txt";
-        fs::path tempFgdDict = win64Bin / L"fgd_translations.jsonc";
-        fs::path tempFgdOver = win64Bin / L"fgd_override.jsonc";
-        fs::path tempFgdFall = win64Bin / L"fgd_fallback.jsonc";
 
         SafeRemoveFileWithRetry(tempQmDll, 15, 100);
-        SafeRemoveFileWithRetry(tempJsonc, 15, 100);
         SafeRemoveFileWithRetry(tempPointer, 15, 100);
-        SafeRemoveFileWithRetry(tempFgdDict, 15, 100);
-        SafeRemoveFileWithRetry(tempFgdOver, 15, 100);
-        SafeRemoveFileWithRetry(tempFgdFall, 15, 100);
 
         return true;
     } catch (const std::exception& e) {
@@ -542,8 +534,7 @@ bool BackupManager::IsPatchDeployed(const std::wstring& cs2Root) {
     try {
         fs::path win64Bin = paths::Win64Bin(cs2Root);
         fs::path qmDll = win64Bin / paths::kInjectDll;
-        fs::path qtJsonc = win64Bin / paths::kQtDictFile;
-        return fs::exists(qmDll) || fs::exists(qtJsonc);
+        return fs::exists(qmDll);
     } catch (...) {
         return false;
     }

@@ -8,7 +8,6 @@
 
 #include "core/backup_manager.h"
 #include "core/cs2_detector.h"
-#include "core/dictionary_compiler.h"
 #include "core/dictionary_paths.h"
 #include "core/fgd_translator.h"
 #include "core/path_constants.h"
@@ -236,9 +235,6 @@ bool LocalizationService::Inject(const Context& ctx, bool useMachineTrans, const
     );
 
     try {
-        fs::path destQtJson =
-            cs2Bin / paths::kQtDictFile;
-
         fs::path destQmDll =
             cs2Bin / L"qtcore_qm.dll";
 
@@ -270,42 +266,6 @@ bool LocalizationService::Inject(const Context& ctx, bool useMachineTrans, const
 
             Restore(ctx, false, log);
             return false;
-        }
-
-        std::wstring qtFallbackParam = (useMachineTrans && fs::exists(qtFallbackPath)) ? qtFallbackPath.wstring() : L"";
-
-        // 优先合并主词典与机翻兜底词典；合并失败或未启用机翻时直接部署主词典
-        bool qtJsonMerged = false;
-        if (!qtFallbackParam.empty()) {
-            std::wstring mergeErr;
-            qtJsonMerged = DictionaryCompiler::MergeJsonFiles(
-                    qtDictPath.wstring(),
-                    qtFallbackParam,
-                    destQtJson.wstring(),
-                    mergeErr);
-        }
-
-        if (!qtJsonMerged) {
-            if (!BackupManager::SafeCopyFileWithRetry(qtDictPath, destQtJson)) {
-                log(
-                    "[-] 部署 qt_translations.jsonc 失败 (目标被占用或无写权限)",
-                    "#f92672"
-                );
-
-                Restore(ctx, false, log);
-                return false;
-            }
-        }
-
-        // 部署 FGD 词典副本到游戏 bin 目录作为可靠本地兜底
-        if (fs::exists(fgdDictPath)) {
-            BackupManager::SafeCopyFileWithRetry(fgdDictPath, cs2Bin / L"fgd_translations.jsonc");
-        }
-        if (fs::exists(fgdOverridePath)) {
-            BackupManager::SafeCopyFileWithRetry(fgdOverridePath, cs2Bin / L"fgd_override.jsonc");
-        }
-        if (useMachineTrans && fs::exists(fgdFallbackPath)) {
-            BackupManager::SafeCopyFileWithRetry(fgdFallbackPath, cs2Bin / L"fgd_fallback.jsonc");
         }
 
         // 修补 Qt5Core.dll
