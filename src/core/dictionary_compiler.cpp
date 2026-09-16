@@ -1,10 +1,7 @@
-#include "dictionary_compiler.h"
-#ifndef NOMINMAX
-#define NOMINMAX
-#endif
-#include <windows.h>
+#include "core/dictionary_compiler.h"
+// 引入 UTF-8/UTF-16 转换工具（内部已带 NOMINMAX 与 windows.h，供 MoveFileExW 等使用）
+#include "core/encoding_util.h"
 #include <fstream>
-#include <sstream>
 #include <algorithm>
 #include <cstring>
 #include <filesystem>
@@ -302,9 +299,12 @@ private:
     }
 
     static std::wstring NormalizeSectionName(const std::string& name) {
-        std::wstring wname;
-        wname.reserve(name.size());
-        for (char c : name) wname.push_back(static_cast<wchar_t>(c));
+        // name 来自 JSONC，是 UTF-8。早期实现按字节 static_cast<wchar_t> 强转，
+        // 中文 section 名会被拆成一串乱码，导致词典永远查不中。
+        std::wstring wname = enc::Utf8ToWide(name);
+        if (wname.empty()) {
+            return {};
+        }
         std::transform(wname.begin(), wname.end(), wname.begin(), ::towlower);
         if (wname.length() > 4 && wname.substr(wname.length() - 4) == L".dll") {
             wname = wname.substr(0, wname.length() - 4);
@@ -341,6 +341,22 @@ bool DictionaryCompiler::ParseJsoncStringToMaps(
     // 2. 解析为分块字典结构
     SimpleJsonParser parser(cleanJson);
     if (!parser.Parse(outCommon, outScoped, outError)) {
+        return false;
+    }
+
+    // 3. 生效容量上限。这两个常量此前只是声明，从未被检查，
+    //    词典文件异常膨胀时会在注入进程里无上限吃内存。
+    if (outScoped.size() > MAX_TOTAL_SECTIONS) {
+        outError = L"作用域数量超出上限 (" + std::to_wstring(MAX_TOTAL_SECTIONS) + L")";
+        return false;
+    }
+
+    size_t totalEntries = outCommon.size();
+    for (const auto& scoped : outScoped) {
+        totalEntries += scoped.second.size();
+    }
+    if (totalEntries > MAX_TOTAL_ENTRIES) {
+        outError = L"词条总数超出上限 (" + std::to_wstring(MAX_TOTAL_ENTRIES) + L")";
         return false;
     }
 
@@ -428,80 +444,5 @@ bool DictionaryCompiler::ParseJsoncFileToMaps(
     }
 
     return (!outCommon.empty() || !outScoped.empty());
-}
-
-static std::string EscapeJsonStr(const std::string& str) {
-    std::string out;
-    out.reserve(str.size() + 16);
-    for (char c : str) {
-        if (c == '"') out += "\\\"";
-        else if (c == '\\') out += "\\\\";
-        else if (c == '\b') out += "\\b";
-        else if (c == '\f') out += "\\f";
-        else if (c == '\n') out += "\\n";
-        else if (c == '\r') out += "\\r";
-        else if (c == '\t') out += "\\t";
-        else out += c;
-    }
-    return out;
-}
-
-bool DictionaryCompiler::MergeJsonFiles(
-    const std::wstring& primaryJsonPath,
-    const std::wstring& fallbackJsonPath,
-    const std::wstring& outJsonPath,
-    std::wstring& outError
-) {
-    std::unordered_map<std::string, std::string> commonDict;
-    std::unordered_map<std::wstring, std::unordered_map<std::string, std::string>> scopedDicts;
-
-    if (!ParseJsoncFileToMaps(primaryJsonPath, commonDict, scopedDicts, outError, fallbackJsonPath)) {
-        outError = L"合并字典失败：未找到有效词条";
-        return false;
-    }
-
-    // 写入临时文件，成功后整体替换目标，避免中断产生半写文件
-    std::wstring tmpOutPath = outJsonPath + L".tmp";
-    FILE* outFp = _wfopen(tmpOutPath.c_str(), L"wb");
-    if (!outFp) {
-        outError = L"无法创建目标 JSONC 临时文件: " + tmpOutPath;
-        return false;
-    }
-
-    fputs("{\n", outFp);
-    bool first = true;
-    for (const auto& kv : commonDict) {
-        if (!first) fputs(",\n", outFp);
-        first = false;
-        std::string line = "  \"" + EscapeJsonStr(kv.first) + "\": \"" + EscapeJsonStr(kv.second) + "\"";
-        fputs(line.c_str(), outFp);
-    }
-
-    for (const auto& sc : scopedDicts) {
-        if (sc.second.empty()) continue;
-        if (!first) fputs(",\n", outFp);
-        first = false;
-        std::string secUtf8;
-        for (wchar_t wc : sc.first) secUtf8.push_back(static_cast<char>(wc));
-        std::string secHead = "  \"" + EscapeJsonStr(secUtf8) + "\": {\n";
-        fputs(secHead.c_str(), outFp);
-        bool secFirst = true;
-        for (const auto& kv : sc.second) {
-            if (!secFirst) fputs(",\n", outFp);
-            secFirst = false;
-            std::string subLine = "    \"" + EscapeJsonStr(kv.first) + "\": \"" + EscapeJsonStr(kv.second) + "\"";
-            fputs(subLine.c_str(), outFp);
-        }
-        fputs("\n  }", outFp);
-    }
-    fputs("\n}\n", outFp);
-    fclose(outFp);
-
-    if (!MoveFileExW(tmpOutPath.c_str(), outJsonPath.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
-        outError = L"提交合并词典文件失败: " + outJsonPath;
-        DeleteFileW(tmpOutPath.c_str());
-        return false;
-    }
-    return true;
 }
 

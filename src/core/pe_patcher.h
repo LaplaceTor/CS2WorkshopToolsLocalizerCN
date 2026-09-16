@@ -3,12 +3,17 @@
 #include <string>
 #include <cstdint>
 #include <optional>
+#include <algorithm>  // std::min（此前靠 .cpp 的间接包含才编译通过，单独包含本头文件会失败）
+
+#ifndef NOMINMAX
+#define NOMINMAX      // 阻止 windows.h 定义 min/max 宏，否则会顶掉 std::min
+#endif
 #include <windows.h>
 
 #pragma pack(push, 1)
 struct PatchHeader {
     char     magic[4];          // "LCLZ"
-    uint32_t version;           // 2
+    uint32_t version;           // 3 (无状态纯 EAT 重定向补丁，零 .data 污染)
     uint32_t originalEntryRva;  // 原始未修改的 EntryPoint RVA
     uint32_t origTrRva;         // 原始 QMetaObject::tr RVA
     uint32_t payloadSize;       // Header + Strings + Shellcode 总大小

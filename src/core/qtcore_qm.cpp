@@ -9,11 +9,18 @@
 #include <memory>
 #include <algorithm>
 #include <atomic>
+#include <functional>
 #include <stdio.h>
-#include "hook_manager.h"
-#include "pe_patcher.h"
-#include "dictionary_compiler.h"
+#include "core/hook_manager.h"
+#include "core/pe_patcher.h"
+#include "core/dictionary_compiler.h"
+#include "core/encoding_util.h"
+#include "core/fgd_core.h"
 #include "hde/hde64.h"
+#include <filesystem>
+#include <fstream>
+
+namespace fs = std::filesystem;
 
 #pragma intrinsic(_ReturnAddress)
 
@@ -27,6 +34,49 @@ typedef void* (__fastcall *fnQMetaObject_tr)(const void* pMetaObject, void* pOut
 typedef void* (__fastcall *fnQString_fromUtf8)(void* pOutQString, const char* utf8, int size);
 typedef const wchar_t* (__fastcall *fnQString_utf16)(const void* pQString);
 typedef void (__fastcall *fnQString_dtor)(void* pQString);
+
+// ==============================================================================
+// 1.1 Source 2 引擎文件系统与 CUtlBuffer 函数指针
+// ==============================================================================
+enum BufferSeekType_t {
+    SEEK_HEAD = 0,
+    SEEK_CURRENT = 1,
+    SEEK_TAIL = 2
+};
+
+typedef void (__fastcall *fnCUtlBuffer_EnsureCapacity)(void* pBuffer, int num);
+typedef void (__fastcall *fnCUtlBuffer_Put)(void* pBuffer, const void* pMem, int size);
+typedef void (__fastcall *fnCUtlBuffer_SeekPut)(void* pBuffer, int type, int offset);
+typedef void (__fastcall *fnCUtlBuffer_SeekGet)(void* pBuffer, int type, int offset);
+
+typedef bool (__fastcall *fnReadFileToBuffer)(
+    void* pThis,
+    const char* pFileName,
+    const char* pPathID,
+    void* pBuffer,
+    int maxBytes,
+    int startingOffset,
+    void* pfnAlloc
+);
+
+typedef void (__fastcall *fnQAction_activate)(void* pAction, int event);
+typedef void (__fastcall *fnQWidget_insertAction)(void* pWidget, void* pBefore, void* pAction);
+typedef void (__fastcall *fnQWidget_addAction)(void* pWidget, void* pAction);
+typedef void* (__fastcall *fnQWidget_find)(uint64_t wid);
+
+static fnCUtlBuffer_EnsureCapacity g_pfnCUtlBuffer_EnsureCapacity = nullptr;
+static fnCUtlBuffer_Put g_pfnCUtlBuffer_Put = nullptr;
+static fnCUtlBuffer_SeekPut g_pfnCUtlBuffer_SeekPut = nullptr;
+static fnCUtlBuffer_SeekGet g_pfnCUtlBuffer_SeekGet = nullptr;
+
+static fnReadFileToBuffer g_o_ReadFileToBuffer = nullptr;
+static std::atomic<bool> g_bFileSystemHooked{false};
+static std::atomic<bool> g_bFileSystemHookFailed{false};
+static bool TryHookTier0();
+
+static void* g_pReloadFgdAction = nullptr;
+static std::mutex g_ReloadActionMutex;
+static fnQAction_activate g_pfn_QAction_activate = nullptr;
 
 typedef void* (__fastcall *fnQAction_ctor)(void* pAction, const void* pQString, void* pParent);
 typedef void* (__fastcall *fnQAction_ctor_icon)(void* pAction, const void* pIcon, const void* pQString, void* pParent);
@@ -71,9 +121,18 @@ static fnQAction_setText g_o_QAction_setText = nullptr;
 static fnQAction_setToolTip g_o_QAction_setToolTip = nullptr;
 static fnQAction_setStatusTip g_o_QAction_setStatusTip = nullptr;
 static fnQAction_setWhatsThis g_o_QAction_setWhatsThis = nullptr;
+static fnQWidget_insertAction g_o_QWidget_insertAction = nullptr;
+static fnQWidget_addAction g_o_QWidget_addAction = nullptr;
+static fnQAction_activate g_o_QAction_activate = nullptr;
+static fnQWidget_find g_pfn_QWidget_find = nullptr;
 
 // 安全探测/更新标记：处于安全探测期间发生的异常属于预期的 SEH 捕获，VEH 绝对不应判定为崩溃或停用 Hook
 static std::atomic<bool> g_bInSafeProbe{false};
+
+struct SafeProbeScope {
+    SafeProbeScope() { g_bInSafeProbe.store(true, std::memory_order_relaxed); }
+    ~SafeProbeScope() { g_bInSafeProbe.store(false, std::memory_order_relaxed); }
+};
 
 static fnQAbstractButton_setText g_o_QAbstractButton_setText = nullptr;
 static fnQLabel_setText g_o_QLabel_setText = nullptr;
@@ -115,9 +174,11 @@ static std::atomic<bool> g_bTranslationEnabled{true};
 static std::unordered_map<std::string, std::string> g_CommonDict;
 static std::unordered_map<std::string, std::string> g_CommonCache;
 static std::unordered_map<std::string, std::string> g_CommonReverseDict;
+static std::unordered_map<std::string, std::string> g_CommonReverseCache;
 static std::unordered_map<std::wstring, std::unordered_map<std::string, std::string>> g_ScopedDicts;
 static std::unordered_map<std::wstring, std::unordered_map<std::string, std::string>> g_ScopedCaches;
 static std::unordered_map<std::wstring, std::unordered_map<std::string, std::string>> g_ScopedReverseDicts;
+static std::unordered_map<std::wstring, std::unordered_map<std::string, std::string>> g_ScopedReverseCaches;
 static std::mutex g_DictMutex;
 static std::once_flag g_dictInitFlag;
 static std::atomic<bool> g_bDictLoaded{false};
@@ -197,16 +258,13 @@ static bool IsVerboseLogEnabled() {
     return enabled;
 }
 
-static void LogHookV(const char* fmt, va_list args) {
-    if (!IsVerboseLogEnabled()) return; // 非 DEBUG 状态完全不创建/写 hook_runtime.log
-
+static void LogHookAlwaysV(const char* fmt, va_list args) {
     static std::mutex s_logMtx;
     std::lock_guard<std::mutex> lock(s_logMtx);
 
     std::wstring binDir = GetBinDirectory();
     std::wstring logPath = binDir + L"hook_runtime.log";
 
-    // DEBUG 模式下限制日志体积：每 256 次写入抽查一次，超过 8MB 轮转为 .old，避免无限增长
     static std::atomic<int> s_writeCount{0};
     if ((s_writeCount.fetch_add(1, std::memory_order_relaxed) & 0xFF) == 0) {
         WIN32_FILE_ATTRIBUTE_DATA fad;
@@ -231,17 +289,25 @@ static void LogHookV(const char* fmt, va_list args) {
     fclose(fp);
 }
 
+static void LogHookAlways(const char* fmt, ...) {
+    va_list args;
+    va_start(args, fmt);
+    LogHookAlwaysV(fmt, args);
+    va_end(args);
+}
+
 static void LogHook(const char* fmt, ...) {
     va_list args;
     va_start(args, fmt);
-    LogHookV(fmt, args);
+    LogHookAlwaysV(fmt, args);
     va_end(args);
 }
 
 static inline void LogVerboseTr(const char* fmt, ...) {
+    if (!IsVerboseLogEnabled()) return;
     va_list args;
     va_start(args, fmt);
-    LogHookV(fmt, args);
+    LogHookAlwaysV(fmt, args);
     va_end(args);
 }
 
@@ -378,6 +444,10 @@ static void ScanKnownToolModules() {
         L"engine2.dll",
         L"client.dll",
         L"server.dll",
+        L"rendersystemvulkan.dll",
+        L"rendersystemdx11.dll",
+        L"scenesystem.dll",
+        L"tier0.dll",
         L"qt5widgets.dll",
         L"qt5gui.dll",
         L"qt5core.dll"
@@ -418,9 +488,8 @@ static bool GetCallerModuleName(void* callerAddr, wchar_t* outBuf, size_t maxLen
 // ==============================================================================
 static void LoadMasterTranslations() {
     std::wstring binDir = GetBinDirectory();
-    std::wstring jsoncPath = binDir + L"qt_translations.jsonc";
+    std::wstring jsoncPath = L"";
     std::wstring fallbackPath = L"";
-    std::wstring sourceOrigin = L"local game directory";
     bool useMachineTrans = true;
 
     // 优先尝试从 localizer_appdir.txt 读取启动器程序目录与机翻兜底选项，实现程序目录直读
@@ -457,37 +526,31 @@ static void LoadMasterTranslations() {
         fclose(fpPointer);
     }
 
-    if (!appDir.empty()) {
-        std::wstring launcherJsonc = appDir + L"\\translations\\qt_translations.jsonc";
-        DWORD dwAttrib = GetFileAttributesW(launcherJsonc.c_str());
-        if (dwAttrib != INVALID_FILE_ATTRIBUTES && !(dwAttrib & FILE_ATTRIBUTE_DIRECTORY)) {
-            jsoncPath = launcherJsonc;
-            sourceOrigin = L"launcher program directory";
-        }
+    if (appDir.empty()) {
+        LogHook("[DICT] Error: Cannot find launcher appDir pointer from %ls", appDirPointerPath.c_str());
+        return;
     }
 
+    std::wstring launcherJsonc = appDir + L"\\translations\\qt_translations.jsonc";
+    DWORD dwAttrib = GetFileAttributesW(launcherJsonc.c_str());
+    if (dwAttrib == INVALID_FILE_ATTRIBUTES || (dwAttrib & FILE_ATTRIBUTE_DIRECTORY)) {
+        LogHook("[DICT] Error: Primary Qt dictionary not found at %ls", launcherJsonc.c_str());
+        return;
+    }
+    jsoncPath = launcherJsonc;
+
     if (useMachineTrans) {
-        // 查找 qt_fallback.jsonc 兜底词典（优先从启动器目录获取，其次从游戏目录回退）
-        if (!appDir.empty()) {
-            std::wstring launcherFallback = appDir + L"\\translations\\qt_fallback.jsonc";
-            DWORD dwAttrib = GetFileAttributesW(launcherFallback.c_str());
-            if (dwAttrib != INVALID_FILE_ATTRIBUTES && !(dwAttrib & FILE_ATTRIBUTE_DIRECTORY)) {
-                fallbackPath = launcherFallback;
-            }
-        }
-        if (fallbackPath.empty()) {
-            std::wstring localFallback = binDir + L"qt_fallback.jsonc";
-            DWORD dwAttrib = GetFileAttributesW(localFallback.c_str());
-            if (dwAttrib != INVALID_FILE_ATTRIBUTES && !(dwAttrib & FILE_ATTRIBUTE_DIRECTORY)) {
-                fallbackPath = localFallback;
-            }
+        std::wstring launcherFallback = appDir + L"\\translations\\qt_fallback.jsonc";
+        DWORD fbAttrib = GetFileAttributesW(launcherFallback.c_str());
+        if (fbAttrib != INVALID_FILE_ATTRIBUTES && !(fbAttrib & FILE_ATTRIBUTE_DIRECTORY)) {
+            fallbackPath = launcherFallback;
         }
     }
 
     std::wstring err;
     if (DictionaryCompiler::ParseJsoncFileToMaps(jsoncPath, g_CommonDict, g_ScopedDicts, err, fallbackPath)) {
-        LogHook("[DICT] Loaded JSONC dictionary from %ls (%ls, fallback: %ls): %zu common, %zu scoped modules",
-            sourceOrigin.c_str(), jsoncPath.c_str(), fallbackPath.empty() ? L"none" : fallbackPath.c_str(),
+        LogHook("[DICT] Loaded JSONC dictionary from %ls (fallback: %ls): %zu common, %zu scoped modules",
+            jsoncPath.c_str(), fallbackPath.empty() ? L"none" : fallbackPath.c_str(),
             g_CommonDict.size(), g_ScopedDicts.size());
     } else {
         LogHook("[DICT] Failed to load JSONC dictionary from %ls: %ls", jsoncPath.c_str(), err.c_str());
@@ -495,12 +558,14 @@ static void LoadMasterTranslations() {
 
     // 同步构建反向字典（用于一键切回英文与控件还原）
     g_CommonReverseDict.clear();
+    g_CommonReverseCache.clear();
     for (const auto& kv : g_CommonDict) {
         if (!kv.first.empty() && !kv.second.empty()) {
             g_CommonReverseDict[kv.second] = kv.first;
         }
     }
     g_ScopedReverseDicts.clear();
+    g_ScopedReverseCaches.clear();
     for (const auto& sec : g_ScopedDicts) {
         auto& revMap = g_ScopedReverseDicts[sec.first];
         for (const auto& kv : sec.second) {
@@ -521,6 +586,450 @@ static void EnsureDictionaryLoaded() {
         g_bDictLoaded.store(true, std::memory_order_release);
     });
 }
+
+// ==============================================================================
+// 2.1 运行时纯内存 FGD 预编译缓存与 VFileSystem017 挂钩
+// ==============================================================================
+
+static std::string NormalizeFgdKey(const std::string& path) {
+    if (path.empty()) return "";
+    std::string key = path;
+    for (char& c : key) {
+        if (c == '\\') c = '/';
+        c = (char)::tolower((unsigned char)c);
+    }
+    size_t lastSlash = key.find_last_of('/');
+    if (lastSlash != std::string::npos) {
+        return key.substr(lastSlash + 1);
+    }
+    return key;
+}
+
+static bool IsFgdPath(const char* pFileName) {
+    if (!pFileName) return false;
+    size_t len = strlen(pFileName);
+    if (len < 4) return false;
+    const char* ext = pFileName + len - 4;
+    return (_stricmp(ext, ".fgd") == 0);
+}
+
+static std::unordered_map<std::string, std::string> g_FgdMemoryCache;
+static std::mutex g_FgdCacheMutex;
+static std::atomic<bool> g_bFgdCacheLoaded{false};
+
+static std::unordered_map<std::string, std::string> g_FgdDict;
+static FgdOverrideData g_FgdOverrideData;
+static std::mutex g_FgdDictMutex;
+static std::atomic<bool> g_bFgdDictLoaded{false};
+
+static void LoadFgdOverridePureCpp(const std::wstring& path, FgdOverrideData& outOverride) {
+    outOverride = FgdOverrideData();
+    std::ifstream inFile(path, std::ios::binary);
+    if (!inFile.is_open()) return;
+    std::string rawData((std::istreambuf_iterator<char>(inFile)), std::istreambuf_iterator<char>());
+    inFile.close();
+
+    std::unordered_map<std::string, std::string> common;
+    std::unordered_map<std::wstring, std::unordered_map<std::string, std::string>> scoped;
+    std::wstring err;
+    if (!DictionaryCompiler::ParseJsoncStringToMaps(rawData, common, scoped, err)) {
+        return;
+    }
+
+    for (const auto& kv : common) {
+        outOverride.globalProperties[kv.first].description = kv.second;
+    }
+
+    auto itProps = scoped.find(L"properties");
+    if (itProps != scoped.end()) {
+        for (const auto& kv : itProps->second) {
+            outOverride.globalProperties[kv.first].description = kv.second;
+        }
+    }
+
+    auto itIo = scoped.find(L"io");
+    if (itIo != scoped.end()) {
+        for (const auto& kv : itIo->second) {
+            outOverride.ioOverrides[kv.first] = kv.second;
+        }
+    }
+
+    auto itClasses = scoped.find(L"classes");
+    if (itClasses != scoped.end()) {
+        for (const auto& kv : itClasses->second) {
+            outOverride.classDescriptions[kv.first] = kv.second;
+        }
+    }
+}
+
+static void EnsureFgdDictLoaded() {
+    if (g_bFgdDictLoaded.load(std::memory_order_acquire)) return;
+    std::lock_guard<std::mutex> lock(g_FgdDictMutex);
+    if (g_bFgdDictLoaded.load(std::memory_order_relaxed)) return;
+
+    std::wstring binDir = GetBinDirectory();
+    std::wstring appDir = L"";
+    bool useMachineTrans = true;
+
+    std::wstring appDirPointerPath = binDir + L"localizer_appdir.txt";
+    FILE* fpPointer = _wfopen(appDirPointerPath.c_str(), L"r, ccs=UTF-8");
+    if (!fpPointer) fpPointer = _wfopen(appDirPointerPath.c_str(), L"r");
+    if (fpPointer) {
+        wchar_t lineBuf[MAX_PATH] = {0};
+        if (fgetws(lineBuf, MAX_PATH, fpPointer)) {
+            size_t len = wcslen(lineBuf);
+            while (len > 0 && (lineBuf[len - 1] == L'\r' || lineBuf[len - 1] == L'\n' || lineBuf[len - 1] == L' ' || lineBuf[len - 1] == L'\t')) {
+                lineBuf[--len] = L'\0';
+            }
+            if (len > 0 && (lineBuf[len - 1] == L'\\' || lineBuf[len - 1] == L'/')) {
+                lineBuf[--len] = L'\0';
+            }
+            if (len > 0) appDir = lineBuf;
+        }
+        while (fgetws(lineBuf, MAX_PATH, fpPointer)) {
+            std::wstring opt = lineBuf;
+            if (opt.find(L"use_machine_trans=0") != std::wstring::npos) useMachineTrans = false;
+            else if (opt.find(L"use_machine_trans=1") != std::wstring::npos) useMachineTrans = true;
+        }
+        fclose(fpPointer);
+    }
+
+    if (appDir.empty()) {
+        LogHook("[FGD] Error: Cannot find launcher appDir pointer for FGD dictionaries from %ls", appDirPointerPath.c_str());
+        return;
+    }
+
+    std::wstring fgdDictPath = appDir + L"\\translations\\fgd_translations.jsonc";
+    std::wstring fgdOverridePath = appDir + L"\\translations\\fgd_override.jsonc";
+    std::wstring fgdFallbackPath = L"";
+
+    if (GetFileAttributesW(fgdDictPath.c_str()) == INVALID_FILE_ATTRIBUTES) {
+        LogHook("[FGD] Error: fgd_translations.jsonc not found at %ls", fgdDictPath.c_str());
+        fgdDictPath.clear();
+    }
+    if (GetFileAttributesW(fgdOverridePath.c_str()) == INVALID_FILE_ATTRIBUTES) {
+        fgdOverridePath.clear();
+    }
+    if (useMachineTrans) {
+        std::wstring pFallback = appDir + L"\\translations\\fgd_fallback.jsonc";
+        if (GetFileAttributesW(pFallback.c_str()) != INVALID_FILE_ATTRIBUTES) {
+            fgdFallbackPath = pFallback;
+        }
+    }
+
+    if (!fgdDictPath.empty()) {
+        std::unordered_map<std::wstring, std::unordered_map<std::string, std::string>> dummyScoped;
+        std::wstring err;
+        DictionaryCompiler::ParseJsoncFileToMaps(fgdDictPath, g_FgdDict, dummyScoped, err, fgdFallbackPath);
+    }
+    if (!fgdOverridePath.empty()) {
+        LoadFgdOverridePureCpp(fgdOverridePath, g_FgdOverrideData);
+    }
+
+    LogHook("[FGD] Loaded %zu FGD translation keys (dict=%ls, fallback=%ls), %zu override keys",
+            g_FgdDict.size(), fgdDictPath.empty() ? L"none" : fgdDictPath.c_str(), fgdFallbackPath.empty() ? L"none" : fgdFallbackPath.c_str(),
+            g_FgdOverrideData.globalProperties.size() + g_FgdOverrideData.ioOverrides.size() + g_FgdOverrideData.classDescriptions.size());
+
+    g_bFgdDictLoaded.store(true, std::memory_order_release);
+}
+
+static void PrecompileFgdBuffers() {
+    EnsureFgdDictLoaded();
+
+    std::wstring binDir = GetBinDirectory();
+    fs::path binPath(binDir);
+    fs::path gameRoot = binPath.parent_path().parent_path();
+
+    std::unordered_map<std::string, std::string> newCache;
+    size_t fileCount = 0;
+
+    std::vector<fs::path> targetDirs = {
+        gameRoot / "game" / "core",
+        gameRoot / "game" / "csgo",
+        gameRoot / "game" / "csgo_core"
+    };
+
+    for (const auto& dir : targetDirs) {
+        if (!fs::exists(dir)) continue;
+        try {
+            for (const auto& entry : fs::recursive_directory_iterator(dir)) {
+                if (entry.is_regular_file() && entry.path().extension() == ".fgd") {
+                    std::ifstream inFile(entry.path(), std::ios::binary);
+                    if (inFile.is_open()) {
+                        std::string rawContent((std::istreambuf_iterator<char>(inFile)), std::istreambuf_iterator<char>());
+                        inFile.close();
+
+                        std::string transContent;
+                        if (FgdCore::TranslateContent(rawContent, transContent, g_FgdDict, g_FgdOverrideData) && !transContent.empty()) {
+                            std::string filenameLower = entry.path().filename().string();
+                            std::transform(filenameLower.begin(), filenameLower.end(), filenameLower.begin(), ::tolower);
+                            newCache[filenameLower] = transContent;
+
+                            std::string relPath = fs::relative(entry.path(), gameRoot).string();
+                            for (char& c : relPath) {
+                                if (c == '\\') c = '/';
+                                c = (char)::tolower((unsigned char)c);
+                            }
+                            newCache[relPath] = transContent;
+                            fileCount++;
+                        }
+                    }
+                }
+            }
+        } catch (const std::exception& e) {
+            LogHook("[FGD] Exception scanning FGD directory: %s", e.what());
+        }
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(g_FgdCacheMutex);
+        g_FgdMemoryCache = std::move(newCache);
+        g_bFgdCacheLoaded.store(true, std::memory_order_release);
+    }
+    LogHook("[FGD] Precompiled %zu FGD files into in-memory cache", fileCount);
+}
+
+static bool SafeGetBufferMemory(void* pBuffer, char*& outPtr, int& outSize) {
+    if (!pBuffer) return false;
+    __try {
+        outPtr = (char*)((void**)pBuffer)[1];
+        outSize = *(int*)((uint8_t*)pBuffer + 0x14);
+        return (outPtr != nullptr && outSize > 0);
+    } __except(EXCEPTION_EXECUTE_HANDLER) {
+        outPtr = nullptr;
+        outSize = 0;
+        return false;
+    }
+}
+
+static bool __fastcall hk_ReadFileToBuffer(
+    void* pThis,
+    const char* pFileName,
+    const char* pPathID,
+    void* pBuffer,
+    int maxBytes,
+    int startingOffset,
+    void* pfnAlloc
+) {
+    bool bRet = g_o_ReadFileToBuffer(pThis, pFileName, pPathID, pBuffer, maxBytes, startingOffset, pfnAlloc);
+    if (!bRet || !pFileName || !pBuffer) return bRet;
+    if (!g_bTranslationEnabled.load(std::memory_order_relaxed)) return bRet;
+
+    if (!IsFgdPath(pFileName)) {
+        return bRet;
+    }
+
+    std::string normKey = NormalizeFgdKey(pFileName);
+    std::string transData;
+    bool found = false;
+
+    {
+        std::lock_guard<std::mutex> lock(g_FgdCacheMutex);
+        auto it = g_FgdMemoryCache.find(normKey);
+        if (it != g_FgdMemoryCache.end() && !it->second.empty()) {
+            transData = it->second;
+            found = true;
+        }
+    }
+
+    // JIT 即时兜底：如果缓存还未就绪（如 Hammer 刚启动立即读取），直接现场翻译！
+    if (!found) {
+        EnsureFgdDictLoaded();
+        char* pRawData = nullptr;
+        int rawSize = 0;
+        if (SafeGetBufferMemory(pBuffer, pRawData, rawSize) && pRawData && rawSize > 0) {
+            std::string rawContent(pRawData, static_cast<size_t>(rawSize));
+            std::string jitTrans;
+            if (FgdCore::TranslateContent(rawContent, jitTrans, g_FgdDict, g_FgdOverrideData) && !jitTrans.empty()) {
+                transData = std::move(jitTrans);
+                found = true;
+                std::lock_guard<std::mutex> lock(g_FgdCacheMutex);
+                g_FgdMemoryCache[normKey] = transData;
+                LogHook("[FGD] JIT translated '%s' (%d -> %zu bytes)", pFileName, rawSize, transData.size());
+            }
+        }
+    }
+
+    if (found && !transData.empty()) {
+        if (g_pfnCUtlBuffer_SeekPut && g_pfnCUtlBuffer_EnsureCapacity && g_pfnCUtlBuffer_Put && g_pfnCUtlBuffer_SeekGet) {
+            g_pfnCUtlBuffer_SeekPut(pBuffer, SEEK_HEAD, 0);
+            g_pfnCUtlBuffer_EnsureCapacity(pBuffer, static_cast<int>(transData.size()) + 2);
+            g_pfnCUtlBuffer_Put(pBuffer, transData.data(), static_cast<int>(transData.size()));
+            // 确保结尾有安全 null 字符
+            char* pMem = (char*)((void**)pBuffer)[1];
+            if (pMem) {
+                pMem[transData.size()] = '\0';
+            }
+            g_pfnCUtlBuffer_SeekGet(pBuffer, SEEK_HEAD, 0);
+
+            LogHook("[FGD] In-memory injected '%s' (%zu bytes) into CUtlBuffer at %p",
+                    pFileName, transData.size(), pBuffer);
+            return true;
+        }
+    }
+
+    return bRet;
+}
+
+static bool TryHookFileSystem() {
+    if (g_bFileSystemHooked.load(std::memory_order_relaxed)) return true;
+    if (g_bFileSystemHookFailed.load(std::memory_order_relaxed)) return false;
+
+    HMODULE hFileSystem = GetModuleHandleW(L"filesystem_stdio.dll");
+    if (!hFileSystem) {
+        hFileSystem = LoadLibraryW(L"filesystem_stdio.dll");
+    }
+    if (!hFileSystem) {
+        return false;
+    }
+
+    typedef void* (*CreateInterfaceFn)(const char* pName, int* pReturnCode);
+    CreateInterfaceFn pfnCreateInterface = (CreateInterfaceFn)GetProcAddress(hFileSystem, "CreateInterface");
+    if (!pfnCreateInterface) {
+        LogHook("[FGD] filesystem_stdio.dll has no CreateInterface export!");
+        return false;
+    }
+
+    void* pFileSystem = pfnCreateInterface("VFileSystem017", nullptr);
+    if (!pFileSystem) {
+        LogHook("[FGD] CreateInterface('VFileSystem017') returned null!");
+        return false;
+    }
+
+    void** vtable = *(void***)pFileSystem;
+    if (!vtable) {
+        LogHook("[FGD] VFileSystem017 has null vtable!");
+        return false;
+    }
+
+    void* pTargetReadFile = vtable[25];
+    if (!pTargetReadFile) {
+        LogHook("[FGD] vtable[25] is null!");
+        return false;
+    }
+
+    HMODULE hTier0 = GetModuleHandleW(L"tier0.dll");
+    if (!hTier0) {
+        hTier0 = LoadLibraryW(L"tier0.dll");
+    }
+    if (hTier0) {
+        g_pfnCUtlBuffer_EnsureCapacity = (fnCUtlBuffer_EnsureCapacity)GetProcAddress(hTier0, "?EnsureCapacity@CUtlBuffer@@QEAAXH@Z");
+        g_pfnCUtlBuffer_Put = (fnCUtlBuffer_Put)GetProcAddress(hTier0, "?Put@CUtlBuffer@@QEAAXPEBXH@Z");
+        g_pfnCUtlBuffer_SeekPut = (fnCUtlBuffer_SeekPut)GetProcAddress(hTier0, "?SeekPut@CUtlBuffer@@QEAAXW4SeekType_t@1@H@Z");
+        g_pfnCUtlBuffer_SeekGet = (fnCUtlBuffer_SeekGet)GetProcAddress(hTier0, "?SeekGet@CUtlBuffer@@QEAAXW4SeekType_t@1@H@Z");
+    }
+
+    if (!g_pfnCUtlBuffer_EnsureCapacity || !g_pfnCUtlBuffer_Put || !g_pfnCUtlBuffer_SeekPut || !g_pfnCUtlBuffer_SeekGet) {
+        LogHook("[FGD] Failed to resolve CUtlBuffer exports from tier0.dll!");
+        g_bFileSystemHookFailed.store(true, std::memory_order_release);
+        MessageBoxW(
+            NULL,
+            L"CS2 创意工坊工具汉化模块未能成功解析 tier0.dll 中的 CUtlBuffer 接口。\n\n"
+            L"FGD 实体汉化可能无法在内存中完全生效，请检查游戏是否发生更新。",
+            L"CS2 Workshop Tools Localizer - 警告",
+            MB_ICONWARNING | MB_OK
+        );
+        return false;
+    }
+
+    bool ok = HookManager::Instance().InstallHook(
+        pTargetReadFile,
+        (void*)hk_ReadFileToBuffer,
+        (void**)&g_o_ReadFileToBuffer,
+        "VFileSystem017::ReadFileToBuffer"
+    );
+
+    if (ok) {
+        g_bFileSystemHooked.store(true, std::memory_order_release);
+        LogHook("[FGD] Successfully hooked VFileSystem017::ReadFileToBuffer at %p", pTargetReadFile);
+    } else {
+        g_bFileSystemHookFailed.store(true, std::memory_order_release);
+        LogHook("[FGD] Failed to hook VFileSystem017::ReadFileToBuffer at %p!", pTargetReadFile);
+        MessageBoxW(
+            NULL,
+            L"CS2 创意工坊工具汉化模块未能成功挂钩 VFileSystem017::ReadFileToBuffer。\n\n"
+            L"原因：当前游戏版本的文件系统接口特征可能发生了变动。\n"
+            L"FGD 实体汉化将临时降级为原版英文显示，建议检查启动器是否有新版本更新。",
+            L"CS2 Workshop Tools Localizer - 警告",
+            MB_ICONWARNING | MB_OK
+        );
+    }
+    TryHookTier0();
+    return ok;
+}
+
+// 2.2 Tier0 字符串比较兼容兜底 (防止 Hammer 实体分类比较中英不匹配)
+typedef int (__fastcall *fnV_stricmp_fast)(const char* s1, const char* s2);
+static fnV_stricmp_fast g_o_V_stricmp_fast = nullptr;
+static std::atomic<bool> g_bTier0Hooked{false};
+
+static int __fastcall hk_V_stricmp_fast(const char* s1, const char* s2) {
+    if (!s1 || !s2) {
+        if (g_o_V_stricmp_fast) return g_o_V_stricmp_fast(s1, s2);
+        return (s1 == s2) ? 0 : (s1 ? 1 : -1);
+    }
+
+    int res = g_o_V_stricmp_fast ? g_o_V_stricmp_fast(s1, s2) : _stricmp(s1, s2);
+    if (res == 0) return 0;
+
+    // 针对 Hammer 实体工具分类比对的兼容兜底：
+    // 当原版字符串不相等时，若调用方来自 hammer.dll，检查是否存在中英文互译映射
+    void* caller = _ReturnAddress();
+    wchar_t stem[64] = {0};
+    if (GetCallerModuleName(caller, stem, 64) && _wcsicmp(stem, L"hammer") == 0) {
+        std::lock_guard<std::mutex> lock(g_DictMutex);
+
+        // 1. s1 是英文，s2 是中文
+        auto it1 = g_CommonDict.find(s1);
+        if (it1 != g_CommonDict.end() && it1->second == s2) return 0;
+
+        // 2. s2 是英文，s1 是中文
+        auto it2 = g_CommonDict.find(s2);
+        if (it2 != g_CommonDict.end() && it2->second == s1) return 0;
+
+        // 3. 反向字典查找
+        auto itRev1 = g_CommonReverseDict.find(s1);
+        if (itRev1 != g_CommonReverseDict.end() && _stricmp(itRev1->second.c_str(), s2) == 0) return 0;
+
+        auto itRev2 = g_CommonReverseDict.find(s2);
+        if (itRev2 != g_CommonReverseDict.end() && _stricmp(itRev2->second.c_str(), s1) == 0) return 0;
+
+        // 4. FGD 字典查找
+        auto itFgd1 = g_FgdDict.find(s1);
+        if (itFgd1 != g_FgdDict.end() && itFgd1->second == s2) return 0;
+
+        auto itFgd2 = g_FgdDict.find(s2);
+        if (itFgd2 != g_FgdDict.end() && itFgd2->second == s1) return 0;
+    }
+
+    return res;
+}
+
+static bool TryHookTier0() {
+    if (g_bTier0Hooked.load(std::memory_order_relaxed)) return true;
+
+    HMODULE hTier0 = GetModuleHandleW(L"tier0.dll");
+    if (!hTier0) {
+        hTier0 = LoadLibraryW(L"tier0.dll");
+    }
+    if (!hTier0) return false;
+
+    void* pVStricmpFast = (void*)GetProcAddress(hTier0, "V_stricmp_fast");
+    if (pVStricmpFast) {
+        if (HookManager::Instance().InstallHook(
+            pVStricmpFast,
+            (void*)hk_V_stricmp_fast,
+            (void**)&g_o_V_stricmp_fast,
+            "tier0::V_stricmp_fast"
+        )) {
+            g_bTier0Hooked.store(true, std::memory_order_release);
+            LogHook("[HOOK] Successfully hooked tier0!V_stricmp_fast at %p", pVStricmpFast);
+            return true;
+        }
+    }
+    return false;
+}
+
 
 // ==============================================================================
 // 3. 递归智能拆分与快捷键/后缀匹配算法
@@ -1039,18 +1548,12 @@ static bool FindTranslationScoped(void* callerAddr, const char* text, std::strin
     return false;
 }
 
+// 堆分配版 UTF-16 -> UTF-8，委托给全项目统一的 enc::WideToUtf8。
+// 注意：调用方在它之前还有一条栈缓冲快路径（char utf8Stack[1024]），
+// 那是钩子热路径上刻意做的免分配优化，不要一并替换掉。
 static std::string WStringToUtf8(const wchar_t* wstr) {
     if (!wstr || !*wstr) return "";
-    int sizeNeeded = WideCharToMultiByte(CP_UTF8, 0, wstr, -1, NULL, 0, NULL, NULL);
-    if (sizeNeeded <= 1) return "";
-    std::string str(static_cast<size_t>(sizeNeeded), '\0');
-    int written = WideCharToMultiByte(CP_UTF8, 0, wstr, -1, str.data(), sizeNeeded, NULL, NULL);
-    if (written > 0) {
-        str.resize(static_cast<size_t>(written - 1));
-    } else {
-        str.clear();
-    }
-    return str;
+    return enc::WideToUtf8(wstr);
 }
 
 static bool FindTranslationScopedW(void* callerAddr, const wchar_t* wstr, std::string& outResult, TranslationSource source = TranslationSource::StaticUI) {
@@ -1124,24 +1627,132 @@ static bool FindReverseTranslationScoped(void* callerAddr, const char* text, std
     bool hasCaller = (callerAddr != nullptr && GetCallerModuleName(callerAddr, callerStemBuf, 64));
     std::wstring callerStem = hasCaller ? callerStemBuf : L"";
 
+    // 辅助 lambda：静态精确全词匹配与基础修剪、快捷键剥离、标点还原与反向哈希缓存
+    auto tryDirectScopedReverse = [&](const std::unordered_map<std::string, std::string>& revDict,
+                                      std::unordered_map<std::string, std::string>& revCache) -> bool {
+        // 1. 缓存快速短路命中
+        auto itCache = revCache.find(textStr);
+        if (itCache != revCache.end()) {
+            outResult = itCache->second;
+            return true;
+        }
+
+        // 2. 精确全字匹配
+        auto itDirect = revDict.find(textStr);
+        if (itDirect != revDict.end()) {
+            outResult = itDirect->second;
+            revCache[textStr] = outResult;
+            return true;
+        }
+
+        // 3. 去除前后空白匹配（如 " 使用实体报告搜索 " -> "使用实体报告搜索"）
+        size_t first = textStr.find_first_not_of(" \t\r\n");
+        if (first != std::string::npos) {
+            size_t last = textStr.find_last_not_of(" \t\r\n");
+            std::string prefixPad = textStr.substr(0, first);
+            std::string suffixPad = textStr.substr(last + 1);
+            std::string trimmed = textStr.substr(first, last - first + 1);
+
+            // 3.1 去除首尾空白后直接查
+            auto itTrimmed = revDict.find(trimmed);
+            if (itTrimmed != revDict.end()) {
+                outResult = prefixPad + itTrimmed->second + suffixPad;
+                revCache[textStr] = outResult;
+                return true;
+            }
+
+            // 3.2 剥离加速键 '&' 匹配 (如 "&保存" -> "保存")
+            if (trimmed.find('&') != std::string::npos) {
+                std::string stripped;
+                stripped.reserve(trimmed.length());
+                for (char c : trimmed) {
+                    if (c != '&') stripped.push_back(c);
+                }
+                auto itStrip = revDict.find(stripped);
+                if (itStrip != revDict.end()) {
+                    outResult = prefixPad + itStrip->second + suffixPad;
+                    revCache[textStr] = outResult;
+                    return true;
+                }
+            }
+
+            // 3.3 剥离尾部快捷键括号，例如 "保存(&S)" 或 "保存(S)"
+            size_t tLen = trimmed.length();
+            if (tLen >= 4 && trimmed.back() == ')') {
+                if (trimmed[tLen - 4] == '(' && trimmed[tLen - 3] == '&' &&
+                    isalnum(static_cast<unsigned char>(trimmed[tLen - 2]))) {
+                    std::string base = trimmed.substr(0, tLen - 4);
+                    size_t bLast = base.find_last_not_of(" \t");
+                    if (bLast != std::string::npos) base = base.substr(0, bLast + 1);
+                    auto itBase = revDict.find(base);
+                    if (itBase != revDict.end()) {
+                        outResult = prefixPad + itBase->second + suffixPad;
+                        revCache[textStr] = outResult;
+                        return true;
+                    }
+                } else if (tLen >= 3 && trimmed[tLen - 3] == '(' &&
+                           isalnum(static_cast<unsigned char>(trimmed[tLen - 2]))) {
+                    std::string base = trimmed.substr(0, tLen - 3);
+                    size_t bLast = base.find_last_not_of(" \t");
+                    if (bLast != std::string::npos) base = base.substr(0, bLast + 1);
+                    auto itBase = revDict.find(base);
+                    if (itBase != revDict.end()) {
+                        outResult = prefixPad + itBase->second + suffixPad;
+                        revCache[textStr] = outResult;
+                        return true;
+                    }
+                }
+            }
+
+            // 3.4 中英文省略号与冒号互转适配（"…" <=> "...", "：" <=> ":"）
+            // UTF-8: "…" 为 \xE2\x80\xA6, "：" 为 \xEF\xBC\x9A
+            static const std::string kCnEllipsis = "\xE2\x80\xA6";
+            static const std::string kEnEllipsis = "...";
+            static const std::string kCnColon = "\xEF\xBC\x9A";
+            static const std::string kEnColon = ":";
+
+            auto tryReplaceAndFind = [&](const std::string& from, const std::string& to) -> bool {
+                if (trimmed.find(from) == std::string::npos) return false;
+                std::string rep = trimmed;
+                size_t p = 0;
+                while ((p = rep.find(from, p)) != std::string::npos) {
+                    rep.replace(p, from.length(), to);
+                    p += to.length();
+                }
+                auto itRep = revDict.find(rep);
+                if (itRep != revDict.end()) {
+                    outResult = prefixPad + itRep->second + suffixPad;
+                    revCache[textStr] = outResult;
+                    return true;
+                }
+                return false;
+            };
+
+            if (tryReplaceAndFind(kCnEllipsis, kEnEllipsis)) return true;
+            if (tryReplaceAndFind(kEnEllipsis, kCnEllipsis)) return true;
+            if (tryReplaceAndFind(kCnColon, kEnColon)) return true;
+            if (tryReplaceAndFind(kEnColon, kCnColon)) return true;
+        }
+
+        return false;
+    };
+
     std::lock_guard<std::mutex> lock(g_DictMutex);
 
     // 1. 优先在 Caller 对应的 Scoped 反向字典中查找
     if (hasCaller) {
         auto itSec = g_ScopedReverseDicts.find(callerStem);
         if (itSec != g_ScopedReverseDicts.end()) {
-            auto it = itSec->second.find(textStr);
-            if (it != itSec->second.end()) {
-                outResult = it->second;
+            auto& secCache = g_ScopedReverseCaches[callerStem];
+            if (tryDirectScopedReverse(itSec->second, secCache)) {
                 return true;
             }
         }
         if (callerStem != L"hammer") {
             auto itHammer = g_ScopedReverseDicts.find(L"hammer");
             if (itHammer != g_ScopedReverseDicts.end()) {
-                auto it = itHammer->second.find(textStr);
-                if (it != itHammer->second.end()) {
-                    outResult = it->second;
+                auto& hammerCache = g_ScopedReverseCaches[L"hammer"];
+                if (tryDirectScopedReverse(itHammer->second, hammerCache)) {
                     return true;
                 }
             }
@@ -1149,10 +1760,10 @@ static bool FindReverseTranslationScoped(void* callerAddr, const char* text, std
     }
 
     // 2. 在公共反向字典中查找
-    auto itCommon = g_CommonReverseDict.find(textStr);
-    if (itCommon != g_CommonReverseDict.end()) {
-        outResult = itCommon->second;
-        return true;
+    if (!g_CommonReverseDict.empty()) {
+        if (tryDirectScopedReverse(g_CommonReverseDict, g_CommonReverseCache)) {
+            return true;
+        }
     }
 
     return false;
@@ -1182,11 +1793,172 @@ static bool FindReverseTranslationScopedW(void* callerAddr, const wchar_t* wstr,
     return false;
 }
 
+static inline bool SafeProbeActionCmdId(void* pAction, uint32_t& outCmdId) {
+    if (!pAction || (uintptr_t)pAction < 0x10000) return false;
+    __try {
+        outCmdId = *(uint32_t*)((char*)pAction + 0x20);
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+}
+
+static void CheckAndCacheReloadActionPtr(void* pAction) {
+    if (!pAction || (uintptr_t)pAction < 0x10000) return;
+    if (g_pReloadFgdAction) return;
+
+    SafeProbeScope probeScope;
+    uint32_t cmdId = 0;
+    if (!SafeProbeActionCmdId(pAction, cmdId)) return;
+
+    // Hammer 为 'Reload .FGD Files' 专属分配的内部 CommandID (0x49285562)
+    if (cmdId == 0x49285562) {
+        std::lock_guard<std::mutex> lock(g_ReloadActionMutex);
+        if (g_pReloadFgdAction != pAction) {
+            g_pReloadFgdAction = pAction;
+            LogHook("[FGD] Cached 'Reload .FGD Files' QAction pointer via CommandID 0x49285562: %p", pAction);
+        }
+    }
+}
+
+static inline bool SafeGetWidgetActions(void* pWidget, void**& outItems, int& outCount) {
+    if (!pWidget || (uintptr_t)pWidget < 0x10000) return false;
+    __try {
+        void* d_ptr = *(void**)((char*)pWidget + 8);
+        if (!d_ptr || (uintptr_t)d_ptr < 0x10000) return false;
+        void* listData = *(void**)((char*)d_ptr + 0x190);
+        if (!listData || (uintptr_t)listData < 0x10000) return false;
+        int begin = *(int*)((char*)listData + 8);
+        int end = *(int*)((char*)listData + 12);
+        if (begin >= 0 && end > begin && (end - begin) < 5000) {
+            outItems = (void**)((char*)listData + 16) + begin;
+            outCount = end - begin;
+            return true;
+        }
+        return false;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+}
+
+static inline void* SafeFindWidget(fnQWidget_find pfn, uint64_t wid) {
+    if (!pfn || !wid) return nullptr;
+    __try {
+        return pfn(wid);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return nullptr;
+    }
+}
+
+static inline bool SafeActivateAction(fnQAction_activate pfnActivate, void* pAction) {
+    if (!pfnActivate || !pAction) return false;
+    __try {
+        pfnActivate(pAction, 0);
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+}
+
+static void ScanWindowTreeForReloadAction() {
+    if (g_pReloadFgdAction) return;
+    HMODULE hQtWidgets = GetModuleHandleW(L"Qt5Widgets.dll");
+    if (!hQtWidgets) return;
+    if (!g_pfn_QWidget_find) {
+        g_pfn_QWidget_find = (fnQWidget_find)GetProcAddress(hQtWidgets, "?find@QWidget@@SAPEAV1@_K@Z");
+    }
+    if (!g_pfn_QWidget_find) return;
+
+    SafeProbeScope probeScope;
+
+    EnumWindows([](HWND hwnd, LPARAM lParam) -> BOOL {
+        if (g_pReloadFgdAction) return FALSE;
+        DWORD pid = 0;
+        GetWindowThreadProcessId(hwnd, &pid);
+        if (pid != GetCurrentProcessId()) return TRUE;
+
+        auto InspectWidget = [](void* pWidget) {
+            if (!pWidget || g_pReloadFgdAction) return;
+            void** items = nullptr;
+            int count = 0;
+            if (SafeGetWidgetActions(pWidget, items, count) && items && count > 0) {
+                for (int i = 0; i < count; ++i) {
+                    void* pAction = items[i];
+                    if (pAction) {
+                        CheckAndCacheReloadActionPtr(pAction);
+                        if (g_pReloadFgdAction) return;
+                    }
+                }
+            }
+        };
+
+        void* pTop = SafeFindWidget(g_pfn_QWidget_find, (uint64_t)hwnd);
+        if (pTop) {
+            InspectWidget(pTop);
+        }
+
+        EnumChildWindows(hwnd, [](HWND childHwnd, LPARAM) -> BOOL {
+            if (g_pReloadFgdAction) return FALSE;
+            void* pChild = SafeFindWidget(g_pfn_QWidget_find, (uint64_t)childHwnd);
+            if (pChild) {
+                void** items = nullptr;
+                int count = 0;
+                if (SafeGetWidgetActions(pChild, items, count) && items && count > 0) {
+                    for (int i = 0; i < count; ++i) {
+                        void* pAction = items[i];
+                        if (pAction) {
+                            CheckAndCacheReloadActionPtr(pAction);
+                            if (g_pReloadFgdAction) return FALSE;
+                        }
+                    }
+                }
+            }
+            return TRUE;
+        }, 0);
+
+        return TRUE;
+    }, 0);
+}
+
+static void TriggerReloadFgdAction() {
+    void* pAction = nullptr;
+    {
+        std::lock_guard<std::mutex> lock(g_ReloadActionMutex);
+        pAction = g_pReloadFgdAction;
+    }
+    if (!pAction) {
+        ScanWindowTreeForReloadAction();
+        std::lock_guard<std::mutex> lock(g_ReloadActionMutex);
+        pAction = g_pReloadFgdAction;
+    }
+    if (pAction) {
+        HMODULE hQtWidgets = GetModuleHandleW(L"Qt5Widgets.dll");
+        if (hQtWidgets && !g_pfn_QAction_activate) {
+            g_pfn_QAction_activate = (fnQAction_activate)GetProcAddress(hQtWidgets, "?activate@QAction@@QEAAXW4ActionEvent@1@@Z");
+        }
+        fnQAction_activate pfnActivate = g_o_QAction_activate ? g_o_QAction_activate : g_pfn_QAction_activate;
+        if (pfnActivate) {
+            LogHook("[FGD] Automatically triggering QAction 'Reload .FGD Files' at %p", pAction);
+            SafeProbeScope probeScope;
+            if (SafeActivateAction(pfnActivate, pAction)) {
+                LogHook("[FGD] Successfully triggered 'Reload .FGD Files' QAction");
+            } else {
+                LogHook("[FGD] Exception caught while activating 'Reload .FGD Files' QAction");
+            }
+        }
+    } else {
+        LogHook("[FGD] Reload .FGD Files action not cached yet");
+    }
+}
+
 static void ToggleLanguage() {
     bool current = g_bTranslationEnabled.load(std::memory_order_acquire);
     bool next = !current;
     g_bTranslationEnabled.store(next, std::memory_order_release);
     LogHook("[LANG] Translation toggled: %s", next ? "ENABLED (Chinese)" : "DISABLED (English)");
+
+    // 自动触发 Hammer 原生 'Reload .FGD Files'，重读实体定义（中英双向即刻生效）
+    TriggerReloadFgdAction();
 
     // 广播重绘所有 CS2/Hammer 窗口，触发 QPainter 毫秒级双向无伤重绘，0 跨线程调用，0 堆踩踏风险
     EnumWindows([](HWND hwnd, LPARAM lParam) -> BOOL {
@@ -1208,9 +1980,17 @@ static void ReloadTranslations() {
         g_ScopedDicts.clear();
         g_ScopedCaches.clear();
         g_CommonReverseDict.clear();
+        g_CommonReverseCache.clear();
         g_ScopedReverseDicts.clear();
+        g_ScopedReverseCaches.clear();
         LoadMasterTranslations();
     }
+
+    // 重新预编译所有 FGD 内存缓存
+    PrecompileFgdBuffers();
+
+    // 自动触发 Hammer 原生 'Reload .FGD Files'
+    TriggerReloadFgdAction();
 
     // 广播重绘所有 CS2/Hammer 窗口，使最新词典即刻渲染
     EnumWindows([](HWND hwnd, LPARAM lParam) -> BOOL {
@@ -1222,7 +2002,7 @@ static void ReloadTranslations() {
         return TRUE;
     }, 0);
 
-    LogHook("[RELOAD] Translations reloaded successfully");
+    LogHook("[RELOAD] Translations and FGD buffers reloaded successfully");
 }
 
 extern "C" __declspec(dllexport) bool InitializeTranslator();
@@ -1255,676 +2035,310 @@ extern "C" __declspec(dllexport) void* __fastcall tr(const void* pMetaObject, vo
     return hk_QMetaObject_tr(pMetaObject, pOutQString, sourceText, disambiguation, n);
 }
 
-// 2. QPainter::drawText (全面覆盖 PropertyEditor 属性面板与树形表格渲染，支持双向即时无损渲染)
-static void __fastcall hk_QPainter_drawText_Rect(void* pPainter, const void* pRect, int flags, const void* pQString, void* pBoundingRect) {
-    void* caller = _ReturnAddress();
+// =============================================================================
+// 3.5 通用转发钩子
+// -----------------------------------------------------------------------------
+// 下面 29 个 hk_* 钩子此前是 29 份几乎逐行相同的代码：取返回地址 → 读 QString 原文
+// → 查作用域词典 → 命中则构造译文 QString 并调用原始函数 → 否则用原文调用。
+// 现在这段流程只实现一次，每个钩子只保留自己的签名与调用实参。
+//
+// 【重要】caller 必须由钩子函数用 _ReturnAddress() 取得后传入，不能在辅助函数内部取：
+// 作用域词典靠调用方地址定位所属模块，若在辅助函数里取，得到的永远是本 DLL 的地址，
+// 所有模块作用域判定会全部失效（表现为所有 scoped 词条都不生效，且不报任何错）。
+// =============================================================================
+
+// 读取 pQString 的原文并查词典，然后用译文（未命中则用原文）调用 forward。
+// forward 恰好被调用一次；是否判空、如何处理返回值由各钩子自己决定。
+template <typename Forward>
+__forceinline static void ForwardTranslatedQString(void* caller, const void* pQString,
+                                     TranslationSource source, Forward&& forward) {
     const wchar_t* wstr = nullptr;
     if (SafeGetUtf16(g_pfn_utf16, pQString, wstr)) {
         std::string trans;
         bool found = false;
         if (g_bTranslationEnabled.load(std::memory_order_relaxed)) {
-            found = FindTranslationScopedW(caller, wstr, trans, TranslationSource::Painter);
+            found = FindTranslationScopedW(caller, wstr, trans, source);
         } else {
             found = FindReverseTranslationScopedW(caller, wstr, trans);
         }
         if (found) {
             void* qstr[1] = {0};
-            if (SafeCreateQString(g_pfn_fromUtf8, qstr, trans.c_str(), (int)trans.length())) {
-                if (g_o_QPainter_drawText_Rect) g_o_QPainter_drawText_Rect(pPainter, pRect, flags, qstr, pBoundingRect);
+            if (SafeCreateQString(g_pfn_fromUtf8, qstr, trans.c_str(), static_cast<int>(trans.length()))) {
+                forward(qstr);
                 SafeDestroyQString(g_pfn_QString_dtor, qstr);
                 return;
             }
         }
     }
-    if (g_o_QPainter_drawText_Rect) g_o_QPainter_drawText_Rect(pPainter, pRect, flags, pQString, pBoundingRect);
+    forward(pQString);
+}
+
+// 2. QPainter::drawText 系列
+//    全面覆盖 PropertyEditor 属性面板与树形表格渲染，支持双向即时无损渲染
+
+static void __fastcall hk_QPainter_drawText_Rect(void* pPainter, const void* pRect, int flags, const void* pQString, void* pBoundingRect) {
+    void* caller = _ReturnAddress();
+    ForwardTranslatedQString(caller, pQString, TranslationSource::Painter, [&](const void* text) {
+        if (g_o_QPainter_drawText_Rect) g_o_QPainter_drawText_Rect(pPainter, pRect, flags, text, pBoundingRect);
+    });
 }
 
 static void __fastcall hk_QPainter_drawText_RectF(void* pPainter, const void* pRectF, int flags, const void* pQString, void* pBoundingRect) {
     void* caller = _ReturnAddress();
-    const wchar_t* wstr = nullptr;
-    if (SafeGetUtf16(g_pfn_utf16, pQString, wstr)) {
-        std::string trans;
-        bool found = false;
-        if (g_bTranslationEnabled.load(std::memory_order_relaxed)) {
-            found = FindTranslationScopedW(caller, wstr, trans, TranslationSource::Painter);
-        } else {
-            found = FindReverseTranslationScopedW(caller, wstr, trans);
-        }
-        if (found) {
-            void* qstr[1] = {0};
-            if (SafeCreateQString(g_pfn_fromUtf8, qstr, trans.c_str(), (int)trans.length())) {
-                if (g_o_QPainter_drawText_RectF) g_o_QPainter_drawText_RectF(pPainter, pRectF, flags, qstr, pBoundingRect);
-                SafeDestroyQString(g_pfn_QString_dtor, qstr);
-                return;
-            }
-        }
-    }
-    if (g_o_QPainter_drawText_RectF) g_o_QPainter_drawText_RectF(pPainter, pRectF, flags, pQString, pBoundingRect);
+    ForwardTranslatedQString(caller, pQString, TranslationSource::Painter, [&](const void* text) {
+        if (g_o_QPainter_drawText_RectF) g_o_QPainter_drawText_RectF(pPainter, pRectF, flags, text, pBoundingRect);
+    });
 }
 
 static void __fastcall hk_QPainter_drawText_PointF(void* pPainter, const void* pPointF, const void* pQString) {
     void* caller = _ReturnAddress();
-    const wchar_t* wstr = nullptr;
-    if (SafeGetUtf16(g_pfn_utf16, pQString, wstr)) {
-        std::string trans;
-        bool found = false;
-        if (g_bTranslationEnabled.load(std::memory_order_relaxed)) {
-            found = FindTranslationScopedW(caller, wstr, trans, TranslationSource::Painter);
-        } else {
-            found = FindReverseTranslationScopedW(caller, wstr, trans);
-        }
-        if (found) {
-            void* qstr[1] = {0};
-            if (SafeCreateQString(g_pfn_fromUtf8, qstr, trans.c_str(), (int)trans.length())) {
-                if (g_o_QPainter_drawText_PointF) g_o_QPainter_drawText_PointF(pPainter, pPointF, qstr);
-                SafeDestroyQString(g_pfn_QString_dtor, qstr);
-                return;
-            }
-        }
-    }
-    if (g_o_QPainter_drawText_PointF) g_o_QPainter_drawText_PointF(pPainter, pPointF, pQString);
+    ForwardTranslatedQString(caller, pQString, TranslationSource::Painter, [&](const void* text) {
+        if (g_o_QPainter_drawText_PointF) g_o_QPainter_drawText_PointF(pPainter, pPointF, text);
+    });
 }
 
 static void __fastcall hk_QPainter_drawText_RectF_Option(void* pPainter, const void* pRectF, const void* pQString, const void* pOption) {
     void* caller = _ReturnAddress();
-    const wchar_t* wstr = nullptr;
-    if (SafeGetUtf16(g_pfn_utf16, pQString, wstr)) {
-        std::string trans;
-        bool found = false;
-        if (g_bTranslationEnabled.load(std::memory_order_relaxed)) {
-            found = FindTranslationScopedW(caller, wstr, trans, TranslationSource::Painter);
-        } else {
-            found = FindReverseTranslationScopedW(caller, wstr, trans);
-        }
-        if (found) {
-            void* qstr[1] = {0};
-            if (SafeCreateQString(g_pfn_fromUtf8, qstr, trans.c_str(), (int)trans.length())) {
-                if (g_o_QPainter_drawText_RectF_Option) g_o_QPainter_drawText_RectF_Option(pPainter, pRectF, qstr, pOption);
-                SafeDestroyQString(g_pfn_QString_dtor, qstr);
-                return;
-            }
-        }
-    }
-    if (g_o_QPainter_drawText_RectF_Option) g_o_QPainter_drawText_RectF_Option(pPainter, pRectF, pQString, pOption);
+    ForwardTranslatedQString(caller, pQString, TranslationSource::Painter, [&](const void* text) {
+        if (g_o_QPainter_drawText_RectF_Option) g_o_QPainter_drawText_RectF_Option(pPainter, pRectF, text, pOption);
+    });
 }
 
 static void __fastcall hk_QPainter_drawText_Point(void* pPainter, const void* pPoint, const void* pQString) {
     void* caller = _ReturnAddress();
-    const wchar_t* wstr = nullptr;
-    if (SafeGetUtf16(g_pfn_utf16, pQString, wstr)) {
-        std::string trans;
-        bool found = false;
-        if (g_bTranslationEnabled.load(std::memory_order_relaxed)) {
-            found = FindTranslationScopedW(caller, wstr, trans, TranslationSource::Painter);
-        } else {
-            found = FindReverseTranslationScopedW(caller, wstr, trans);
-        }
-        if (found) {
-            void* qstr[1] = {0};
-            if (SafeCreateQString(g_pfn_fromUtf8, qstr, trans.c_str(), (int)trans.length())) {
-                if (g_o_QPainter_drawText_Point) g_o_QPainter_drawText_Point(pPainter, pPoint, qstr);
-                SafeDestroyQString(g_pfn_QString_dtor, qstr);
-                return;
-            }
-        }
-    }
-    if (g_o_QPainter_drawText_Point) g_o_QPainter_drawText_Point(pPainter, pPoint, pQString);
+    ForwardTranslatedQString(caller, pQString, TranslationSource::Painter, [&](const void* text) {
+        if (g_o_QPainter_drawText_Point) g_o_QPainter_drawText_Point(pPainter, pPoint, text);
+    });
 }
 
 static void __fastcall hk_QPainter_drawText_xy(void* pPainter, int x, int y, const void* pQString) {
     void* caller = _ReturnAddress();
-    const wchar_t* wstr = nullptr;
-    if (SafeGetUtf16(g_pfn_utf16, pQString, wstr)) {
-        std::string trans;
-        bool found = false;
-        if (g_bTranslationEnabled.load(std::memory_order_relaxed)) {
-            found = FindTranslationScopedW(caller, wstr, trans, TranslationSource::Painter);
-        } else {
-            found = FindReverseTranslationScopedW(caller, wstr, trans);
-        }
-        if (found) {
-            void* qstr[1] = {0};
-            if (SafeCreateQString(g_pfn_fromUtf8, qstr, trans.c_str(), (int)trans.length())) {
-                if (g_o_QPainter_drawText_xy) g_o_QPainter_drawText_xy(pPainter, x, y, qstr);
-                SafeDestroyQString(g_pfn_QString_dtor, qstr);
-                return;
-            }
-        }
-    }
-    if (g_o_QPainter_drawText_xy) g_o_QPainter_drawText_xy(pPainter, x, y, pQString);
+    ForwardTranslatedQString(caller, pQString, TranslationSource::Painter, [&](const void* text) {
+        if (g_o_QPainter_drawText_xy) g_o_QPainter_drawText_xy(pPainter, x, y, text);
+    });
 }
 
-// 2.1 QTextDocument (拦截 CQRichItemListPicker 等富文本代理列表项与描述文本)
+// 3. 静态界面文本：菜单项、标签、窗口标题、按钮文字等
+//    作用域 StaticUI，与绘制期文本区分开，避免误译
+
 static void __fastcall hk_QTextDocument_setPlainText(void* pDoc, const void* pQString) {
     void* caller = _ReturnAddress();
-    const wchar_t* wstr = nullptr;
-    if (SafeGetUtf16(g_pfn_utf16, pQString, wstr)) {
-        std::string trans;
-        bool found = false;
-        if (g_bTranslationEnabled.load(std::memory_order_relaxed)) {
-            found = FindTranslationScopedW(caller, wstr, trans, TranslationSource::StaticUI);
-        } else {
-            found = FindReverseTranslationScopedW(caller, wstr, trans);
-        }
-        if (found) {
-            void* qstr[1] = {0};
-            if (SafeCreateQString(g_pfn_fromUtf8, qstr, trans.c_str(), (int)trans.length())) {
-                if (g_o_QTextDocument_setPlainText) g_o_QTextDocument_setPlainText(pDoc, qstr);
-                SafeDestroyQString(g_pfn_QString_dtor, qstr);
-                return;
-            }
-        }
-    }
-    if (g_o_QTextDocument_setPlainText) g_o_QTextDocument_setPlainText(pDoc, pQString);
+    ForwardTranslatedQString(caller, pQString, TranslationSource::StaticUI, [&](const void* text) {
+        if (g_o_QTextDocument_setPlainText) g_o_QTextDocument_setPlainText(pDoc, text);
+    });
 }
 
 static void __fastcall hk_QTextDocument_setHtml(void* pDoc, const void* pQString) {
     void* caller = _ReturnAddress();
-    const wchar_t* wstr = nullptr;
-    if (SafeGetUtf16(g_pfn_utf16, pQString, wstr)) {
-        std::string trans;
-        bool found = false;
-        if (g_bTranslationEnabled.load(std::memory_order_relaxed)) {
-            found = FindTranslationScopedW(caller, wstr, trans, TranslationSource::StaticUI);
-        } else {
-            found = FindReverseTranslationScopedW(caller, wstr, trans);
-        }
-        if (found) {
-            void* qstr[1] = {0};
-            if (SafeCreateQString(g_pfn_fromUtf8, qstr, trans.c_str(), (int)trans.length())) {
-                if (g_o_QTextDocument_setHtml) g_o_QTextDocument_setHtml(pDoc, qstr);
-                SafeDestroyQString(g_pfn_QString_dtor, qstr);
-                return;
-            }
-        }
-    }
-    if (g_o_QTextDocument_setHtml) g_o_QTextDocument_setHtml(pDoc, pQString);
+    ForwardTranslatedQString(caller, pQString, TranslationSource::StaticUI, [&](const void* text) {
+        if (g_o_QTextDocument_setHtml) g_o_QTextDocument_setHtml(pDoc, text);
+    });
 }
 
-// 3. QAction
-static void* __fastcall hk_QAction_ctor(void* pAction, const void* pQString, void* pParent) {
-    void* caller = _ReturnAddress();
-    const wchar_t* wstr = nullptr;
-    if (SafeGetUtf16(g_pfn_utf16, pQString, wstr)) {
-        std::string trans;
-        bool found = false;
-        if (g_bTranslationEnabled.load(std::memory_order_relaxed)) {
-            found = FindTranslationScopedW(caller, wstr, trans);
-        } else {
-            found = FindReverseTranslationScopedW(caller, wstr, trans);
-        }
-        if (found) {
-            void* qstr[1] = {0};
-            if (SafeCreateQString(g_pfn_fromUtf8, qstr, trans.c_str(), (int)trans.length())) {
-                void* res = g_o_QAction_ctor(pAction, qstr, pParent);
-                SafeDestroyQString(g_pfn_QString_dtor, qstr);
-                return res;
+static inline void CheckAndCacheReloadAction(void* pAction, const void* pQString) {
+    if (!pAction) return;
+    CheckAndCacheReloadActionPtr(pAction);
+    if (!g_pReloadFgdAction && pQString && g_pfn_utf16) {
+        const wchar_t* wstr = nullptr;
+        if (SafeGetUtf16(g_pfn_utf16, pQString, wstr) && wstr) {
+            if ((wcsstr(wstr, L"FGD") != nullptr || wcsstr(wstr, L"fgd") != nullptr) &&
+                (wcsstr(wstr, L"Reload") != nullptr || wcsstr(wstr, L"重载") != nullptr || wcsstr(wstr, L"重新加载") != nullptr)) {
+                std::lock_guard<std::mutex> lock(g_ReloadActionMutex);
+                if (g_pReloadFgdAction != pAction) {
+                    g_pReloadFgdAction = pAction;
+                    LogHook("[FGD] Cached 'Reload .FGD Files' QAction pointer via explicit text ('%ls'): %p", wstr, pAction);
+                }
             }
         }
     }
-    return g_o_QAction_ctor(pAction, pQString, pParent);
-}
-
-static void* __fastcall hk_QAction_ctor_icon(void* pAction, const void* pIcon, const void* pQString, void* pParent) {
-    void* caller = _ReturnAddress();
-    const wchar_t* wstr = nullptr;
-    if (SafeGetUtf16(g_pfn_utf16, pQString, wstr)) {
-        std::string trans;
-        bool found = false;
-        if (g_bTranslationEnabled.load(std::memory_order_relaxed)) {
-            found = FindTranslationScopedW(caller, wstr, trans);
-        } else {
-            found = FindReverseTranslationScopedW(caller, wstr, trans);
-        }
-        if (found) {
-            void* qstr[1] = {0};
-            if (SafeCreateQString(g_pfn_fromUtf8, qstr, trans.c_str(), (int)trans.length())) {
-                void* res = g_o_QAction_ctor_icon(pAction, pIcon, qstr, pParent);
-                SafeDestroyQString(g_pfn_QString_dtor, qstr);
-                return res;
-            }
-        }
-    }
-    return g_o_QAction_ctor_icon(pAction, pIcon, pQString, pParent);
 }
 
 static void __fastcall hk_QAction_setText(void* pAction, const void* pQString) {
     void* caller = _ReturnAddress();
-    const wchar_t* wstr = nullptr;
-    if (SafeGetUtf16(g_pfn_utf16, pQString, wstr)) {
-        std::string trans;
-        bool found = false;
-        if (g_bTranslationEnabled.load(std::memory_order_relaxed)) {
-            found = FindTranslationScopedW(caller, wstr, trans);
-        } else {
-            found = FindReverseTranslationScopedW(caller, wstr, trans);
-        }
-        if (found) {
-            void* qstr[1] = {0};
-            if (SafeCreateQString(g_pfn_fromUtf8, qstr, trans.c_str(), (int)trans.length())) {
-                if (g_o_QAction_setText) g_o_QAction_setText(pAction, qstr);
-                SafeDestroyQString(g_pfn_QString_dtor, qstr);
-                return;
-            }
-        }
-    }
-    if (g_o_QAction_setText) g_o_QAction_setText(pAction, pQString);
+    CheckAndCacheReloadAction(pAction, pQString);
+    ForwardTranslatedQString(caller, pQString, TranslationSource::StaticUI, [&](const void* text) {
+        if (g_o_QAction_setText) g_o_QAction_setText(pAction, text);
+    });
 }
 
 static void __fastcall hk_QAction_setToolTip(void* pAction, const void* pQString) {
     void* caller = _ReturnAddress();
-    const wchar_t* wstr = nullptr;
-    if (SafeGetUtf16(g_pfn_utf16, pQString, wstr)) {
-        std::string trans;
-        bool found = false;
-        if (g_bTranslationEnabled.load(std::memory_order_relaxed)) {
-            found = FindTranslationScopedW(caller, wstr, trans);
-        } else {
-            found = FindReverseTranslationScopedW(caller, wstr, trans);
-        }
-        if (found) {
-            void* qstr[1] = {0};
-            if (SafeCreateQString(g_pfn_fromUtf8, qstr, trans.c_str(), (int)trans.length())) {
-                if (g_o_QAction_setToolTip) g_o_QAction_setToolTip(pAction, qstr);
-                SafeDestroyQString(g_pfn_QString_dtor, qstr);
-                return;
-            }
-        }
-    }
-    if (g_o_QAction_setToolTip) g_o_QAction_setToolTip(pAction, pQString);
+    ForwardTranslatedQString(caller, pQString, TranslationSource::StaticUI, [&](const void* text) {
+        if (g_o_QAction_setToolTip) g_o_QAction_setToolTip(pAction, text);
+    });
 }
 
 static void __fastcall hk_QAction_setStatusTip(void* pAction, const void* pQString) {
     void* caller = _ReturnAddress();
-    const wchar_t* wstr = nullptr;
-    if (SafeGetUtf16(g_pfn_utf16, pQString, wstr)) {
-        std::string trans;
-        bool found = false;
-        if (g_bTranslationEnabled.load(std::memory_order_relaxed)) {
-            found = FindTranslationScopedW(caller, wstr, trans);
-        } else {
-            found = FindReverseTranslationScopedW(caller, wstr, trans);
-        }
-        if (found) {
-            void* qstr[1] = {0};
-            if (SafeCreateQString(g_pfn_fromUtf8, qstr, trans.c_str(), (int)trans.length())) {
-                if (g_o_QAction_setStatusTip) g_o_QAction_setStatusTip(pAction, qstr);
-                SafeDestroyQString(g_pfn_QString_dtor, qstr);
-                return;
-            }
-        }
-    }
-    if (g_o_QAction_setStatusTip) g_o_QAction_setStatusTip(pAction, pQString);
+    ForwardTranslatedQString(caller, pQString, TranslationSource::StaticUI, [&](const void* text) {
+        if (g_o_QAction_setStatusTip) g_o_QAction_setStatusTip(pAction, text);
+    });
 }
 
 static void __fastcall hk_QAction_setWhatsThis(void* pAction, const void* pQString) {
     void* caller = _ReturnAddress();
-    const wchar_t* wstr = nullptr;
-    if (SafeGetUtf16(g_pfn_utf16, pQString, wstr)) {
-        std::string trans;
-        bool found = false;
-        if (g_bTranslationEnabled.load(std::memory_order_relaxed)) {
-            found = FindTranslationScopedW(caller, wstr, trans);
-        } else {
-            found = FindReverseTranslationScopedW(caller, wstr, trans);
-        }
-        if (found) {
-            void* qstr[1] = {0};
-            if (SafeCreateQString(g_pfn_fromUtf8, qstr, trans.c_str(), (int)trans.length())) {
-                if (g_o_QAction_setWhatsThis) g_o_QAction_setWhatsThis(pAction, qstr);
-                SafeDestroyQString(g_pfn_QString_dtor, qstr);
-                return;
-            }
-        }
-    }
-    if (g_o_QAction_setWhatsThis) g_o_QAction_setWhatsThis(pAction, pQString);
+    ForwardTranslatedQString(caller, pQString, TranslationSource::StaticUI, [&](const void* text) {
+        if (g_o_QAction_setWhatsThis) g_o_QAction_setWhatsThis(pAction, text);
+    });
 }
 
-// 4. 按钮/标签/窗口标题
 static void __fastcall hk_QAbstractButton_setText(void* pButton, const void* pQString) {
     void* caller = _ReturnAddress();
-    const wchar_t* wstr = nullptr;
-    if (SafeGetUtf16(g_pfn_utf16, pQString, wstr)) {
-        std::string trans;
-        bool found = false;
-        if (g_bTranslationEnabled.load(std::memory_order_relaxed)) {
-            found = FindTranslationScopedW(caller, wstr, trans);
-        } else {
-            found = FindReverseTranslationScopedW(caller, wstr, trans);
-        }
-        if (found) {
-            void* qstr[1] = {0};
-            if (SafeCreateQString(g_pfn_fromUtf8, qstr, trans.c_str(), (int)trans.length())) {
-                if (g_o_QAbstractButton_setText) g_o_QAbstractButton_setText(pButton, qstr);
-                SafeDestroyQString(g_pfn_QString_dtor, qstr);
-                return;
-            }
-        }
-    }
-    if (g_o_QAbstractButton_setText) g_o_QAbstractButton_setText(pButton, pQString);
+    ForwardTranslatedQString(caller, pQString, TranslationSource::StaticUI, [&](const void* text) {
+        if (g_o_QAbstractButton_setText) g_o_QAbstractButton_setText(pButton, text);
+    });
 }
 
 static void __fastcall hk_QLabel_setText(void* pLabel, const void* pQString) {
     void* caller = _ReturnAddress();
-    const wchar_t* wstr = nullptr;
-    if (SafeGetUtf16(g_pfn_utf16, pQString, wstr)) {
-        std::string trans;
-        bool found = false;
-        if (g_bTranslationEnabled.load(std::memory_order_relaxed)) {
-            found = FindTranslationScopedW(caller, wstr, trans);
-        } else {
-            found = FindReverseTranslationScopedW(caller, wstr, trans);
-        }
-        if (found) {
-            void* qstr[1] = {0};
-            if (SafeCreateQString(g_pfn_fromUtf8, qstr, trans.c_str(), (int)trans.length())) {
-                if (g_o_QLabel_setText) g_o_QLabel_setText(pLabel, qstr);
-                SafeDestroyQString(g_pfn_QString_dtor, qstr);
-                return;
-            }
-        }
-    }
-    if (g_o_QLabel_setText) g_o_QLabel_setText(pLabel, pQString);
+    ForwardTranslatedQString(caller, pQString, TranslationSource::StaticUI, [&](const void* text) {
+        if (g_o_QLabel_setText) g_o_QLabel_setText(pLabel, text);
+    });
 }
 
 static void __fastcall hk_QWidget_setWindowTitle(void* pWidget, const void* pQString) {
     void* caller = _ReturnAddress();
-    const wchar_t* wstr = nullptr;
-    if (SafeGetUtf16(g_pfn_utf16, pQString, wstr)) {
-        std::string trans;
-        bool found = false;
-        if (g_bTranslationEnabled.load(std::memory_order_relaxed)) {
-            found = FindTranslationScopedW(caller, wstr, trans);
-        } else {
-            found = FindReverseTranslationScopedW(caller, wstr, trans);
-        }
-        if (found) {
-            void* qstr[1] = {0};
-            if (SafeCreateQString(g_pfn_fromUtf8, qstr, trans.c_str(), (int)trans.length())) {
-                if (g_o_QWidget_setWindowTitle) g_o_QWidget_setWindowTitle(pWidget, qstr);
-                SafeDestroyQString(g_pfn_QString_dtor, qstr);
-                return;
-            }
-        }
-    }
-    if (g_o_QWidget_setWindowTitle) g_o_QWidget_setWindowTitle(pWidget, pQString);
+    ForwardTranslatedQString(caller, pQString, TranslationSource::StaticUI, [&](const void* text) {
+        if (g_o_QWidget_setWindowTitle) g_o_QWidget_setWindowTitle(pWidget, text);
+    });
 }
 
 static void __fastcall hk_QGroupBox_setTitle(void* pBox, const void* pQString) {
     void* caller = _ReturnAddress();
-    const wchar_t* wstr = nullptr;
-    if (SafeGetUtf16(g_pfn_utf16, pQString, wstr)) {
-        std::string trans;
-        bool found = false;
-        if (g_bTranslationEnabled.load(std::memory_order_relaxed)) {
-            found = FindTranslationScopedW(caller, wstr, trans);
-        } else {
-            found = FindReverseTranslationScopedW(caller, wstr, trans);
-        }
-        if (found) {
-            void* qstr[1] = {0};
-            if (SafeCreateQString(g_pfn_fromUtf8, qstr, trans.c_str(), (int)trans.length())) {
-                if (g_o_QGroupBox_setTitle) g_o_QGroupBox_setTitle(pBox, qstr);
-                SafeDestroyQString(g_pfn_QString_dtor, qstr);
-                return;
-            }
-        }
-    }
-    if (g_o_QGroupBox_setTitle) g_o_QGroupBox_setTitle(pBox, pQString);
+    ForwardTranslatedQString(caller, pQString, TranslationSource::StaticUI, [&](const void* text) {
+        if (g_o_QGroupBox_setTitle) g_o_QGroupBox_setTitle(pBox, text);
+    });
 }
 
-// 5. Item 控件
+static void* __fastcall hk_QAction_ctor(void* pAction, const void* pQString, void* pParent) {
+    void* caller = _ReturnAddress();
+    CheckAndCacheReloadAction(pAction, pQString);
+    void* result = nullptr;
+    ForwardTranslatedQString(caller, pQString, TranslationSource::StaticUI, [&](const void* text) {
+        result = g_o_QAction_ctor(pAction, text, pParent);
+    });
+    return result;
+}
+
+static void* __fastcall hk_QAction_ctor_icon(void* pAction, const void* pIcon, const void* pQString, void* pParent) {
+    void* caller = _ReturnAddress();
+    CheckAndCacheReloadAction(pAction, pQString);
+    void* result = nullptr;
+    ForwardTranslatedQString(caller, pQString, TranslationSource::StaticUI, [&](const void* text) {
+        result = g_o_QAction_ctor_icon(pAction, pIcon, text, pParent);
+    });
+    return result;
+}
+
+static void __fastcall hk_QWidget_insertAction(void* pWidget, void* pBefore, void* pAction) {
+    if (g_o_QWidget_insertAction) {
+        g_o_QWidget_insertAction(pWidget, pBefore, pAction);
+    }
+    if (pAction && !g_pReloadFgdAction) {
+        CheckAndCacheReloadActionPtr(pAction);
+    }
+}
+
+static void __fastcall hk_QWidget_addAction(void* pWidget, void* pAction) {
+    if (g_o_QWidget_addAction) {
+        g_o_QWidget_addAction(pWidget, pAction);
+    }
+    if (pAction && !g_pReloadFgdAction) {
+        CheckAndCacheReloadActionPtr(pAction);
+    }
+}
+
+static void __fastcall hk_QAction_activate(void* pAction, int event) {
+    if (pAction && !g_pReloadFgdAction) {
+        CheckAndCacheReloadActionPtr(pAction);
+    }
+    if (g_o_QAction_activate) {
+        g_o_QAction_activate(pAction, event);
+    }
+}
+
+// 4. 列表 / 树 / 表格 / 下拉框项文本
+//    作用域 ItemWidget，这类文本重复率极高，单独分组便于词典维护
+
 static void __fastcall hk_QTreeWidgetItem_setText(void* pItem, int column, const void* pQString) {
     void* caller = _ReturnAddress();
-    const wchar_t* wstr = nullptr;
-    if (SafeGetUtf16(g_pfn_utf16, pQString, wstr)) {
-        std::string trans;
-        bool found = false;
-        if (g_bTranslationEnabled.load(std::memory_order_relaxed)) {
-            found = FindTranslationScopedW(caller, wstr, trans, TranslationSource::ItemWidget);
-        } else {
-            found = FindReverseTranslationScopedW(caller, wstr, trans);
-        }
-        if (found) {
-            void* qstr[1] = {0};
-            if (SafeCreateQString(g_pfn_fromUtf8, qstr, trans.c_str(), (int)trans.length())) {
-                if (g_o_QTreeWidgetItem_setText) g_o_QTreeWidgetItem_setText(pItem, column, qstr);
-                SafeDestroyQString(g_pfn_QString_dtor, qstr);
-                return;
-            }
-        }
-    }
-    if (g_o_QTreeWidgetItem_setText) g_o_QTreeWidgetItem_setText(pItem, column, pQString);
+    ForwardTranslatedQString(caller, pQString, TranslationSource::ItemWidget, [&](const void* text) {
+        if (g_o_QTreeWidgetItem_setText) g_o_QTreeWidgetItem_setText(pItem, column, text);
+    });
 }
 
 static void __fastcall hk_QTreeWidget_setHeaderLabel(void* pTree, const void* pQString) {
     void* caller = _ReturnAddress();
-    const wchar_t* wstr = nullptr;
-    if (SafeGetUtf16(g_pfn_utf16, pQString, wstr)) {
-        std::string trans;
-        bool found = false;
-        if (g_bTranslationEnabled.load(std::memory_order_relaxed)) {
-            found = FindTranslationScopedW(caller, wstr, trans, TranslationSource::ItemWidget);
-        } else {
-            found = FindReverseTranslationScopedW(caller, wstr, trans);
-        }
-        if (found) {
-            void* qstr[1] = {0};
-            if (SafeCreateQString(g_pfn_fromUtf8, qstr, trans.c_str(), (int)trans.length())) {
-                if (g_o_QTreeWidget_setHeaderLabel) g_o_QTreeWidget_setHeaderLabel(pTree, qstr);
-                SafeDestroyQString(g_pfn_QString_dtor, qstr);
-                return;
-            }
-        }
-    }
-    if (g_o_QTreeWidget_setHeaderLabel) g_o_QTreeWidget_setHeaderLabel(pTree, pQString);
-}
-
-static void* __fastcall hk_QTableWidgetItem_ctor(void* pItem, const void* pQString, int type) {
-    void* caller = _ReturnAddress();
-    const wchar_t* wstr = nullptr;
-    if (SafeGetUtf16(g_pfn_utf16, pQString, wstr)) {
-        std::string trans;
-        bool found = false;
-        if (g_bTranslationEnabled.load(std::memory_order_relaxed)) {
-            found = FindTranslationScopedW(caller, wstr, trans, TranslationSource::ItemWidget);
-        } else {
-            found = FindReverseTranslationScopedW(caller, wstr, trans);
-        }
-        if (found) {
-            void* qstr[1] = {0};
-            if (SafeCreateQString(g_pfn_fromUtf8, qstr, trans.c_str(), (int)trans.length())) {
-                void* res = g_o_QTableWidgetItem_ctor(pItem, qstr, type);
-                SafeDestroyQString(g_pfn_QString_dtor, qstr);
-                return res;
-            }
-        }
-    }
-    return g_o_QTableWidgetItem_ctor(pItem, pQString, type);
+    ForwardTranslatedQString(caller, pQString, TranslationSource::ItemWidget, [&](const void* text) {
+        if (g_o_QTreeWidget_setHeaderLabel) g_o_QTreeWidget_setHeaderLabel(pTree, text);
+    });
 }
 
 static void __fastcall hk_QTableWidgetItem_setText(void* pItem, const void* pQString) {
     void* caller = _ReturnAddress();
-    const wchar_t* wstr = nullptr;
-    if (SafeGetUtf16(g_pfn_utf16, pQString, wstr)) {
-        std::string trans;
-        bool found = false;
-        if (g_bTranslationEnabled.load(std::memory_order_relaxed)) {
-            found = FindTranslationScopedW(caller, wstr, trans, TranslationSource::ItemWidget);
-        } else {
-            found = FindReverseTranslationScopedW(caller, wstr, trans);
-        }
-        if (found) {
-            void* qstr[1] = {0};
-            if (SafeCreateQString(g_pfn_fromUtf8, qstr, trans.c_str(), (int)trans.length())) {
-                if (g_o_QTableWidgetItem_setText) g_o_QTableWidgetItem_setText(pItem, qstr);
-                SafeDestroyQString(g_pfn_QString_dtor, qstr);
-                return;
-            }
-        }
-    }
-    if (g_o_QTableWidgetItem_setText) g_o_QTableWidgetItem_setText(pItem, pQString);
-}
-
-static void* __fastcall hk_QListWidgetItem_ctor(void* pItem, const void* pQString, void* pListWidget, int type) {
-    void* caller = _ReturnAddress();
-    const wchar_t* wstr = nullptr;
-    if (SafeGetUtf16(g_pfn_utf16, pQString, wstr)) {
-        std::string trans;
-        bool found = false;
-        if (g_bTranslationEnabled.load(std::memory_order_relaxed)) {
-            found = FindTranslationScopedW(caller, wstr, trans, TranslationSource::ItemWidget);
-        } else {
-            found = FindReverseTranslationScopedW(caller, wstr, trans);
-        }
-        if (found) {
-            void* qstr[1] = {0};
-            if (SafeCreateQString(g_pfn_fromUtf8, qstr, trans.c_str(), (int)trans.length())) {
-                void* res = g_o_QListWidgetItem_ctor(pItem, qstr, pListWidget, type);
-                SafeDestroyQString(g_pfn_QString_dtor, qstr);
-                return res;
-            }
-        }
-    }
-    return g_o_QListWidgetItem_ctor(pItem, pQString, pListWidget, type);
+    ForwardTranslatedQString(caller, pQString, TranslationSource::ItemWidget, [&](const void* text) {
+        if (g_o_QTableWidgetItem_setText) g_o_QTableWidgetItem_setText(pItem, text);
+    });
 }
 
 static void __fastcall hk_QListWidgetItem_setText(void* pItem, const void* pQString) {
     void* caller = _ReturnAddress();
-    const wchar_t* wstr = nullptr;
-    if (SafeGetUtf16(g_pfn_utf16, pQString, wstr)) {
-        std::string trans;
-        bool found = false;
-        if (g_bTranslationEnabled.load(std::memory_order_relaxed)) {
-            found = FindTranslationScopedW(caller, wstr, trans, TranslationSource::ItemWidget);
-        } else {
-            found = FindReverseTranslationScopedW(caller, wstr, trans);
-        }
-        if (found) {
-            void* qstr[1] = {0};
-            if (SafeCreateQString(g_pfn_fromUtf8, qstr, trans.c_str(), (int)trans.length())) {
-                if (g_o_QListWidgetItem_setText) g_o_QListWidgetItem_setText(pItem, qstr);
-                SafeDestroyQString(g_pfn_QString_dtor, qstr);
-                return;
-            }
-        }
-    }
-    if (g_o_QListWidgetItem_setText) g_o_QListWidgetItem_setText(pItem, pQString);
+    ForwardTranslatedQString(caller, pQString, TranslationSource::ItemWidget, [&](const void* text) {
+        if (g_o_QListWidgetItem_setText) g_o_QListWidgetItem_setText(pItem, text);
+    });
 }
 
 static void __fastcall hk_QComboBox_addItem(void* pBox, const void* pQString, const void* pUserData) {
     void* caller = _ReturnAddress();
-    const wchar_t* wstr = nullptr;
-    if (SafeGetUtf16(g_pfn_utf16, pQString, wstr)) {
-        std::string trans;
-        bool found = false;
-        if (g_bTranslationEnabled.load(std::memory_order_relaxed)) {
-            found = FindTranslationScopedW(caller, wstr, trans, TranslationSource::ItemWidget);
-        } else {
-            found = FindReverseTranslationScopedW(caller, wstr, trans);
-        }
-        if (found) {
-            void* qstr[1] = {0};
-            if (SafeCreateQString(g_pfn_fromUtf8, qstr, trans.c_str(), (int)trans.length())) {
-                if (g_o_QComboBox_addItem) g_o_QComboBox_addItem(pBox, qstr, pUserData);
-                SafeDestroyQString(g_pfn_QString_dtor, qstr);
-                return;
-            }
-        }
-    }
-    if (g_o_QComboBox_addItem) g_o_QComboBox_addItem(pBox, pQString, pUserData);
+    ForwardTranslatedQString(caller, pQString, TranslationSource::ItemWidget, [&](const void* text) {
+        if (g_o_QComboBox_addItem) g_o_QComboBox_addItem(pBox, text, pUserData);
+    });
 }
 
 static void __fastcall hk_QComboBox_addItem_icon(void* pBox, const void* pIcon, const void* pQString, const void* pUserData) {
     void* caller = _ReturnAddress();
-    const wchar_t* wstr = nullptr;
-    if (SafeGetUtf16(g_pfn_utf16, pQString, wstr)) {
-        std::string trans;
-        bool found = false;
-        if (g_bTranslationEnabled.load(std::memory_order_relaxed)) {
-            found = FindTranslationScopedW(caller, wstr, trans, TranslationSource::ItemWidget);
-        } else {
-            found = FindReverseTranslationScopedW(caller, wstr, trans);
-        }
-        if (found) {
-            void* qstr[1] = {0};
-            if (SafeCreateQString(g_pfn_fromUtf8, qstr, trans.c_str(), (int)trans.length())) {
-                if (g_o_QComboBox_addItem_icon) g_o_QComboBox_addItem_icon(pBox, pIcon, qstr, pUserData);
-                SafeDestroyQString(g_pfn_QString_dtor, qstr);
-                return;
-            }
-        }
-    }
-    if (g_o_QComboBox_addItem_icon) g_o_QComboBox_addItem_icon(pBox, pIcon, pQString, pUserData);
+    ForwardTranslatedQString(caller, pQString, TranslationSource::ItemWidget, [&](const void* text) {
+        if (g_o_QComboBox_addItem_icon) g_o_QComboBox_addItem_icon(pBox, pIcon, text, pUserData);
+    });
 }
 
 static void __fastcall hk_QComboBox_setItemText(void* pBox, int index, const void* pQString) {
     void* caller = _ReturnAddress();
-    const wchar_t* wstr = nullptr;
-    if (SafeGetUtf16(g_pfn_utf16, pQString, wstr)) {
-        std::string trans;
-        bool found = false;
-        if (g_bTranslationEnabled.load(std::memory_order_relaxed)) {
-            found = FindTranslationScopedW(caller, wstr, trans, TranslationSource::ItemWidget);
-        } else {
-            found = FindReverseTranslationScopedW(caller, wstr, trans);
-        }
-        if (found) {
-            void* qstr[1] = {0};
-            if (SafeCreateQString(g_pfn_fromUtf8, qstr, trans.c_str(), (int)trans.length())) {
-                if (g_o_QComboBox_setItemText) g_o_QComboBox_setItemText(pBox, index, qstr);
-                SafeDestroyQString(g_pfn_QString_dtor, qstr);
-                return;
-            }
-        }
-    }
-    if (g_o_QComboBox_setItemText) g_o_QComboBox_setItemText(pBox, index, pQString);
+    ForwardTranslatedQString(caller, pQString, TranslationSource::ItemWidget, [&](const void* text) {
+        if (g_o_QComboBox_setItemText) g_o_QComboBox_setItemText(pBox, index, text);
+    });
 }
 
 static void __fastcall hk_QComboBox_insertItem(void* pBox, int index, const void* pQString, const void* pUserData) {
     void* caller = _ReturnAddress();
-    const wchar_t* wstr = nullptr;
-    if (SafeGetUtf16(g_pfn_utf16, pQString, wstr)) {
-        std::string trans;
-        bool found = false;
-        if (g_bTranslationEnabled.load(std::memory_order_relaxed)) {
-            found = FindTranslationScopedW(caller, wstr, trans, TranslationSource::ItemWidget);
-        } else {
-            found = FindReverseTranslationScopedW(caller, wstr, trans);
-        }
-        if (found) {
-            void* qstr[1] = {0};
-            if (SafeCreateQString(g_pfn_fromUtf8, qstr, trans.c_str(), (int)trans.length())) {
-                if (g_o_QComboBox_insertItem) g_o_QComboBox_insertItem(pBox, index, qstr, pUserData);
-                SafeDestroyQString(g_pfn_QString_dtor, qstr);
-                return;
-            }
-        }
-    }
-    if (g_o_QComboBox_insertItem) g_o_QComboBox_insertItem(pBox, index, pQString, pUserData);
+    ForwardTranslatedQString(caller, pQString, TranslationSource::ItemWidget, [&](const void* text) {
+        if (g_o_QComboBox_insertItem) g_o_QComboBox_insertItem(pBox, index, text, pUserData);
+    });
 }
 
 static void __fastcall hk_QComboBox_insertItem_icon(void* pBox, int index, const void* pIcon, const void* pQString, const void* pUserData) {
     void* caller = _ReturnAddress();
-    const wchar_t* wstr = nullptr;
-    if (SafeGetUtf16(g_pfn_utf16, pQString, wstr)) {
-        std::string trans;
-        bool found = false;
-        if (g_bTranslationEnabled.load(std::memory_order_relaxed)) {
-            found = FindTranslationScopedW(caller, wstr, trans, TranslationSource::ItemWidget);
-        } else {
-            found = FindReverseTranslationScopedW(caller, wstr, trans);
-        }
-        if (found) {
-            void* qstr[1] = {0};
-            if (SafeCreateQString(g_pfn_fromUtf8, qstr, trans.c_str(), (int)trans.length())) {
-                if (g_o_QComboBox_insertItem_icon) g_o_QComboBox_insertItem_icon(pBox, index, pIcon, qstr, pUserData);
-                SafeDestroyQString(g_pfn_QString_dtor, qstr);
-                return;
-            }
-        }
-    }
-    if (g_o_QComboBox_insertItem_icon) g_o_QComboBox_insertItem_icon(pBox, index, pIcon, pQString, pUserData);
+    ForwardTranslatedQString(caller, pQString, TranslationSource::ItemWidget, [&](const void* text) {
+        if (g_o_QComboBox_insertItem_icon) g_o_QComboBox_insertItem_icon(pBox, index, pIcon, text, pUserData);
+    });
+}
+
+static void* __fastcall hk_QTableWidgetItem_ctor(void* pItem, const void* pQString, int type) {
+    void* caller = _ReturnAddress();
+    void* result = nullptr;
+    ForwardTranslatedQString(caller, pQString, TranslationSource::ItemWidget, [&](const void* text) {
+        result = g_o_QTableWidgetItem_ctor(pItem, text, type);
+    });
+    return result;
+}
+
+static void* __fastcall hk_QListWidgetItem_ctor(void* pItem, const void* pQString, void* pListWidget, int type) {
+    void* caller = _ReturnAddress();
+    void* result = nullptr;
+    ForwardTranslatedQString(caller, pQString, TranslationSource::ItemWidget, [&](const void* text) {
+        result = g_o_QListWidgetItem_ctor(pItem, text, pListWidget, type);
+    });
+    return result;
 }
 
 // ==============================================================================
@@ -2011,6 +2425,10 @@ static bool TryHookQtToolsModules() {
             void* pComboInsertItem = (void*)GetProcAddress(hQtWidgets, "?insertItem@QComboBox@@QEAAXHAEBVQString@@AEBVQVariant@@@Z");
             void* pComboInsertItemIcon = (void*)GetProcAddress(hQtWidgets, "?insertItem@QComboBox@@QEAAXHAEBVQIcon@@AEBVQString@@AEBVQVariant@@@Z");
 
+            void* pInsertAction    = (void*)GetProcAddress(hQtWidgets, "?insertAction@QWidget@@QEAAXPEAVQAction@@0@Z");
+            void* pAddAction       = (void*)GetProcAddress(hQtWidgets, "?addAction@QWidget@@QEAAXPEAVQAction@@@Z");
+            void* pActivate        = (void*)GetProcAddress(hQtWidgets, "?activate@QAction@@QEAAXW4ActionEvent@1@@Z");
+
             std::vector<HookRequest> widgetRequests = {
                 { pActionCtorText,      (void*)hk_QAction_ctor,             (void**)&g_o_QAction_ctor,             "QAction::QAction(text)" },
                 { pActionCtorIcon,      (void*)hk_QAction_ctor_icon,        (void**)&g_o_QAction_ctor_icon,        "QAction::QAction(icon,text)" },
@@ -2018,6 +2436,9 @@ static bool TryHookQtToolsModules() {
                 { pActionSetTip,        (void*)hk_QAction_setToolTip,       (void**)&g_o_QAction_setToolTip,       "QAction::setToolTip" },
                 { pActionSetStatus,     (void*)hk_QAction_setStatusTip,     (void**)&g_o_QAction_setStatusTip,     "QAction::setStatusTip" },
                 { pActionSetWhats,      (void*)hk_QAction_setWhatsThis,     (void**)&g_o_QAction_setWhatsThis,     "QAction::setWhatsThis" },
+                { pInsertAction,        (void*)hk_QWidget_insertAction,     (void**)&g_o_QWidget_insertAction,     "QWidget::insertAction" },
+                { pAddAction,           (void*)hk_QWidget_addAction,        (void**)&g_o_QWidget_addAction,        "QWidget::addAction" },
+                { pActivate,            (void*)hk_QAction_activate,         (void**)&g_o_QAction_activate,         "QAction::activate" },
                 { pButtonSetText,       (void*)hk_QAbstractButton_setText,  (void**)&g_o_QAbstractButton_setText,  "QAbstractButton::setText" },
                 { pLabelSetText,        (void*)hk_QLabel_setText,           (void**)&g_o_QLabel_setText,           "QLabel::setText" },
                 { pSetTitle,            (void*)hk_QWidget_setWindowTitle,   (void**)&g_o_QWidget_setWindowTitle,   "QWidget::setWindowTitle" },
@@ -2074,6 +2495,7 @@ static bool TryHookQtToolsModules() {
         }
     }
 
+    TryHookTier0();
     return (g_bWidgetsHooked.load() && g_bGuiHooked.load());
 }
 
@@ -2252,6 +2674,10 @@ static DWORD WINAPI ToolsHookThread(LPVOID lpParam) {
     EnsureDictionaryLoaded();
     ScanKnownToolModules();
 
+    // 预编译内存中的 FGD 翻译缓存并挂钩文件系统
+    PrecompileFgdBuffers();
+    TryHookFileSystem();
+
     HANDLE waitHandles[2] = { g_hWakeHookEvent, g_hCrashReportEvent };
 
     while (!g_bStopHookThread.load(std::memory_order_relaxed)) {
@@ -2264,6 +2690,9 @@ static DWORD WINAPI ToolsHookThread(LPVOID lpParam) {
 
         if (!g_bWidgetsHooked.load(std::memory_order_relaxed) || !g_bGuiHooked.load(std::memory_order_relaxed)) {
             TryHookQtToolsModules();
+        }
+        if (!g_bFileSystemHooked.load(std::memory_order_relaxed) && !g_bFileSystemHookFailed.load(std::memory_order_relaxed)) {
+            TryHookFileSystem();
         }
         ScanKnownToolModules();
 
@@ -2291,7 +2720,7 @@ static DWORD WINAPI ToolsHookThread(LPVOID lpParam) {
             break;
         }
 
-        DWORD timeout = (g_bWidgetsHooked.load() && g_bGuiHooked.load()) ? 500 : 50;
+        DWORD timeout = (g_bWidgetsHooked.load() && g_bGuiHooked.load() && g_bFileSystemHooked.load()) ? 500 : 50;
         DWORD waitRes = MsgWaitForMultipleObjectsEx(2, waitHandles, timeout, QS_ALLINPUT, MWMO_INPUTAVAILABLE);
         if (waitRes == WAIT_OBJECT_0 + 1) {
             ProcessCrashReportAsync();
@@ -2461,6 +2890,9 @@ extern "C" __declspec(dllexport) bool InitializeTranslator() {
     }
 
     LogHook("[INIT] Qt5Core=%p, fromUtf8=%p, utf16=%p, dtor=%p, orig_tr=%p", hQtCore, g_pfn_fromUtf8, g_pfn_utf16, g_pfn_QString_dtor, g_o_QMetaObject_tr);
+
+    // 立即挂钩 VFileSystem017::ReadFileToBuffer，抢在 Hammer 加载 FGD 前就绪
+    TryHookFileSystem();
 
     // 2. 创建异步唤醒事件与崩溃报告事件，并注册 DLL 通知
     if (!g_hWakeHookEvent) {

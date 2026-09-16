@@ -28,14 +28,6 @@ public:
         const std::wstring& fallbackJsonPath = L""
     );
 
-    // 合并主字典与 fallback 兜底字典为单个 JSONC 文件
-    static bool MergeJsonFiles(
-        const std::wstring& primaryJsonPath,
-        const std::wstring& fallbackJsonPath,
-        const std::wstring& outJsonPath,
-        std::wstring& outError
-    );
-
     // 去除 JSONC 注释与尾随逗号辅助函数
     static std::string StripJsonComments(const char* p, size_t length);
 };

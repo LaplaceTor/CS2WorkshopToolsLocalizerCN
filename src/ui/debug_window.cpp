@@ -1,5 +1,8 @@
-#include "debug_window.h"
-#include "mainwindow.h"
+#include "ui/debug_window.h"
+#include "ui/mainwindow.h"
+#include "core/cs2_detector.h"
+#include "core/hammer_ipc.h"
+#include "core/path_constants.h"
 #include <windows.h>
 #include <psapi.h>
 #include <tlhelp32.h>
@@ -16,6 +19,7 @@
 #include <QDateTime>
 #include <QProcess>
 #include <QDir>
+#include <QStringDecoder>
 #include <chrono>
 
 #ifndef WM_LOCALIZER_TOGGLE_LANG
@@ -28,31 +32,7 @@
 #define WM_LOCALIZER_QUERY_STATUS  (WM_USER + 103)
 #endif
 
-static HWND FindHammerIpcWindow() {
-    HWND hWnd = FindWindowExW(HWND_MESSAGE, NULL, L"CS2_HAMMER_LOCALIZER_IPC", L"CS2_Hammer_Localizer_MsgWnd");
-    if (!hWnd) {
-        hWnd = FindWindowW(L"CS2_HAMMER_LOCALIZER_IPC", L"CS2_Hammer_Localizer_MsgWnd");
-    }
-    return hWnd;
-}
 
-static DWORD FindCs2ProcessId() {
-    DWORD pid = 0;
-    HANDLE hSnap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
-    if (hSnap != INVALID_HANDLE_VALUE) {
-        PROCESSENTRY32W pe = { sizeof(pe) };
-        if (Process32FirstW(hSnap, &pe)) {
-            do {
-                if (_wcsicmp(pe.szExeFile, L"cs2.exe") == 0) {
-                    pid = pe.th32ProcessID;
-                    break;
-                }
-            } while (Process32NextW(hSnap, &pe));
-        }
-        CloseHandle(hSnap);
-    }
-    return pid;
-}
 
 DebugWindow::DebugWindow(const std::wstring& cs2Root, QWidget* parent)
     : QDialog(parent)
@@ -82,33 +62,34 @@ DebugWindow::~DebugWindow() {
     }
 }
 
-void DebugWindow::setupUi() {
-    QVBoxLayout* mainLayout = new QVBoxLayout(this);
-    mainLayout->setContentsMargins(12, 12, 12, 12);
-    mainLayout->setSpacing(10);
+// 顶部状态看板里大量使用的同款小号状态标签
+namespace {
 
-    // 1. 顶部状态监控仪表盘
+QLabel* MakeStatusLabel(const QString& text, const QString& color = "#c9d1d9") {
+    QLabel* lbl = new QLabel(text);
+    lbl->setStyleSheet(QString("font-size: 12px; color: %1;").arg(color));
+    return lbl;
+}
+
+}  // namespace
+
+QWidget* DebugWindow::createStatusDashboard() {
     QGroupBox* grpStatus = new QGroupBox("📊 目标进程与汉化运行状态 (Real-time Dashboard)", this);
     grpStatus->setStyleSheet(
         "QGroupBox { font-weight: bold; border: 1px solid #30363d; border-radius: 6px; margin-top: 6px; padding-top: 10px; }"
         "QGroupBox::title { subcontrol-origin: margin; left: 10px; padding: 0 4px; color: #58a6ff; }"
     );
+
     QGridLayout* statusGrid = new QGridLayout(grpStatus);
     statusGrid->setContentsMargins(12, 8, 12, 8);
     statusGrid->setHorizontalSpacing(20);
     statusGrid->setVerticalSpacing(6);
 
-    auto makeStatusLabel = [](const QString& text, const QString& color = "#c9d1d9") -> QLabel* {
-        QLabel* lbl = new QLabel(text);
-        lbl->setStyleSheet(QString("font-size: 12px; color: %1;").arg(color));
-        return lbl;
-    };
-
-    m_lblHammerStatus = makeStatusLabel("未检测到 cs2.exe 运行", "#f85149");
-    m_lblHammerPid    = makeStatusLabel("-");
-    m_lblHammerMem    = makeStatusLabel("-");
-    m_lblIpcStatus    = makeStatusLabel("未连接", "#f85149");
-    m_lblCurrentLang  = makeStatusLabel("未知", "#8b949e");
+    m_lblHammerStatus = MakeStatusLabel("未检测到 cs2.exe 运行", "#f85149");
+    m_lblHammerPid    = MakeStatusLabel("-");
+    m_lblHammerMem    = MakeStatusLabel("-");
+    m_lblIpcStatus    = MakeStatusLabel("未连接", "#f85149");
+    m_lblCurrentLang  = MakeStatusLabel("未知", "#8b949e");
 
     statusGrid->addWidget(new QLabel("Hammer 进程状态:"), 0, 0);
     statusGrid->addWidget(m_lblHammerStatus, 0, 1);
@@ -123,9 +104,10 @@ void DebugWindow::setupUi() {
     statusGrid->addWidget(new QLabel("当前生效语言:"), 2, 0);
     statusGrid->addWidget(m_lblCurrentLang, 2, 1, 1, 3);
 
-    mainLayout->addWidget(grpStatus);
+    return grpStatus;
+}
 
-    // 2. 交互控制按钮工具条
+QHBoxLayout* DebugWindow::createControlToolbar() {
     QHBoxLayout* actLayout = new QHBoxLayout();
     actLayout->setSpacing(8);
 
@@ -138,7 +120,7 @@ void DebugWindow::setupUi() {
     m_btnHotReload->setStyleSheet("QPushButton { background-color: #8957e5; color: white; font-weight: bold; padding: 6px 12px; border-radius: 4px; } QPushButton:hover { background-color: #a371f7; }");
 
     m_btnLaunchDebug = new QPushButton("🚀 启动调试版 Hammer", this);
-    m_btnLaunchDebug->setToolTip("启动带 -debug -verbosehook 参数的 cs2.exe -tools -addons test");
+    m_btnLaunchDebug->setToolTip("启动带 -vulkan -debug -verbosehook 参数的 cs2.exe -tools -addons test");
     m_btnLaunchDebug->setStyleSheet("QPushButton { background-color: #238636; color: white; font-weight: bold; padding: 6px 12px; border-radius: 4px; } QPushButton:hover { background-color: #2ea043; }");
 
     m_btnCopyReport = new QPushButton("📋 复制完整诊断报告", this);
@@ -159,17 +141,10 @@ void DebugWindow::setupUi() {
     connect(m_btnCopyReport, &QPushButton::clicked, this, &DebugWindow::onCopyReportClicked);
     connect(m_btnClearLog, &QPushButton::clicked, this, &DebugWindow::onClearLogClicked);
 
-    mainLayout->addLayout(actLayout);
+    return actLayout;
+}
 
-    // 3. Tab 视窗
-    m_tabWidget = new QTabWidget(this);
-    m_tabWidget->setStyleSheet(
-        "QTabWidget::pane { border: 1px solid #30363d; border-radius: 4px; background-color: #0d1117; }"
-        "QTabBar::tab { background: #161b22; color: #8b949e; padding: 8px 16px; font-weight: bold; border-top-left-radius: 4px; border-top-right-radius: 4px; }"
-        "QTabBar::tab:selected { background: #0d1117; color: #58a6ff; border-bottom: 2px solid #58a6ff; }"
-    );
-
-    // Tab 1: 实时 Hook 日志流
+QWidget* DebugWindow::createHookLogTab() {
     QWidget* tabLog = new QWidget();
     QVBoxLayout* logLayout = new QVBoxLayout(tabLog);
     logLayout->setContentsMargins(8, 8, 8, 8);
@@ -177,6 +152,7 @@ void DebugWindow::setupUi() {
 
     QHBoxLayout* filterLayout = new QHBoxLayout();
     filterLayout->addWidget(new QLabel("🔍 文本过滤:", tabLog));
+
     m_txtFilter = new QLineEdit(tabLog);
     m_txtFilter->setPlaceholderText("输入关键词实时过滤，如 [LANG], [IPC], [TR], [GUARD], [DUMP]...");
     m_txtFilter->setStyleSheet("background-color: #161b22; color: #c9d1d9; border: 1px solid #30363d; border-radius: 4px; padding: 4px 8px;");
@@ -193,9 +169,10 @@ void DebugWindow::setupUi() {
     m_txtHookLog->setStyleSheet("background-color: #0d1117; color: #c9d1d9; font-family: 'Consolas', 'Courier New', monospace; font-size: 11px;");
     logLayout->addWidget(m_txtHookLog);
 
-    m_tabWidget->addTab(tabLog, "📜 实时 Hook 日志 (hook_runtime.log)");
+    return tabLog;
+}
 
-    // Tab 2: 崩溃捕获与事件诊断
+QWidget* DebugWindow::createCrashTab() {
     QWidget* tabCrash = new QWidget();
     QVBoxLayout* crashLayout = new QVBoxLayout(tabCrash);
     crashLayout->setContentsMargins(8, 8, 8, 8);
@@ -204,6 +181,7 @@ void DebugWindow::setupUi() {
     QHBoxLayout* crashTopLayout = new QHBoxLayout();
     crashTopLayout->addWidget(new QLabel("🚨 MiniDump 转储与 Windows 事件日志 (Event 1000 崩溃检测):", tabCrash));
     crashTopLayout->addStretch();
+
     m_btnCheckCrash = new QPushButton("🔄 重新检测崩溃日志", tabCrash);
     m_btnCheckCrash->setStyleSheet("QPushButton { background-color: #21262d; color: #c9d1d9; padding: 4px 10px; border-radius: 4px; } QPushButton:hover { background-color: #30363d; }");
     connect(m_btnCheckCrash, &QPushButton::clicked, this, &DebugWindow::onCheckCrashEventsClicked);
@@ -215,9 +193,10 @@ void DebugWindow::setupUi() {
     m_txtCrashReport->setStyleSheet("background-color: #0d1117; color: #c9d1d9; font-family: 'Consolas', 'Courier New', monospace; font-size: 11px;");
     crashLayout->addWidget(m_txtCrashReport);
 
-    m_tabWidget->addTab(tabCrash, "🚨 崩溃捕获与事件诊断 (Crash Monitor)");
+    return tabCrash;
+}
 
-    // Tab 3: 已加载模块诊断
+QWidget* DebugWindow::createModulesTab() {
     QWidget* tabMod = new QWidget();
     QVBoxLayout* modLayout = new QVBoxLayout(tabMod);
     modLayout->setContentsMargins(8, 8, 8, 8);
@@ -233,10 +212,34 @@ void DebugWindow::setupUi() {
     m_tblModules->setStyleSheet("background-color: #0d1117; color: #c9d1d9; gridline-color: #30363d; font-family: 'Consolas', monospace;");
     modLayout->addWidget(m_tblModules);
 
-    m_tabWidget->addTab(tabMod, "🧩 已加载工具模块 (Loaded Modules)");
+    return tabMod;
+}
+
+void DebugWindow::setupUi() {
+    QVBoxLayout* mainLayout = new QVBoxLayout(this);
+    mainLayout->setContentsMargins(12, 12, 12, 12);
+    mainLayout->setSpacing(10);
+
+    // 1. 顶部状态监控仪表盘
+    mainLayout->addWidget(createStatusDashboard());
+
+    // 2. 交互控制按钮工具条
+    mainLayout->addLayout(createControlToolbar());
+
+    // 3. Tab 视窗
+    m_tabWidget = new QTabWidget(this);
+    m_tabWidget->setStyleSheet(
+        "QTabWidget::pane { border: 1px solid #30363d; border-radius: 4px; background-color: #0d1117; }"
+        "QTabBar::tab { background: #161b22; color: #8b949e; padding: 8px 16px; font-weight: bold; border-top-left-radius: 4px; border-top-right-radius: 4px; }"
+        "QTabBar::tab:selected { background: #0d1117; color: #58a6ff; border-bottom: 2px solid #58a6ff; }"
+    );
+    m_tabWidget->addTab(createHookLogTab(), "📜 实时 Hook 日志 (hook_runtime.log)");
+    m_tabWidget->addTab(createCrashTab(), "🚨 崩溃捕获与事件诊断 (Crash Monitor)");
+    m_tabWidget->addTab(createModulesTab(), "🧩 已加载工具模块 (Loaded Modules)");
 
     mainLayout->addWidget(m_tabWidget);
 }
+
 
 void DebugWindow::onRefreshTimer() {
     updateProcessDashboard();
@@ -245,7 +248,7 @@ void DebugWindow::onRefreshTimer() {
 }
 
 void DebugWindow::updateProcessDashboard() {
-    DWORD pid = FindCs2ProcessId();
+    DWORD pid = Cs2Detector::FindCs2ProcessId();
     m_cachedHammerPid = pid;
 
     if (pid != 0) {
@@ -268,7 +271,7 @@ void DebugWindow::updateProcessDashboard() {
             CloseHandle(hProcess);
         }
 
-        HWND hIpc = FindHammerIpcWindow();
+        HWND hIpc = HammerIpc::FindIpcWindow();
         if (hIpc) {
             m_lblIpcStatus->setText(QString("✅ 已连接 (HWND: 0x%1)").arg((uintptr_t)hIpc, 0, 16).toUpper());
             m_lblIpcStatus->setStyleSheet("font-size: 12px; color: #3fb950;");
@@ -294,7 +297,7 @@ void DebugWindow::updateProcessDashboard() {
 }
 
 void DebugWindow::queryHammerLanguageStatus() {
-    HWND hIpc = FindHammerIpcWindow();
+    HWND hIpc = HammerIpc::FindIpcWindow();
     if (!hIpc) {
         return;
     }
@@ -314,7 +317,7 @@ void DebugWindow::queryHammerLanguageStatus() {
 }
 
 void DebugWindow::pollHookRuntimeLog() {
-    QString binDir = QString::fromStdWString(m_cs2Root) + "/game/bin/win64/";
+    QString binDir = QString::fromStdWString(paths::Win64Bin(m_cs2Root).wstring()) + "/";
     QString logPath = binDir + "hook_runtime.log";
 
     QFile file(logPath);
@@ -377,7 +380,7 @@ void DebugWindow::onClearLogClicked() {
 }
 
 void DebugWindow::onToggleLangClicked() {
-    HWND hIpc = FindHammerIpcWindow();
+    HWND hIpc = HammerIpc::FindIpcWindow();
     if (!hIpc) {
         m_txtHookLog->appendPlainText("[CLIENT] 错误: 未检测到 Hammer IPC 窗口，无法切换");
         return;
@@ -410,7 +413,7 @@ void DebugWindow::onHotReloadClicked() {
         return;
     }
 
-    HWND hIpc = FindHammerIpcWindow();
+    HWND hIpc = HammerIpc::FindIpcWindow();
     if (!hIpc) {
         m_txtHookLog->appendPlainText("[CLIENT] 错误: 未检测到 Hammer IPC 窗口，无法热重载");
         return;
@@ -429,25 +432,25 @@ void DebugWindow::onHotReloadClicked() {
 }
 
 void DebugWindow::onLaunchDebugHammerClicked() {
-    QString cs2Exe = QString::fromStdWString(m_cs2Root) + "/game/bin/win64/cs2.exe";
+    QString cs2Exe = QString::fromStdWString(paths::Cs2Exe(m_cs2Root).wstring());
     if (!QFile::exists(cs2Exe)) {
         m_txtHookLog->appendPlainText(QString("[CLIENT] 未找到 cs2.exe: %1").arg(cs2Exe));
         return;
     }
 
     QStringList args;
-    args << "-tools" << "-addons" << "test" << "-debug" << "-verbosehook";
+    args << "-tools" << "-addons" << "test" << "-vulkan" << "-debug" << "-verbosehook";
 
-    bool ok = QProcess::startDetached(cs2Exe, args, QString::fromStdWString(m_cs2Root) + "/game/bin/win64/");
+    bool ok = QProcess::startDetached(cs2Exe, args, QString::fromStdWString(paths::Win64Bin(m_cs2Root).wstring()) + "/");
     if (ok) {
-        m_txtHookLog->appendPlainText("[CLIENT] 🚀 已拉起调试版 Hammer: cs2.exe -tools -addons test -debug -verbosehook");
+        m_txtHookLog->appendPlainText("[CLIENT] 🚀 已拉起调试版 Hammer: cs2.exe -tools -addons test -vulkan -debug -verbosehook");
     } else {
         m_txtHookLog->appendPlainText("[CLIENT] ❌ 启动调试版 Hammer 失败");
     }
 }
 
 void DebugWindow::onCheckCrashEventsClicked() {
-    QString binDir = QString::fromStdWString(m_cs2Root) + "/game/bin/win64/";
+    QString binDir = QString::fromStdWString(paths::Win64Bin(m_cs2Root).wstring()) + "/";
     m_txtCrashReport->clear();
 
     QString report;
@@ -482,15 +485,24 @@ void DebugWindow::onCheckCrashEventsClicked() {
     report += "--- [2. Windows 应用程序错误事件日志提取 (Event ID 1000)] ---\n";
     QProcess ps;
     QString psScript =
+        "[Console]::OutputEncoding = [System.Text.Encoding]::UTF8; "
+        "$OutputEncoding = [System.Text.Encoding]::UTF8; "
         "Get-WinEvent -FilterHashtable @{LogName='Application'; ProviderName='Application Error'; Id=1000} -MaxEvents 5 -ErrorAction SilentlyContinue | "
         "Where-Object { $_.Message -match 'cs2.exe|hammer.dll|propertyeditor.dll|qtcore_qm.dll' } | "
         "ForEach-Object { "
         "  [PSCustomObject]@{ Time=$_.TimeCreated; Message=$_.Message } "
         "} | Format-List";
 
-    ps.start("powershell", QStringList() << "-NoProfile" << "-NonInteractive" << "-Command" << psScript);
+    ps.start("powershell", QStringList() << "-NoProfile" << "-NonInteractive" << "-ExecutionPolicy" << "Bypass" << "-Command" << psScript);
     if (ps.waitForFinished(4000)) {
-        QString psOut = QString::fromUtf8(ps.readAllStandardOutput()).trimmed();
+        QByteArray outBytes = ps.readAllStandardOutput();
+        QString psOut;
+        QStringDecoder decoder(QStringDecoder::Utf8);
+        psOut = decoder(outBytes);
+        if (decoder.hasError()) {
+            psOut = QString::fromLocal8Bit(outBytes);
+        }
+        psOut = psOut.trimmed();
         if (psOut.isEmpty()) {
             report += "[OK] 最近 5 条 Application Error 事件中未发现属于 cs2.exe / hammer.dll 的崩溃记录。\n";
         } else {
@@ -509,7 +521,7 @@ void DebugWindow::onCheckCrashEventsClicked() {
 void DebugWindow::queryLoadedModules() {
     m_tblModules->setRowCount(0);
     DWORD pid = m_cachedHammerPid;
-    if (pid == 0) pid = FindCs2ProcessId();
+    if (pid == 0) pid = Cs2Detector::FindCs2ProcessId();
     if (pid == 0) return;
 
     HANDLE hSnap = CreateToolhelp32Snapshot(TH32CS_SNAPMODULE | TH32CS_SNAPMODULE32, pid);

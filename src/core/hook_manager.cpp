@@ -1,5 +1,5 @@
-#include "hook_manager.h"
-#include "../third_party/minhook/include/MinHook.h"
+#include "core/hook_manager.h"
+#include "MinHook.h"
 #include <stdio.h>
 #include <algorithm>
 
@@ -14,6 +14,10 @@ HookManager::~HookManager() {
 
 bool HookManager::Initialize(PVECTORED_EXCEPTION_HANDLER pVehHandler) {
     std::lock_guard<std::mutex> lock(m_mutex);
+    return InitializeLocked(pVehHandler);
+}
+
+bool HookManager::InitializeLocked(PVECTORED_EXCEPTION_HANDLER pVehHandler) {
     if (m_bInitialized.load()) {
         return true;
     }
@@ -38,13 +42,13 @@ bool HookManager::InstallHook(void* pTarget, void* pDetour, void** ppOriginal, c
         return false;
     }
 
-    if (!m_bInitialized.load()) {
-        if (!Initialize(nullptr)) {
-            return false;
-        }
-    }
-
+    // 整个安装过程（含首次初始化）都在同一把锁内完成。
+    // 旧实现是「锁外读标志位 -> 锁外 Initialize -> 再上锁」，
+    // 并发调用时可能两个线程同时走到 MH_Initialize。
     std::lock_guard<std::mutex> lock(m_mutex);
+    if (!m_bInitialized.load() && !InitializeLocked(nullptr)) {
+        return false;
+    }
 
     // 1. 检查是否已有同目标 Hook
     auto it = std::find_if(m_hooks.begin(), m_hooks.end(), [pTarget](const HookEntry& h) {
@@ -166,6 +170,10 @@ bool HookManager::RegisterDllNotification(PLDR_DLL_NOTIFICATION_FUNCTION pfnCall
 
 void HookManager::UnregisterDllNotification() {
     std::lock_guard<std::mutex> lock(m_mutex);
+    UnregisterDllNotificationLocked();
+}
+
+void HookManager::UnregisterDllNotificationLocked() {
     if (m_pDllNotificationCookie != nullptr) {
         HMODULE hNtdll = GetModuleHandleW(L"ntdll.dll");
         if (hNtdll) {
@@ -181,6 +189,10 @@ void HookManager::UnregisterDllNotification() {
 
 void HookManager::UnregisterVeh() {
     std::lock_guard<std::mutex> lock(m_mutex);
+    UnregisterVehLocked();
+}
+
+void HookManager::UnregisterVehLocked() {
     if (m_pVehHandle != nullptr) {
         RemoveVectoredExceptionHandler(m_pVehHandle);
         m_pVehHandle = nullptr;
@@ -194,17 +206,8 @@ void HookManager::Shutdown() {
     }
 
     // 1. 注销 DLL 加载通知回调 (Unregister callback)
-    if (m_pDllNotificationCookie != nullptr) {
-        HMODULE hNtdll = GetModuleHandleW(L"ntdll.dll");
-        if (hNtdll) {
-            pfnLdrUnregisterDllNotification pUnregister = 
-                (pfnLdrUnregisterDllNotification)GetProcAddress(hNtdll, "LdrUnregisterDllNotification");
-            if (pUnregister) {
-                pUnregister(m_pDllNotificationCookie);
-            }
-        }
-        m_pDllNotificationCookie = nullptr;
-    }
+    //    与 UnregisterDllNotification() 共用同一份实现，此前这里是逐行复制的副本
+    UnregisterDllNotificationLocked();
 
     // 2. 禁用所有 Hook (Disable Hook)
     for (auto& hook : m_hooks) {
@@ -224,10 +227,7 @@ void HookManager::Shutdown() {
     m_hooks.clear();
 
     // 4. 注销全局 VEH 异常过滤器
-    if (m_pVehHandle != nullptr) {
-        RemoveVectoredExceptionHandler(m_pVehHandle);
-        m_pVehHandle = nullptr;
-    }
+    UnregisterVehLocked();
 
     // 5. 卸载 MinHook 并释放所有蹦床（trampoline）内存空间 (MinHook Uninitialize)
     MH_Uninitialize();
@@ -248,8 +248,11 @@ void HookManager::EmergencyDisableAllHooks() {
     // 1. 全局原子禁用所有 Hook（MinHook 内部自带原子临界区保护，完全不依赖 m_hooks）
     MH_DisableHook(MH_ALL_HOOKS);
 
-    // 2. 尝试获取互斥锁；若 try_lock 失败则绝对不访问 m_hooks 容器以避免数据竞争
-    if (!m_mutex.try_lock()) {
+    // 2. 尝试获取互斥锁；若抢不到则绝对不访问 m_hooks 容器以避免数据竞争。
+    //    用 unique_lock + try_to_lock 由 RAII 负责释放，
+    //    旧实现手写 try_lock/unlock，中间一旦抛异常就会永久持锁。
+    std::unique_lock<std::mutex> lock(m_mutex, std::try_to_lock);
+    if (!lock.owns_lock()) {
         return;
     }
 
@@ -258,7 +261,6 @@ void HookManager::EmergencyDisableAllHooks() {
             hook.enabled = false;
         }
     }
-    m_mutex.unlock();
 }
 
 bool HookManager::IsHookAddress(void* addr) {

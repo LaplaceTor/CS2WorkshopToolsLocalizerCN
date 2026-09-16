@@ -29,18 +29,25 @@ endif()
 # 版本号，默认 "dev"，CI 通过 -DAPP_VERSION=v1.0.0 传入
 set(APP_VERSION "dev" CACHE STRING "Application version string")
 
+# 源码按 ui / service / core 三层组织，src/ 作为项目内部 include 根：
+#   #include "core/xxx.h" / "service/xxx.h" / "ui/xxx.h"
+# 依赖方向只允许 UI -> Service -> Core，Core 不得反向依赖 UI。
+set(LAYERED_INCLUDE_ROOT ${CMAKE_CURRENT_SOURCE_DIR}/src)
+
 # 1. 编译注入 DLL qtcore_qm.dll
 add_library(qtcore_qm SHARED
-    src/qtcore_qm.cpp
-    src/hook_manager.cpp
-    src/pe_patcher.cpp
-    src/dictionary_compiler.cpp
+    src/core/qtcore_qm.cpp
+    src/core/hook_manager.cpp
+    src/core/pe_patcher.cpp
+    src/core/dictionary_compiler.cpp
+    src/core/fgd_core.cpp
     third_party/minhook/src/buffer.c
     third_party/minhook/src/hook.c
     third_party/minhook/src/trampoline.c
     third_party/minhook/src/hde/hde64.c
 )
 target_include_directories(qtcore_qm PRIVATE
+    ${LAYERED_INCLUDE_ROOT}
     third_party/minhook/include
     third_party/minhook/src
 )
@@ -53,19 +60,33 @@ set_target_properties(qtcore_qm PROPERTIES
 # 2. 编译主启动器图形界面程序
 add_executable(CS2WorkshopToolsLocalizerCN WIN32
     src/main.cpp
-    src/mainwindow.cpp
-    src/debug_window.cpp
-    src/cs2_detector.cpp
-    src/pe_patcher.cpp
-    src/fgd_translator.cpp
-    src/backup_manager.cpp
-    src/dictionary_compiler.cpp
+
+    src/ui/mainwindow.cpp
+    src/ui/debug_window.cpp
+
+    src/service/localization_service.cpp
+    src/service/dictionary_service.cpp
+    src/service/hammer_service.cpp
+
+    src/core/cs2_detector.cpp
+    src/core/pe_patcher.cpp
+    src/core/fgd_core.cpp
+    src/core/fgd_translator.cpp
+    src/core/backup_manager.cpp
+    src/core/dictionary_compiler.cpp
+    src/core/launcher_config.cpp
+    src/core/process_monitor.cpp
+    src/core/hammer_ipc.cpp
 )
 
 set_target_properties(CS2WorkshopToolsLocalizerCN PROPERTIES
     AUTOMOC ON
     AUTORCC ON
     AUTOUIC ON
+)
+
+target_include_directories(CS2WorkshopToolsLocalizerCN PRIVATE
+    ${LAYERED_INCLUDE_ROOT}
 )
 
 target_compile_definitions(CS2WorkshopToolsLocalizerCN PRIVATE
@@ -97,29 +118,7 @@ add_custom_command(TARGET CS2WorkshopToolsLocalizerCN POST_BUILD
         "$<TARGET_FILE_DIR:CS2WorkshopToolsLocalizerCN>/qtcore_qm.dll"
 )
 
-# 3. 单元与集成测试程序
-add_executable(test_components
-    tests/test_components.cpp
-    src/cs2_detector.cpp
-    src/pe_patcher.cpp
-    src/fgd_translator.cpp
-    src/backup_manager.cpp
-    src/hook_manager.cpp
-    src/dictionary_compiler.cpp
-    third_party/minhook/src/buffer.c
-    third_party/minhook/src/hook.c
-    third_party/minhook/src/trampoline.c
-    third_party/minhook/src/hde/hde64.c
-)
-target_include_directories(test_components PRIVATE
-    third_party/minhook/include
-    third_party/minhook/src
-)
-target_link_libraries(test_components PRIVATE
-    Qt6::Core
-    advapi32
-    user32
-    shell32
-    version
-    psapi
-)
+# 说明：本项目不设单元测试目标。
+# 注入型改动的行为正确性只能靠实际 HOOK 到 Hammer 进程验证，
+# 脱离宿主进程的单测无法覆盖真实时序，反而会给出虚假的安全感。
+# 验证方式见 README「验证」章节。

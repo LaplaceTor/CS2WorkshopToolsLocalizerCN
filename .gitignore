@@ -4,6 +4,7 @@
 build/
 build-*/
 tmp/
+.workbuddy-ai/
 bin/
 out/
 dist/
