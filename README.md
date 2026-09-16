@@ -3,6 +3,9 @@
 > 专为 **Counter-Strike 2 (CS2)** 创意工坊工具集（Hammer 地图编辑器、ModelDoc、材质编辑器等 Workshop Tools）打造的一键中文汉化与启动工具。
 > 开箱即用、安全无痕，支持自由修改与扩充汉化词库！
 
+[![ko-fi](https://ko-fi.com/img/githubbutton_sm.svg)](https://ko-fi.com/R5S426JG8P)
+[![爱发电](https://img.shields.io/badge/爱发电-赞助支持-946ce6?style=for-the-badge&logo=afdian&logoColor=white)](https://afdian.com/a/laplacetor)
+
 ---
 
 ## 📑 目录
