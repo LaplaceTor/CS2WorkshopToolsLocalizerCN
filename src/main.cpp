@@ -1,4 +1,5 @@
 #include <QApplication>
+#include <QFont>
 #include <QMessageBox>
 #include <QStyleFactory>
 #include "ui/mainwindow.h"
@@ -9,6 +10,18 @@ int main(int argc, char *argv[]) {
     QApplication app(argc, argv);
     app.setApplicationName("CS2WorkshopToolsLocalizerCN");
     app.setOrganizationName("CS2TranslationTools");
+
+    // 显式指定全局默认字体链：优先现代中文字体，紧接着挂载 Emoji 字体保证跨环境 Emoji 与中文渲染统一
+    QFont globalFont;
+    globalFont.setFamilies({
+        "Microsoft YaHei UI",
+        "Microsoft YaHei",
+        "Segoe UI",
+        "Segoe UI Emoji",
+        "Noto Color Emoji"
+    });
+    globalFont.setPointSize(9);
+    app.setFont(globalFont);
 
     // 设置全局现代暗色调样式
     app.setStyle(QStyleFactory::create("Fusion"));
