@@ -16,6 +16,7 @@
 #include "core/dictionary_compiler.h"
 #include "core/encoding_util.h"
 #include "core/fgd_core.h"
+#include "core/process_guard.h"
 #include "hde/hde64.h"
 #include <filesystem>
 #include <fstream>
@@ -2966,6 +2967,7 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD ul_reason_for_call, LPVOID lpReserv
     if (ul_reason_for_call == DLL_PROCESS_ATTACH) {
         DisableThreadLibraryCalls(hModule);
         g_hModule = hModule;
+        ProcessGuard::EnforceCs2ToolsEnvironment();
     }
     return TRUE;
 }

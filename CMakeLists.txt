@@ -37,6 +37,7 @@ set(LAYERED_INCLUDE_ROOT ${CMAKE_CURRENT_SOURCE_DIR}/src)
 # 1. 编译注入 DLL qtcore_qm.dll
 add_library(qtcore_qm SHARED
     src/core/qtcore_qm.cpp
+    src/core/process_guard.cpp
     src/core/hook_manager.cpp
     src/core/pe_patcher.cpp
     src/core/dictionary_compiler.cpp
@@ -69,6 +70,7 @@ add_executable(CS2WorkshopToolsLocalizerCN WIN32
     src/service/hammer_service.cpp
 
     src/core/cs2_detector.cpp
+    src/core/process_guard.cpp
     src/core/pe_patcher.cpp
     src/core/fgd_core.cpp
     src/core/fgd_translator.cpp
