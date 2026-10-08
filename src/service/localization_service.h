@@ -27,11 +27,11 @@ public:
         std::wstring workingDir;  // 本工具工作目录（backup/ 与 translations/ 的父目录）
     };
 
-    // 完整注入流程：版本校验与原版备份 → FGD 汉化 → Qt 补丁部署。
+    // 完整注入流程：版本校验与原版备份 → FGD 纯内存引擎配置 → Qt 补丁部署。
     // 任一步失败都会自动尝试还原，避免游戏停留在「半注入」状态。
     static bool Inject(const Context& ctx, bool useMachineTrans, const LogSink& log);
 
-    // 还原原版 FGD 与 Qt5Core.dll。
+    // 还原原版 Qt5Core.dll 并清理临时注入文件。
     // showLog=false 用于注入失败后的自动回滚（静默），true 用于用户手动点击还原。
     static bool Restore(const Context& ctx, bool showLog, const LogSink& log);
 

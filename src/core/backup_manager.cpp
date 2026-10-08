@@ -402,41 +402,6 @@ bool BackupManager::CreateOrUpdateBackup(const std::wstring& cs2Root, const std:
     return true;
 }
 
-bool BackupManager::BackupFgdFiles(const std::wstring& cs2Root, const std::wstring& backupDir, std::vector<std::wstring>& outBackedUpFiles, std::wstring& outError) {
-    try {
-        fs::path cs2Path(cs2Root);
-        fs::path gamePath = cs2Path / paths::kGameDir;
-        fs::path backupPath(backupDir);
-
-        if (!fs::exists(gamePath)) {
-            outError = L"未找到 CS2 game 目录: " + gamePath.wstring();
-            return false;
-        }
-
-        for (const auto& entry : fs::recursive_directory_iterator(gamePath)) {
-            if (entry.is_regular_file() && entry.path().extension() == L".fgd") {
-                fs::path relPath = fs::relative(entry.path(), cs2Path);
-                fs::path dstPath = backupPath / relPath;
-
-                // 安全策略：如果 backup 目录中已有该原版文件，则保留现有备份，防止已汉化文件覆盖纯净原版
-                if (!fs::exists(dstPath)) {
-                    fs::create_directories(dstPath.parent_path());
-                    if (!SafeCopyFileWithRetry(entry.path(), dstPath)) {
-                        outError = L"复制原版 FGD 失败 (文件被占用或无写权限): " + dstPath.wstring();
-                        return false;
-                    }
-                }
-
-                outBackedUpFiles.push_back(relPath.wstring());
-            }
-        }
-        return !outBackedUpFiles.empty();
-    } catch (const std::exception& e) {
-        outError = L"备份 FGD 发生异常: " + QString::fromUtf8(e.what()).toStdWString();
-        return false;
-    }
-}
-
 bool BackupManager::BackupQtCore(const std::wstring& cs2Root, const std::wstring& backupDir, std::wstring& outError) {
     try {
         fs::path srcQtCore = paths::Qt5Core(cs2Root);

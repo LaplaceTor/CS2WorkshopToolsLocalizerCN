@@ -157,9 +157,9 @@ cmake --build build --config Release
 
 ```text
 [1/3] 正在校验游戏版本并准备原版备份...
-[+] 成功捕获并绑定 N 个原版 FGD 与 Qt5Core.dll
-[2/3] 正在部署 FGD 汉化...
-[+] 成功汉化并部署 N 个 FGD 文件
+[+] 成功捕获并绑定官方原版 Qt5Core.dll（FGD 采用纯内存引擎，免磁盘备份）
+[2/3] 正在准备 FGD 纯内存汉化引擎...
+[+] FGD 实体汉化引擎就绪：采用纯内存动态指向模式（0 磁盘写入，零文件污染）
 [3/3] 正在部署 Qt 汉化模块并修补 Qt5Core.dll...
 [+] Qt5Core.dll PE Code Cave 注入与重定向修补成功
 [SUCCESS] 汉化补丁注入完成，当前处于"已注入"状态。
@@ -419,13 +419,14 @@ CS2WorkshopToolsLocalizerCN/
 │   │   ├── mainwindow.*    # 主界面（读取 UI 状态 → 调用 Service → 展示结果）
 │   │   └── debug_window.*  # 调试监控窗口
 │   ├── service/            # Service 层：业务流程编排，不依赖任何 Qt 控件
-│   │   ├── localization_service.*  # 备份 → FGD 汉化 → Qt 补丁 → 还原
+│   │   ├── localization_service.*  # 备份 → FGD 内存引擎 → Qt 补丁 → 还原
 │   │   ├── dictionary_service.*    # 在线词典下载 / JSONC 校验 / 原子落盘
 │   │   └── hammer_service.*        # HAMMER 启动、进程监控、IPC、热重载
 │   ├── core/               # Core 层：具体功能实现，不反向依赖 UI
 │   │   ├── cs2_detector.*      # CS2 / Addon 目录检测（注册表 + 库文件夹 + 常见路径）
-│   │   ├── backup_manager.*    # 原版文件备份与一致性校验（SHA256）
-│   │   ├── fgd_translator.*    # FGD 实体定义汉化
+│   │   ├── process_guard.*     # 宿主进程安全守卫（-tools 校验与拦截）
+│   │   ├── backup_manager.*    # 原版 Qt5Core 备份与一致性校验（SHA256）
+│   │   ├── fgd_translator.* / fgd_core.*  # FGD 实体定义纯内存汉化与解析
 │   │   ├── pe_patcher.*        # Qt5Core.dll 的 PE Code Cave 注入与重定向
 │   │   ├── dictionary_compiler.*# JSONC 词典解析、模块子块与 fallback 合并
 │   │   ├── process_monitor.*   # HAMMER 进程存活性三路探测

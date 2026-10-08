@@ -149,13 +149,13 @@ bool LocalizationService::Inject(const Context& ctx, bool useMachineTrans, const
         }
     }
 
-    std::vector<std::wstring> backedFgd;
+    std::vector<std::wstring> backedFiles;
     std::wstring err;
 
     if (!BackupManager::CreateOrUpdateBackup(
             ctx.cs2Root,
             backupDir.wstring(),
-            backedFgd,
+            backedFiles,
             err,
             forceRecreate)) {
 
@@ -381,7 +381,7 @@ bool LocalizationService::Restore(const Context& ctx, bool showLog, const LogSin
 
     if (showLog) {
         log(
-            "[SUCCESS] 还原操作完成！所有原版 FGD 实体定义及 Qt5Core.dll 已恢复原样。",
+            "[SUCCESS] 还原操作完成！官方原版 Qt5Core.dll 已恢复原样，临时注入文件已清理。",
             "#a6e22e"
         );
     }

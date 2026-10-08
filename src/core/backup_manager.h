@@ -46,16 +46,13 @@ public:
     // 严格校验备份是否与当前 CS2 游戏版本匹配
     static BackupValidationResult BackupMatchesCurrentGame(const std::wstring& cs2Root, const std::wstring& backupDir);
 
-    // 创建或更新完整备份（包含 FGD 文件、Qt5Core.dll 以及绑定的 backup_manifest.json）
+    // 创建或更新完整备份（包含 Qt5Core.dll 以及绑定的 backup_manifest.json，FGD 采用纯内存引擎无需磁盘备份）
     static bool CreateOrUpdateBackup(const std::wstring& cs2Root, const std::wstring& backupDir, std::vector<std::wstring>& outBackedUpFiles, std::wstring& outError, bool forceRecreate = false);
-
-    // 递归备份 CS2 目录下的所有 FGD 文件到 backupDir（按相对路径）
-    static bool BackupFgdFiles(const std::wstring& cs2Root, const std::wstring& backupDir, std::vector<std::wstring>& outBackedUpFiles, std::wstring& outError);
 
     // 备份 Qt5Core.dll 到 backupDir/game/bin/win64/Qt5Core.dll
     static bool BackupQtCore(const std::wstring& cs2Root, const std::wstring& backupDir, std::wstring& outError);
 
-    // 从 backupDir 完整恢复所有 FGD 和 Qt5Core.dll 到 CS2 目录，并清理临时注入文件（默认带版本匹配检查）
+    // 从 backupDir 完整恢复原版 Qt5Core.dll 到 CS2 目录，并清理临时注入文件（默认带版本匹配检查）
     static bool RestoreAll(const std::wstring& cs2Root, const std::wstring& backupDir, std::wstring& outError, bool force = false);
 
     // 检查 CS2 目录中是否存在未还原的补丁文件（如 qtcore_qm.dll）
