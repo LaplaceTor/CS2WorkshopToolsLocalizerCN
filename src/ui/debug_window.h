@@ -30,26 +30,22 @@ private slots:
     void onRefreshTimer();
     void onToggleLangClicked();
     void onHotReloadClicked();
-    void onLaunchDebugHammerClicked();
     void onCopyReportClicked();
     void onClearLogClicked();
     void onFilterTextChanged(const QString& text);
-    void onCheckCrashEventsClicked();
 
 private:
     void setupUi();
 
-    // setupUi 的分区构建（原 155 行 setupUi 拆分为 5 个专职函数，各自只负责一块 UI）
+    // setupUi 的分区构建
     QWidget*     createStatusDashboard();  // 顶部：目标进程与汉化状态看板
     QHBoxLayout* createControlToolbar();   // 按钮工具条（含信号连接）
     QWidget*     createHookLogTab();       // Tab 1：实时 Hook 日志流
-    QWidget*     createCrashTab();         // Tab 2：崩溃捕获与事件诊断
-    QWidget*     createModulesTab();       // Tab 3：已加载模块诊断
+    QWidget*     createModulesTab();       // Tab 2：已加载模块诊断
 
     void updateProcessDashboard();
     void pollHookRuntimeLog();
     void queryHammerLanguageStatus();
-    void checkCrashDumps();
     void queryLoadedModules();
 
     std::wstring m_cs2Root;
@@ -65,7 +61,6 @@ private:
     // 交互操作按钮
     QPushButton* m_btnToggleLang;
     QPushButton* m_btnHotReload;
-    QPushButton* m_btnLaunchDebug;
     QPushButton* m_btnCopyReport;
     QPushButton* m_btnClearLog;
 
@@ -79,11 +74,7 @@ private:
     qint64 m_lastLogFilePos;
     QStringList m_allLogLines;
 
-    // Tab 2: 崩溃捕获与事件诊断
-    QPlainTextEdit* m_txtCrashReport;
-    QPushButton* m_btnCheckCrash;
-
-    // Tab 3: 已加载模块诊断
+    // Tab 2: 已加载模块诊断
     QTableWidget* m_tblModules;
 
     // 运行缓存

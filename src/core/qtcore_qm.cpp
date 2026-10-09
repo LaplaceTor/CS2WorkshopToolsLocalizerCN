@@ -248,7 +248,7 @@ static std::wstring GetBinDirectory() {
 }
 
 // 详细翻译日志开关：默认在 Release 模式下关闭以彻底消除巨量 I/O。
-// 仅当 CS2 启动命令行中包含 -debug 或 -verbosehook 时才动态开启逐条翻译日志记录。
+// 仅当 CS2 启动命令行中包含 -verbosehook 时才动态开启逐条翻译日志记录。
 static std::atomic<int> g_nVerboseHookLog{-1}; // -1: 未检测, 0: 关闭, 1: 开启
 
 static bool IsVerboseLogEnabled() {
@@ -260,9 +260,7 @@ static bool IsVerboseLogEnabled() {
     if (pCmdLine) {
         std::wstring cmd = pCmdLine;
         std::transform(cmd.begin(), cmd.end(), cmd.begin(), ::towlower);
-        if (cmd.find(L"-debug") != std::wstring::npos ||
-            cmd.find(L"--debug") != std::wstring::npos ||
-            cmd.find(L"-verbosehook") != std::wstring::npos) {
+        if (cmd.find(L"-verbosehook") != std::wstring::npos) {
             enabled = true;
         }
     }
@@ -2587,124 +2585,9 @@ static bool SafeReadPointer(void* ptr, void*& outVal) {
 }
 
 // ==============================================================================
-// 6. 异常诊断捕获器（VEH 保持极简纯内存快照，耗时格式化/文件 I/O/模块查询/MiniDump 全部交给 Worker 线程）
+// 6. 异常诊断与生命周期管理
 // ==============================================================================
 static HMODULE g_hModule = NULL;
-
-struct CrashContextSnapshot {
-    std::atomic<bool> captured{false};
-    DWORD threadId{0};
-    DWORD processId{0};
-    DWORD exceptionCode{0};
-    void* rip{nullptr};
-    ULONG_PTR faultAddr{0};
-    int accessType{0};
-    CONTEXT contextRecord{};
-    void* stackSnapshot[32]{};
-    size_t stackDepth{0};
-};
-
-static CrashContextSnapshot g_CrashSnapshot;
-static HANDLE g_hCrashReportEvent = NULL;
-static std::atomic<bool> g_bCrashSnapshotConsumed{false};
-
-static void ProcessCrashReportAsync() {
-    if (!g_CrashSnapshot.captured.load(std::memory_order_acquire)) {
-        return;
-    }
-
-    // 严格保证单消费者执行语义（Single-Consumer Semantics）
-    bool expected = false;
-    if (!g_bCrashSnapshotConsumed.compare_exchange_strong(expected, true, std::memory_order_acq_rel)) {
-        return;
-    }
-
-    // 延迟在 Worker 线程上下文中安全停用所有 Hook（避免在 VEH 异常拦截上下文中调用 VirtualProtect 或争用内部锁）
-    HookManager::Instance().EmergencyDisableAllHooks();
-
-    DWORD code = g_CrashSnapshot.exceptionCode;
-    void* rip = g_CrashSnapshot.rip;
-    wchar_t modNameBuf[MAX_PATH] = {0};
-    GetCallerModuleName(rip, modNameBuf, MAX_PATH);
-    int accessType = g_CrashSnapshot.accessType;
-    ULONG_PTR faultAddr = g_CrashSnapshot.faultAddr;
-
-    LogHook("================ [CRASH EXCEPTION CAPTURED (WORKER)] ================");
-    LogHook("Thread ID      : %u (0x%X)", g_CrashSnapshot.threadId, g_CrashSnapshot.threadId);
-    LogHook("Exception Code : 0x%08X", code);
-    LogHook("Faulting RIP   : %p (Module: %ls)", rip, modNameBuf);
-    if (code == EXCEPTION_ACCESS_VIOLATION) {
-        LogHook("Access Violation: Attempt to %s memory at address %p",
-            accessType == 0 ? "READ" : (accessType == 1 ? "WRITE" : "EXECUTE"), (void*)faultAddr);
-    }
-    const CONTEXT& ctx = g_CrashSnapshot.contextRecord;
-    LogHook("Registers:");
-    LogHook("  RAX=%p  RBX=%p  RCX=%p  RDX=%p", (void*)ctx.Rax, (void*)ctx.Rbx, (void*)ctx.Rcx, (void*)ctx.Rdx);
-    LogHook("  RSI=%p  RDI=%p  RSP=%p  RBP=%p", (void*)ctx.Rsi, (void*)ctx.Rdi, (void*)ctx.Rsp, (void*)ctx.Rbp);
-    LogHook("  R8 =%p  R9 =%p  R10=%p  R11=%p", (void*)ctx.R8, (void*)ctx.R9, (void*)ctx.R10, (void*)ctx.R11);
-    LogHook("  R12=%p  R13=%p  R14=%p  R15=%p", (void*)ctx.R12, (void*)ctx.R13, (void*)ctx.R14, (void*)ctx.R15);
-
-    LogHook("Stack Frames (Top %zu):", g_CrashSnapshot.stackDepth);
-    for (size_t i = 0; i < g_CrashSnapshot.stackDepth; ++i) {
-        void* frame = g_CrashSnapshot.stackSnapshot[i];
-        if (frame) {
-            wchar_t mBuf[MAX_PATH] = {0};
-            if (GetCallerModuleName(frame, mBuf, MAX_PATH)) {
-                LogHook("  [RSP+0x%02zX] %p (%ls)", i * 8, frame, mBuf);
-            } else {
-                LogHook("  [RSP+0x%02zX] %p", i * 8, frame);
-            }
-        }
-    }
-    LogHook("====================================================================");
-
-    // 自动写入 MiniDump（在 Worker 线程上下文中安全调用，明确从 System32 加载系统组件）
-    wchar_t szSysDir[MAX_PATH] = {0};
-    GetSystemDirectoryW(szSysDir, MAX_PATH);
-    std::wstring dbgHelpPath = std::wstring(szSysDir) + L"\\dbghelp.dll";
-    HMODULE hDbgHelp = LoadLibraryExW(dbgHelpPath.c_str(), NULL, LOAD_LIBRARY_SEARCH_SYSTEM32);
-    if (!hDbgHelp) {
-        hDbgHelp = LoadLibraryW(dbgHelpPath.c_str());
-    }
-    if (hDbgHelp) {
-        typedef BOOL(WINAPI* fnMiniDumpWriteDump)(HANDLE, DWORD, HANDLE, int, PVOID, PVOID, PVOID);
-        fnMiniDumpWriteDump pDump = (fnMiniDumpWriteDump)GetProcAddress(hDbgHelp, "MiniDumpWriteDump");
-        if (pDump) {
-            std::wstring dumpPath = GetBinDirectory() + L"captured_crash.dmp";
-            HANDLE hFile = CreateFileW(dumpPath.c_str(), GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
-            if (hFile != INVALID_HANDLE_VALUE) {
-                EXCEPTION_POINTERS ep;
-                EXCEPTION_RECORD er = {0};
-                er.ExceptionCode = code;
-                er.ExceptionAddress = rip;
-                er.NumberParameters = 2;
-                er.ExceptionInformation[0] = accessType;
-                er.ExceptionInformation[1] = faultAddr;
-
-                CONTEXT ctxCopy = ctx;
-                ep.ExceptionRecord = &er;
-                ep.ContextRecord = &ctxCopy;
-
-                struct {
-                    DWORD ThreadId;
-                    PEXCEPTION_POINTERS ExceptionPointers;
-                    BOOL ClientPointers;
-                } exInfo;
-                exInfo.ThreadId = g_CrashSnapshot.threadId;
-                exInfo.ExceptionPointers = &ep;
-                // 默认生成轻量级 MiniDumpNormal (0x00000000)，开发模式通过环境变量 CS2_TRANSLATOR_FULL_DUMP=1 开启 FullMemory
-                int dumpType = 0; // MiniDumpNormal
-                wchar_t envBuf[16] = {0};
-                if (GetEnvironmentVariableW(L"CS2_TRANSLATOR_FULL_DUMP", envBuf, 16) > 0 && envBuf[0] == L'1') {
-                    dumpType = 2; // MiniDumpWithFullMemory
-                }
-                pDump(GetCurrentProcess(), GetCurrentProcessId(), hFile, dumpType, &exInfo, NULL, NULL);
-                CloseHandle(hFile);
-                LogHook("[DUMP] %s minidump saved to: captured_crash.dmp", (dumpType == 2 ? "Full" : "Standard"));
-            }
-        }
-    }
-}
 
 #define WM_LOCALIZER_TOGGLE_LANG   (WM_USER + 101)
 #define WM_LOCALIZER_RELOAD_DICT   (WM_USER + 102)
@@ -2749,8 +2632,6 @@ static DWORD WINAPI ToolsHookThread(LPVOID lpParam) {
     PrecompileFgdBuffers();
     TryHookFileSystem();
 
-    HANDLE waitHandles[2] = { g_hWakeHookEvent, g_hCrashReportEvent };
-
     while (!g_bStopHookThread.load(std::memory_order_relaxed)) {
         // 泵送 IPC 窗口消息
         MSG msg;
@@ -2785,22 +2666,8 @@ static DWORD WINAPI ToolsHookThread(LPVOID lpParam) {
             }
         }
 
-        // 检查是否有崩溃报告待异步处理
-        if (g_CrashSnapshot.captured.load(std::memory_order_acquire)) {
-            ProcessCrashReportAsync();
-            break;
-        }
-
         DWORD timeout = (g_bWidgetsHooked.load() && g_bGuiHooked.load() && g_bFileSystemHooked.load()) ? 500 : 50;
-        DWORD waitRes = MsgWaitForMultipleObjectsEx(2, waitHandles, timeout, QS_ALLINPUT, MWMO_INPUTAVAILABLE);
-        if (waitRes == WAIT_OBJECT_0 + 1) {
-            ProcessCrashReportAsync();
-            break;
-        }
-    }
-
-    if (g_CrashSnapshot.captured.load(std::memory_order_acquire)) {
-        ProcessCrashReportAsync();
+        MsgWaitForMultipleObjectsEx(1, &g_hWakeHookEvent, timeout, QS_ALLINPUT, MWMO_INPUTAVAILABLE);
     }
 
     if (hIpcWnd) {
@@ -2872,41 +2739,7 @@ static LONG WINAPI DiagnosticCrashLoggerVEH(PEXCEPTION_POINTERS pExceptionInfo) 
         }
     }
 
-    // 2. 严重异常原子最小化快照（100% 纯寄存器与栈内存抓取，零系统锁与文件操作，交给 Worker 异步处理）
-    if (code == EXCEPTION_ACCESS_VIOLATION || code == EXCEPTION_ILLEGAL_INSTRUCTION || code == EXCEPTION_DATATYPE_MISALIGNMENT) {
-        bool expected = false;
-        if (g_CrashSnapshot.captured.compare_exchange_strong(expected, true, std::memory_order_acq_rel)) {
-            g_CrashSnapshot.threadId = GetCurrentThreadId();
-            g_CrashSnapshot.processId = GetCurrentProcessId();
-            g_CrashSnapshot.exceptionCode = code;
-            g_CrashSnapshot.rip = (void*)pExceptionInfo->ContextRecord->Rip;
-            if (code == EXCEPTION_ACCESS_VIOLATION && pExceptionInfo->ExceptionRecord->NumberParameters >= 2) {
-                g_CrashSnapshot.accessType = (int)pExceptionInfo->ExceptionRecord->ExceptionInformation[0];
-                g_CrashSnapshot.faultAddr = pExceptionInfo->ExceptionRecord->ExceptionInformation[1];
-            }
-            g_CrashSnapshot.contextRecord = *pExceptionInfo->ContextRecord;
-
-            // 纯栈指针无锁快照
-            void** rsp = (void**)pExceptionInfo->ContextRecord->Rsp;
-            size_t depth = 0;
-            if (rsp) {
-                for (int i = 0; i < 32; ++i) {
-                    void* frame = nullptr;
-                    if (SafeReadPointer(&rsp[i], frame) && frame) {
-                        g_CrashSnapshot.stackSnapshot[depth++] = frame;
-                    }
-                }
-            }
-            g_CrashSnapshot.stackDepth = depth;
-
-            // 唤醒后台 Worker 线程进行复杂格式化与写盘
-            if (g_hCrashReportEvent) {
-                SetEvent(g_hCrashReportEvent);
-            }
-        }
-    }
-
-    // 允许异常在宿主进程中继续正常传播
+    // 2. 其他异常直接放行交由宿主 (Valve) 原生报错机制与系统 WER 生成 MiniDump
     return EXCEPTION_CONTINUE_SEARCH;
 }
 
@@ -2966,12 +2799,9 @@ extern "C" __declspec(dllexport) bool InitializeTranslator() {
     // 立即挂钩 VFileSystem017::ReadFileToBuffer，抢在 Hammer 加载 FGD 前就绪
     TryHookFileSystem();
 
-    // 2. 创建异步唤醒事件与崩溃报告事件，并注册 DLL 通知
+    // 2. 创建异步唤醒事件并注册 DLL 通知
     if (!g_hWakeHookEvent) {
         g_hWakeHookEvent = CreateEventW(NULL, FALSE, FALSE, NULL);
-    }
-    if (!g_hCrashReportEvent) {
-        g_hCrashReportEvent = CreateEventW(NULL, FALSE, FALSE, NULL);
     }
     HookManager::Instance().RegisterDllNotification(OnDllNotification);
 
@@ -3018,10 +2848,6 @@ extern "C" __declspec(dllexport) void ShutdownTranslator() {
     if (g_hWakeHookEvent) {
         CloseHandle(g_hWakeHookEvent);
         g_hWakeHookEvent = NULL;
-    }
-    if (g_hCrashReportEvent) {
-        CloseHandle(g_hCrashReportEvent);
-        g_hCrashReportEvent = NULL;
     }
 
     // 3. 统一执行完整生命周期退出：

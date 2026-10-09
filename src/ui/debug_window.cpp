@@ -53,7 +53,7 @@ DebugWindow::DebugWindow(const std::wstring& cs2Root, QWidget* parent)
 
     // 立即执行一次初始状态检测
     onRefreshTimer();
-    onCheckCrashEventsClicked();
+    queryLoadedModules();
 }
 
 DebugWindow::~DebugWindow() {
@@ -119,10 +119,6 @@ QHBoxLayout* DebugWindow::createControlToolbar() {
     m_btnHotReload->setToolTip("向注入模块发送 WM_LOCALIZER_RELOAD_DICT 消息");
     m_btnHotReload->setStyleSheet("QPushButton { background-color: #8957e5; color: white; font-weight: bold; padding: 6px 12px; border-radius: 4px; } QPushButton:hover { background-color: #a371f7; }");
 
-    m_btnLaunchDebug = new QPushButton("🚀 启动调试版 Hammer", this);
-    m_btnLaunchDebug->setToolTip("启动带 -vulkan -debug -verbosehook 参数的 cs2.exe -tools -addons test");
-    m_btnLaunchDebug->setStyleSheet("QPushButton { background-color: #238636; color: white; font-weight: bold; padding: 6px 12px; border-radius: 4px; } QPushButton:hover { background-color: #2ea043; }");
-
     m_btnCopyReport = new QPushButton("📋 复制完整诊断报告", this);
     m_btnCopyReport->setStyleSheet("QPushButton { background-color: #30363d; color: #c9d1d9; font-weight: bold; padding: 6px 12px; border-radius: 4px; } QPushButton:hover { background-color: #484f58; }");
 
@@ -131,13 +127,11 @@ QHBoxLayout* DebugWindow::createControlToolbar() {
 
     actLayout->addWidget(m_btnToggleLang);
     actLayout->addWidget(m_btnHotReload);
-    actLayout->addWidget(m_btnLaunchDebug);
     actLayout->addWidget(m_btnCopyReport);
     actLayout->addWidget(m_btnClearLog);
 
     connect(m_btnToggleLang, &QPushButton::clicked, this, &DebugWindow::onToggleLangClicked);
     connect(m_btnHotReload, &QPushButton::clicked, this, &DebugWindow::onHotReloadClicked);
-    connect(m_btnLaunchDebug, &QPushButton::clicked, this, &DebugWindow::onLaunchDebugHammerClicked);
     connect(m_btnCopyReport, &QPushButton::clicked, this, &DebugWindow::onCopyReportClicked);
     connect(m_btnClearLog, &QPushButton::clicked, this, &DebugWindow::onClearLogClicked);
 
@@ -154,7 +148,7 @@ QWidget* DebugWindow::createHookLogTab() {
     filterLayout->addWidget(new QLabel("🔍 文本过滤:", tabLog));
 
     m_txtFilter = new QLineEdit(tabLog);
-    m_txtFilter->setPlaceholderText("输入关键词实时过滤，如 [LANG], [IPC], [TR], [GUARD], [DUMP]...");
+    m_txtFilter->setPlaceholderText("输入关键词实时过滤，如 [LANG], [IPC], [TR], [GUARD]...");
     m_txtFilter->setStyleSheet("background-color: #161b22; color: #c9d1d9; border: 1px solid #30363d; border-radius: 4px; padding: 4px 8px;");
     connect(m_txtFilter, &QLineEdit::textChanged, this, &DebugWindow::onFilterTextChanged);
     filterLayout->addWidget(m_txtFilter);
@@ -170,30 +164,6 @@ QWidget* DebugWindow::createHookLogTab() {
     logLayout->addWidget(m_txtHookLog);
 
     return tabLog;
-}
-
-QWidget* DebugWindow::createCrashTab() {
-    QWidget* tabCrash = new QWidget();
-    QVBoxLayout* crashLayout = new QVBoxLayout(tabCrash);
-    crashLayout->setContentsMargins(8, 8, 8, 8);
-    crashLayout->setSpacing(6);
-
-    QHBoxLayout* crashTopLayout = new QHBoxLayout();
-    crashTopLayout->addWidget(new QLabel("🚨 MiniDump 转储与 Windows 事件日志 (Event 1000 崩溃检测):", tabCrash));
-    crashTopLayout->addStretch();
-
-    m_btnCheckCrash = new QPushButton("🔄 重新检测崩溃日志", tabCrash);
-    m_btnCheckCrash->setStyleSheet("QPushButton { background-color: #21262d; color: #c9d1d9; padding: 4px 10px; border-radius: 4px; } QPushButton:hover { background-color: #30363d; }");
-    connect(m_btnCheckCrash, &QPushButton::clicked, this, &DebugWindow::onCheckCrashEventsClicked);
-    crashTopLayout->addWidget(m_btnCheckCrash);
-    crashLayout->addLayout(crashTopLayout);
-
-    m_txtCrashReport = new QPlainTextEdit(tabCrash);
-    m_txtCrashReport->setReadOnly(true);
-    m_txtCrashReport->setStyleSheet("background-color: #0d1117; color: #c9d1d9; font-family: 'Consolas', 'Courier New', monospace; font-size: 11px;");
-    crashLayout->addWidget(m_txtCrashReport);
-
-    return tabCrash;
 }
 
 QWidget* DebugWindow::createModulesTab() {
@@ -234,7 +204,6 @@ void DebugWindow::setupUi() {
         "QTabBar::tab:selected { background: #0d1117; color: #58a6ff; border-bottom: 2px solid #58a6ff; }"
     );
     m_tabWidget->addTab(createHookLogTab(), "📜 实时 Hook 日志 (hook_runtime.log)");
-    m_tabWidget->addTab(createCrashTab(), "🚨 崩溃捕获与事件诊断 (Crash Monitor)");
     m_tabWidget->addTab(createModulesTab(), "🧩 已加载工具模块 (Loaded Modules)");
 
     mainLayout->addWidget(m_tabWidget);
@@ -245,6 +214,7 @@ void DebugWindow::onRefreshTimer() {
     updateProcessDashboard();
     pollHookRuntimeLog();
     queryHammerLanguageStatus();
+    queryLoadedModules();
 }
 
 void DebugWindow::updateProcessDashboard() {
@@ -431,93 +401,6 @@ void DebugWindow::onHotReloadClicked() {
     }
 }
 
-void DebugWindow::onLaunchDebugHammerClicked() {
-    QString cs2Exe = QString::fromStdWString(paths::Cs2Exe(m_cs2Root).wstring());
-    if (!QFile::exists(cs2Exe)) {
-        m_txtHookLog->appendPlainText(QString("[CLIENT] 未找到 cs2.exe: %1").arg(cs2Exe));
-        return;
-    }
-
-    QStringList args;
-    args << "-tools" << "-addons" << "test" << "-vulkan" << "-debug" << "-verbosehook";
-
-    bool ok = QProcess::startDetached(cs2Exe, args, QString::fromStdWString(paths::Win64Bin(m_cs2Root).wstring()) + "/");
-    if (ok) {
-        m_txtHookLog->appendPlainText("[CLIENT] 🚀 已拉起调试版 Hammer: cs2.exe -tools -addons test -vulkan -debug -verbosehook");
-    } else {
-        m_txtHookLog->appendPlainText("[CLIENT] ❌ 启动调试版 Hammer 失败");
-    }
-}
-
-void DebugWindow::onCheckCrashEventsClicked() {
-    QString binDir = QString::fromStdWString(paths::Win64Bin(m_cs2Root).wstring()) + "/";
-    m_txtCrashReport->clear();
-
-    QString report;
-    report += "================================================================================\n";
-    report += "                    CS2 Hammer 崩溃捕获与事件诊断报告\n";
-    report += "================================================================================\n";
-    report += QString("诊断时间: %1\n").arg(QDateTime::currentDateTime().toString("yyyy-MM-dd HH:mm:ss"));
-    report += QString("CS2 根目录: %1\n\n").arg(QString::fromStdWString(m_cs2Root));
-
-    // 1. 扫描转储文件
-    report += "--- [1. 本地 MiniDump 文件扫描] ---\n";
-    QDir dir(binDir);
-    QStringList filters;
-    filters << "*.dmp" << "*.mdmp";
-    QFileInfoList dumps = dir.entryInfoList(filters, QDir::Files, QDir::Time);
-
-    if (dumps.isEmpty()) {
-        report += "[OK] 未在 game/bin/win64/ 目录下检测到任何崩溃转储文件 (.dmp / .mdmp)\n";
-    } else {
-        report += QString("检测到 %1 个转储文件:\n").arg(dumps.size());
-        for (const QFileInfo& fi : dumps) {
-            double sizeKb = static_cast<double>(fi.size()) / 1024.0;
-            report += QString("  - %1  (%2 KB, %3)\n")
-                .arg(fi.fileName())
-                .arg(sizeKb, 0, 'f', 1)
-                .arg(fi.lastModified().toString("yyyy-MM-dd HH:mm:ss"));
-        }
-    }
-    report += "\n";
-
-    // 2. 检查 Windows 应用程序事件日志（Event ID 1000 - Application Error）
-    report += "--- [2. Windows 应用程序错误事件日志提取 (Event ID 1000)] ---\n";
-    QProcess ps;
-    QString psScript =
-        "[Console]::OutputEncoding = [System.Text.Encoding]::UTF8; "
-        "$OutputEncoding = [System.Text.Encoding]::UTF8; "
-        "Get-WinEvent -FilterHashtable @{LogName='Application'; ProviderName='Application Error'; Id=1000} -MaxEvents 5 -ErrorAction SilentlyContinue | "
-        "Where-Object { $_.Message -match 'cs2.exe|hammer.dll|propertyeditor.dll|qtcore_qm.dll' } | "
-        "ForEach-Object { "
-        "  [PSCustomObject]@{ Time=$_.TimeCreated; Message=$_.Message } "
-        "} | Format-List";
-
-    ps.start("powershell", QStringList() << "-NoProfile" << "-NonInteractive" << "-ExecutionPolicy" << "Bypass" << "-Command" << psScript);
-    if (ps.waitForFinished(4000)) {
-        QByteArray outBytes = ps.readAllStandardOutput();
-        QString psOut;
-        QStringDecoder decoder(QStringDecoder::Utf8);
-        psOut = decoder(outBytes);
-        if (decoder.hasError()) {
-            psOut = QString::fromLocal8Bit(outBytes);
-        }
-        psOut = psOut.trimmed();
-        if (psOut.isEmpty()) {
-            report += "[OK] 最近 5 条 Application Error 事件中未发现属于 cs2.exe / hammer.dll 的崩溃记录。\n";
-        } else {
-            report += psOut + "\n";
-        }
-    } else {
-        report += "[!] 查询 Windows 事件日志超时。\n";
-    }
-
-    m_txtCrashReport->setPlainText(report);
-
-    // 同步更新 Tab 3 模块列表
-    queryLoadedModules();
-}
-
 void DebugWindow::queryLoadedModules() {
     m_tblModules->setRowCount(0);
     DWORD pid = m_cachedHammerPid;
@@ -576,8 +459,15 @@ void DebugWindow::onCopyReportClicked() {
     }
     report += "\n";
 
-    report += m_txtCrashReport->toPlainText();
-    report += "\n==============================================================================\n";
+    report += "--- [已加载核心模块] ---\n";
+    int rowCount = m_tblModules->rowCount();
+    for (int r = 0; r < rowCount; ++r) {
+        QString modName = m_tblModules->item(r, 0) ? m_tblModules->item(r, 0)->text() : "";
+        QString modBase = m_tblModules->item(r, 1) ? m_tblModules->item(r, 1)->text() : "";
+        QString modSize = m_tblModules->item(r, 2) ? m_tblModules->item(r, 2)->text() : "";
+        report += QString("  - %1  (Base: %2, Size: %3)\n").arg(modName, -24).arg(modBase).arg(modSize);
+    }
+    report += "==============================================================================\n";
 
     QClipboard* cb = QApplication::clipboard();
     if (cb) {

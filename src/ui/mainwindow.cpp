@@ -535,7 +535,7 @@ void MainWindow::setupUi() {
         QSizePolicy::Expanding,
         QSizePolicy::Preferred
     );
-    m_debugBtn->setToolTip("打开专用调试监控窗口，查看实时日志流、内存诊断、崩溃事件与快捷控制");
+    m_debugBtn->setToolTip("打开专用调试监控窗口，查看实时日志流、模块诊断与快捷控制");
     m_debugBtn->setStyleSheet(
         "QPushButton {"
         "  background-color: #21262d;"
