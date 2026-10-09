@@ -247,56 +247,66 @@ static std::wstring GetBinDirectory() {
     return std::wstring(szPath);
 }
 
-// 详细翻译日志开关：默认在 Release 模式下关闭以彻底消除巨量 I/O。
-// 仅当 CS2 启动命令行中包含 -verbosehook 时才动态开启逐条翻译日志记录。
-static std::atomic<int> g_nVerboseHookLog{-1}; // -1: 未检测, 0: 关闭, 1: 开启
+// 跨进程共享内存日志环形缓冲区（100% 纯内存传输，0 磁盘 I/O，不写入任何日志文件）
+static constexpr const wchar_t* SHARED_LOG_MEM_NAME = L"Local\\CS2_Hammer_Localizer_SharedLog";
+static constexpr size_t SHARED_LOG_CAPACITY = 128 * 1024; // 128 KB 环形缓冲区
 
-static bool IsVerboseLogEnabled() {
-    int v = g_nVerboseHookLog.load(std::memory_order_relaxed);
-    if (v != -1) return v == 1;
+#pragma pack(push, 4)
+struct SharedLogHeader {
+    uint32_t magic;         // 0x5A4C434C ('LCLZ')
+    uint32_t writeSeq;      // 单调递增写入总字节数
+    uint32_t writeOffset;   // 当前写入环形偏移
+    char buffer[SHARED_LOG_CAPACITY];
+};
+#pragma pack(pop)
 
-    bool enabled = false;
-    LPCWSTR pCmdLine = GetCommandLineW();
-    if (pCmdLine) {
-        std::wstring cmd = pCmdLine;
-        std::transform(cmd.begin(), cmd.end(), cmd.begin(), ::towlower);
-        if (cmd.find(L"-verbosehook") != std::wstring::npos) {
-            enabled = true;
-        }
-    }
-    g_nVerboseHookLog.store(enabled ? 1 : 0, std::memory_order_relaxed);
-    return enabled;
-}
+static HANDLE g_hSharedLogMap = NULL;
+static SharedLogHeader* g_pSharedLogHeader = nullptr;
+static std::mutex g_SharedLogMutex;
 
-static void LogHookAlwaysV(const char* fmt, va_list args) {
-    static std::mutex s_logMtx;
-    std::lock_guard<std::mutex> lock(s_logMtx);
-
-    std::wstring binDir = GetBinDirectory();
-    std::wstring logPath = binDir + L"hook_runtime.log";
-
-    static std::atomic<int> s_writeCount{0};
-    if ((s_writeCount.fetch_add(1, std::memory_order_relaxed) & 0xFF) == 0) {
-        WIN32_FILE_ATTRIBUTE_DATA fad;
-        if (GetFileAttributesExW(logPath.c_str(), GetFileExInfoStandard, &fad)) {
-            ULONGLONG size = (static_cast<ULONGLONG>(fad.nFileSizeHigh) << 32) | fad.nFileSizeLow;
-            if (size > 8ull * 1024 * 1024) {
-                std::wstring oldPath = logPath + L".old";
-                DeleteFileW(oldPath.c_str());
-                MoveFileW(logPath.c_str(), oldPath.c_str());
+static void EnsureSharedLogMapping() {
+    if (g_pSharedLogHeader) return;
+    g_hSharedLogMap = CreateFileMappingW(
+        INVALID_HANDLE_VALUE,
+        NULL,
+        PAGE_READWRITE,
+        0,
+        sizeof(SharedLogHeader),
+        SHARED_LOG_MEM_NAME
+    );
+    if (g_hSharedLogMap) {
+        g_pSharedLogHeader = reinterpret_cast<SharedLogHeader*>(
+            MapViewOfFile(g_hSharedLogMap, FILE_MAP_ALL_ACCESS, 0, 0, sizeof(SharedLogHeader))
+        );
+        if (g_pSharedLogHeader) {
+            if (g_pSharedLogHeader->magic != 0x5A4C434C) {
+                g_pSharedLogHeader->magic = 0x5A4C434C;
+                g_pSharedLogHeader->writeSeq = 0;
+                g_pSharedLogHeader->writeOffset = 0;
             }
         }
     }
+}
 
-    FILE* fp = _wfopen(logPath.c_str(), L"a");
-    if (!fp) return;
-    va_list va;
-    va_copy(va, args);
-    vfprintf(fp, fmt, va);
-    va_end(va);
-    fprintf(fp, "\n");
-    fflush(fp);
-    fclose(fp);
+static void LogHookAlwaysV(const char* fmt, va_list args) {
+    if (!fmt) return;
+    char formatted[1024] = {0};
+    int len = vsnprintf(formatted, sizeof(formatted) - 2, fmt, args);
+    if (len <= 0) return;
+    formatted[len] = '\n';
+    formatted[len + 1] = '\0';
+    len += 1;
+
+    std::lock_guard<std::mutex> lock(g_SharedLogMutex);
+    EnsureSharedLogMapping();
+    if (!g_pSharedLogHeader) return;
+
+    for (int i = 0; i < len; ++i) {
+        uint32_t offset = g_pSharedLogHeader->writeOffset;
+        g_pSharedLogHeader->buffer[offset] = formatted[i];
+        g_pSharedLogHeader->writeOffset = (offset + 1) % SHARED_LOG_CAPACITY;
+    }
+    g_pSharedLogHeader->writeSeq += static_cast<uint32_t>(len);
 }
 
 static void LogHookAlways(const char* fmt, ...) {
@@ -307,14 +317,6 @@ static void LogHookAlways(const char* fmt, ...) {
 }
 
 static void LogHook(const char* fmt, ...) {
-    va_list args;
-    va_start(args, fmt);
-    LogHookAlwaysV(fmt, args);
-    va_end(args);
-}
-
-static inline void LogVerboseTr(const char* fmt, ...) {
-    if (!IsVerboseLogEnabled()) return;
     va_list args;
     va_start(args, fmt);
     LogHookAlwaysV(fmt, args);
@@ -2029,7 +2031,6 @@ extern "C" __declspec(dllexport) void* __fastcall hk_QMetaObject_tr(const void* 
     if (sourceText && g_pfn_fromUtf8 && pOutQString && g_bDictLoaded.load(std::memory_order_acquire)) {
         std::string trans;
         if (FindTranslationScoped(caller, sourceText, trans)) {
-            LogVerboseTr("[TR] '%s' -> '%s'", sourceText, trans.c_str());
             if (SafeCreateQString(g_pfn_fromUtf8, pOutQString, trans.c_str(), (int)trans.length())) {
                 return pOutQString;
             }
@@ -2854,6 +2855,17 @@ extern "C" __declspec(dllexport) void ShutdownTranslator() {
     //    Unregister callback -> Disable Hook -> Remove Hook -> Remove VEH -> MinHook Uninitialize
     HookManager::Instance().Shutdown();
     LogHook("[SHUTDOWN] ShutdownTranslator completed cleanly");
+
+    // 4. 清理共享内存映射
+    std::lock_guard<std::mutex> logLock(g_SharedLogMutex);
+    if (g_pSharedLogHeader) {
+        UnmapViewOfFile(g_pSharedLogHeader);
+        g_pSharedLogHeader = nullptr;
+    }
+    if (g_hSharedLogMap) {
+        CloseHandle(g_hSharedLogMap);
+        g_hSharedLogMap = NULL;
+    }
 }
 
 extern "C" __declspec(dllexport) void InitQtCoreQmTranslator() {

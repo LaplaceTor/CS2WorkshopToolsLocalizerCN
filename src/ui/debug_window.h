@@ -28,9 +28,6 @@ public:
 
 private slots:
     void onRefreshTimer();
-    void onToggleLangClicked();
-    void onHotReloadClicked();
-    void onCopyReportClicked();
     void onClearLogClicked();
     void onFilterTextChanged(const QString& text);
 
@@ -38,10 +35,9 @@ private:
     void setupUi();
 
     // setupUi 的分区构建
-    QWidget*     createStatusDashboard();  // 顶部：目标进程与汉化状态看板
-    QHBoxLayout* createControlToolbar();   // 按钮工具条（含信号连接）
-    QWidget*     createHookLogTab();       // Tab 1：实时 Hook 日志流
-    QWidget*     createModulesTab();       // Tab 2：已加载模块诊断
+    QWidget* createStatusDashboard();  // 顶部：目标进程与汉化状态看板
+    QWidget* createHookLogTab();       // Tab 1：实时 Hook 日志流
+    QWidget* createModulesTab();       // Tab 2：已加载模块诊断
 
     void updateProcessDashboard();
     void pollHookRuntimeLog();
@@ -58,12 +54,6 @@ private:
     QLabel* m_lblIpcStatus;
     QLabel* m_lblCurrentLang;
 
-    // 交互操作按钮
-    QPushButton* m_btnToggleLang;
-    QPushButton* m_btnHotReload;
-    QPushButton* m_btnCopyReport;
-    QPushButton* m_btnClearLog;
-
     // Tab 视窗
     QTabWidget* m_tabWidget;
 
@@ -71,8 +61,13 @@ private:
     QPlainTextEdit* m_txtHookLog;
     QLineEdit* m_txtFilter;
     QCheckBox* m_chkAutoScroll;
-    qint64 m_lastLogFilePos;
+    QPushButton* m_btnClearLog;
     QStringList m_allLogLines;
+
+    // 共享内存日志读取状态（100% 纯内存传输，0 磁盘文件）
+    void* m_hSharedLogMap = nullptr;
+    const void* m_pSharedLog = nullptr;
+    uint32_t m_lastReadSeq = 0;
 
     // Tab 2: 已加载模块诊断
     QTableWidget* m_tblModules;

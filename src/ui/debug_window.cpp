@@ -12,44 +12,45 @@
 #include <QGroupBox>
 #include <QHeaderView>
 #include <QScrollBar>
-#include <QClipboard>
 #include <QApplication>
-#include <QFile>
-#include <QFileInfo>
-#include <QDateTime>
-#include <QProcess>
-#include <QDir>
-#include <QStringDecoder>
-#include <chrono>
 
-#ifndef WM_LOCALIZER_TOGGLE_LANG
-#define WM_LOCALIZER_TOGGLE_LANG   (WM_USER + 101)
-#endif
-#ifndef WM_LOCALIZER_RELOAD_DICT
-#define WM_LOCALIZER_RELOAD_DICT   (WM_USER + 102)
-#endif
 #ifndef WM_LOCALIZER_QUERY_STATUS
 #define WM_LOCALIZER_QUERY_STATUS  (WM_USER + 103)
 #endif
 
 
 
+// 跨进程共享内存日志环形缓冲区（100% 纯内存传输，0 磁盘 I/O）
+static constexpr const wchar_t* SHARED_LOG_MEM_NAME = L"Local\\CS2_Hammer_Localizer_SharedLog";
+static constexpr size_t SHARED_LOG_CAPACITY = 128 * 1024; // 128 KB 环形缓冲区
+
+#pragma pack(push, 4)
+struct SharedLogHeader {
+    uint32_t magic;         // 0x5A4C434C ('LCLZ')
+    uint32_t writeSeq;      // 单调递增写入总字节数
+    uint32_t writeOffset;   // 当前写入环形偏移
+    char buffer[SHARED_LOG_CAPACITY];
+};
+#pragma pack(pop)
+
 DebugWindow::DebugWindow(const std::wstring& cs2Root, QWidget* parent)
     : QDialog(parent)
     , m_cs2Root(cs2Root)
     , m_pollTimer(new QTimer(this))
-    , m_lastLogFilePos(0)
     , m_cachedHammerPid(0)
     , m_lastKnownLang(0)
+    , m_hSharedLogMap(nullptr)
+    , m_pSharedLog(nullptr)
+    , m_lastReadSeq(0)
 {
     setWindowTitle("CS2 Workshop Tools 汉化调试与监控面板");
-    resize(920, 680);
-    setMinimumSize(780, 520);
+    resize(660, 480);
+    setMinimumSize(540, 360);
 
     setupUi();
 
     connect(m_pollTimer, &QTimer::timeout, this, &DebugWindow::onRefreshTimer);
-    m_pollTimer->start(500); // 500ms 刷新周期
+    m_pollTimer->start(300); // 300ms 刷新周期
 
     // 立即执行一次初始状态检测
     onRefreshTimer();
@@ -59,6 +60,14 @@ DebugWindow::DebugWindow(const std::wstring& cs2Root, QWidget* parent)
 DebugWindow::~DebugWindow() {
     if (m_pollTimer) {
         m_pollTimer->stop();
+    }
+    if (m_pSharedLog) {
+        UnmapViewOfFile(m_pSharedLog);
+        m_pSharedLog = nullptr;
+    }
+    if (m_hSharedLogMap) {
+        CloseHandle(reinterpret_cast<HANDLE>(m_hSharedLogMap));
+        m_hSharedLogMap = nullptr;
     }
 }
 
@@ -74,7 +83,7 @@ QLabel* MakeStatusLabel(const QString& text, const QString& color = "#c9d1d9") {
 }  // namespace
 
 QWidget* DebugWindow::createStatusDashboard() {
-    QGroupBox* grpStatus = new QGroupBox("📊 目标进程与汉化运行状态 (Real-time Dashboard)", this);
+    QGroupBox* grpStatus = new QGroupBox("📊 目标进程与汉化运行状态", this);
     grpStatus->setStyleSheet(
         "QGroupBox { font-weight: bold; border: 1px solid #30363d; border-radius: 6px; margin-top: 6px; padding-top: 10px; }"
         "QGroupBox::title { subcontrol-origin: margin; left: 10px; padding: 0 4px; color: #58a6ff; }"
@@ -82,8 +91,8 @@ QWidget* DebugWindow::createStatusDashboard() {
 
     QGridLayout* statusGrid = new QGridLayout(grpStatus);
     statusGrid->setContentsMargins(12, 8, 12, 8);
-    statusGrid->setHorizontalSpacing(20);
-    statusGrid->setVerticalSpacing(6);
+    statusGrid->setHorizontalSpacing(16);
+    statusGrid->setVerticalSpacing(4);
 
     m_lblHammerStatus = MakeStatusLabel("未检测到 cs2.exe 运行", "#f85149");
     m_lblHammerPid    = MakeStatusLabel("-");
@@ -91,51 +100,20 @@ QWidget* DebugWindow::createStatusDashboard() {
     m_lblIpcStatus    = MakeStatusLabel("未连接", "#f85149");
     m_lblCurrentLang  = MakeStatusLabel("未知", "#8b949e");
 
-    statusGrid->addWidget(new QLabel("Hammer 进程状态:"), 0, 0);
+    statusGrid->addWidget(new QLabel("Hammer 进程:"), 0, 0);
     statusGrid->addWidget(m_lblHammerStatus, 0, 1);
-    statusGrid->addWidget(new QLabel("进程 PID:"), 0, 2);
+    statusGrid->addWidget(new QLabel("PID:"), 0, 2);
     statusGrid->addWidget(m_lblHammerPid, 0, 3);
 
-    statusGrid->addWidget(new QLabel("内存占用 (WorkingSet):"), 1, 0);
+    statusGrid->addWidget(new QLabel("内存占用:"), 1, 0);
     statusGrid->addWidget(m_lblHammerMem, 1, 1);
-    statusGrid->addWidget(new QLabel("IPC 消息窗口:"), 1, 2);
+    statusGrid->addWidget(new QLabel("IPC 状态:"), 1, 2);
     statusGrid->addWidget(m_lblIpcStatus, 1, 3);
 
-    statusGrid->addWidget(new QLabel("当前生效语言:"), 2, 0);
+    statusGrid->addWidget(new QLabel("生效语言:"), 2, 0);
     statusGrid->addWidget(m_lblCurrentLang, 2, 1, 1, 3);
 
     return grpStatus;
-}
-
-QHBoxLayout* DebugWindow::createControlToolbar() {
-    QHBoxLayout* actLayout = new QHBoxLayout();
-    actLayout->setSpacing(8);
-
-    m_btnToggleLang = new QPushButton("🔀 切换原文 / 翻译", this);
-    m_btnToggleLang->setToolTip("向注入模块发送 WM_LOCALIZER_TOGGLE_LANG 消息");
-    m_btnToggleLang->setStyleSheet("QPushButton { background-color: #d29922; color: white; font-weight: bold; padding: 6px 12px; border-radius: 4px; } QPushButton:hover { background-color: #e3b341; }");
-
-    m_btnHotReload = new QPushButton("⚡ 免重启热重载词典", this);
-    m_btnHotReload->setToolTip("向注入模块发送 WM_LOCALIZER_RELOAD_DICT 消息");
-    m_btnHotReload->setStyleSheet("QPushButton { background-color: #8957e5; color: white; font-weight: bold; padding: 6px 12px; border-radius: 4px; } QPushButton:hover { background-color: #a371f7; }");
-
-    m_btnCopyReport = new QPushButton("📋 复制完整诊断报告", this);
-    m_btnCopyReport->setStyleSheet("QPushButton { background-color: #30363d; color: #c9d1d9; font-weight: bold; padding: 6px 12px; border-radius: 4px; } QPushButton:hover { background-color: #484f58; }");
-
-    m_btnClearLog = new QPushButton("🗑 清空日志", this);
-    m_btnClearLog->setStyleSheet("QPushButton { background-color: #21262d; color: #8b949e; padding: 6px 12px; border-radius: 4px; } QPushButton:hover { background-color: #30363d; color: #c9d1d9; }");
-
-    actLayout->addWidget(m_btnToggleLang);
-    actLayout->addWidget(m_btnHotReload);
-    actLayout->addWidget(m_btnCopyReport);
-    actLayout->addWidget(m_btnClearLog);
-
-    connect(m_btnToggleLang, &QPushButton::clicked, this, &DebugWindow::onToggleLangClicked);
-    connect(m_btnHotReload, &QPushButton::clicked, this, &DebugWindow::onHotReloadClicked);
-    connect(m_btnCopyReport, &QPushButton::clicked, this, &DebugWindow::onCopyReportClicked);
-    connect(m_btnClearLog, &QPushButton::clicked, this, &DebugWindow::onClearLogClicked);
-
-    return actLayout;
 }
 
 QWidget* DebugWindow::createHookLogTab() {
@@ -156,6 +134,12 @@ QWidget* DebugWindow::createHookLogTab() {
     m_chkAutoScroll = new QCheckBox("自动滚屏", tabLog);
     m_chkAutoScroll->setChecked(true);
     filterLayout->addWidget(m_chkAutoScroll);
+
+    m_btnClearLog = new QPushButton("🗑 清空日志", tabLog);
+    m_btnClearLog->setStyleSheet("QPushButton { background-color: #21262d; color: #8b949e; padding: 4px 10px; border-radius: 4px; border: 1px solid #30363d; } QPushButton:hover { background-color: #30363d; color: #c9d1d9; }");
+    connect(m_btnClearLog, &QPushButton::clicked, this, &DebugWindow::onClearLogClicked);
+    filterLayout->addWidget(m_btnClearLog);
+
     logLayout->addLayout(filterLayout);
 
     m_txtHookLog = new QPlainTextEdit(tabLog);
@@ -187,28 +171,24 @@ QWidget* DebugWindow::createModulesTab() {
 
 void DebugWindow::setupUi() {
     QVBoxLayout* mainLayout = new QVBoxLayout(this);
-    mainLayout->setContentsMargins(12, 12, 12, 12);
-    mainLayout->setSpacing(10);
+    mainLayout->setContentsMargins(10, 10, 10, 10);
+    mainLayout->setSpacing(8);
 
     // 1. 顶部状态监控仪表盘
     mainLayout->addWidget(createStatusDashboard());
 
-    // 2. 交互控制按钮工具条
-    mainLayout->addLayout(createControlToolbar());
-
-    // 3. Tab 视窗
+    // 2. Tab 视窗
     m_tabWidget = new QTabWidget(this);
     m_tabWidget->setStyleSheet(
         "QTabWidget::pane { border: 1px solid #30363d; border-radius: 4px; background-color: #0d1117; }"
-        "QTabBar::tab { background: #161b22; color: #8b949e; padding: 8px 16px; font-weight: bold; border-top-left-radius: 4px; border-top-right-radius: 4px; }"
+        "QTabBar::tab { background: #161b22; color: #8b949e; padding: 6px 14px; font-weight: bold; border-top-left-radius: 4px; border-top-right-radius: 4px; }"
         "QTabBar::tab:selected { background: #0d1117; color: #58a6ff; border-bottom: 2px solid #58a6ff; }"
     );
-    m_tabWidget->addTab(createHookLogTab(), "📜 实时 Hook 日志 (hook_runtime.log)");
-    m_tabWidget->addTab(createModulesTab(), "🧩 已加载工具模块 (Loaded Modules)");
+    m_tabWidget->addTab(createHookLogTab(), "📜 实时 Hook 日志");
+    m_tabWidget->addTab(createModulesTab(), "🧩 已加载工具模块");
 
     mainLayout->addWidget(m_tabWidget);
 }
-
 
 void DebugWindow::onRefreshTimer() {
     updateProcessDashboard();
@@ -245,13 +225,9 @@ void DebugWindow::updateProcessDashboard() {
         if (hIpc) {
             m_lblIpcStatus->setText(QString("✅ 已连接 (HWND: 0x%1)").arg((uintptr_t)hIpc, 0, 16).toUpper());
             m_lblIpcStatus->setStyleSheet("font-size: 12px; color: #3fb950;");
-            m_btnToggleLang->setEnabled(true);
-            m_btnHotReload->setEnabled(true);
         } else {
             m_lblIpcStatus->setText("⚠️ 模块未初始化 IPC 窗口 (可能正在启动)");
             m_lblIpcStatus->setStyleSheet("font-size: 12px; color: #d29922;");
-            m_btnToggleLang->setEnabled(false);
-            m_btnHotReload->setEnabled(false);
         }
     } else {
         m_lblHammerStatus->setText("❌ 未检测到 cs2.exe");
@@ -261,8 +237,6 @@ void DebugWindow::updateProcessDashboard() {
         m_lblIpcStatus->setText("未运行");
         m_lblIpcStatus->setStyleSheet("font-size: 12px; color: #8b949e;");
         m_lblCurrentLang->setText("-");
-        m_btnToggleLang->setEnabled(false);
-        m_btnHotReload->setEnabled(false);
     }
 }
 
@@ -287,47 +261,61 @@ void DebugWindow::queryHammerLanguageStatus() {
 }
 
 void DebugWindow::pollHookRuntimeLog() {
-    QString binDir = QString::fromStdWString(paths::Win64Bin(m_cs2Root).wstring()) + "/";
-    QString logPath = binDir + "hook_runtime.log";
-
-    QFile file(logPath);
-    if (!file.exists()) {
-        return;
-    }
-
-    if (file.open(QIODevice::ReadOnly | QIODevice::Text)) {
-        qint64 size = file.size();
-        if (size < m_lastLogFilePos) {
-            // 文件可能被轮转或截断重置
-            m_lastLogFilePos = 0;
-            m_allLogLines.clear();
-            m_txtHookLog->clear();
+    if (!m_pSharedLog) {
+        if (!m_hSharedLogMap) {
+            m_hSharedLogMap = OpenFileMappingW(FILE_MAP_READ, FALSE, SHARED_LOG_MEM_NAME);
         }
-
-        if (size > m_lastLogFilePos) {
-            file.seek(m_lastLogFilePos);
-            QByteArray newBytes = file.readAll();
-            m_lastLogFilePos = file.pos();
-
-            QString newText = QString::fromUtf8(newBytes);
-            QStringList lines = newText.split('\n', Qt::SkipEmptyParts);
-
-            QString filter = m_txtFilter->text().trimmed();
-            for (const QString& line : lines) {
-                QString trimmed = line.trimmed();
-                if (trimmed.isEmpty()) continue;
-                m_allLogLines.append(trimmed);
-
-                if (filter.isEmpty() || trimmed.contains(filter, Qt::CaseInsensitive)) {
-                    m_txtHookLog->appendPlainText(trimmed);
+        if (m_hSharedLogMap) {
+            m_pSharedLog = MapViewOfFile(reinterpret_cast<HANDLE>(m_hSharedLogMap), FILE_MAP_READ, 0, 0, sizeof(SharedLogHeader));
+            if (m_pSharedLog) {
+                const auto* pHeader = reinterpret_cast<const SharedLogHeader*>(m_pSharedLog);
+                if (pHeader->magic != 0x5A4C434C) {
+                    UnmapViewOfFile(m_pSharedLog);
+                    m_pSharedLog = nullptr;
                 }
             }
-
-            if (m_chkAutoScroll->isChecked()) {
-                m_txtHookLog->verticalScrollBar()->setValue(m_txtHookLog->verticalScrollBar()->maximum());
-            }
         }
-        file.close();
+    }
+
+    if (!m_pSharedLog) return;
+
+    const auto* pHeader = reinterpret_cast<const SharedLogHeader*>(m_pSharedLog);
+    uint32_t currentSeq = pHeader->writeSeq;
+    if (currentSeq == m_lastReadSeq) return;
+
+    // 若写入跨度超出缓冲区大小，对齐至最新有效窗口
+    if (currentSeq < m_lastReadSeq || (currentSeq - m_lastReadSeq) > SHARED_LOG_CAPACITY) {
+        m_lastReadSeq = (currentSeq > SHARED_LOG_CAPACITY) ? (currentSeq - SHARED_LOG_CAPACITY) : 0;
+    }
+
+    uint32_t bytesToRead = currentSeq - m_lastReadSeq;
+    if (bytesToRead == 0) return;
+
+    QByteArray rawBytes;
+    rawBytes.reserve(static_cast<int>(bytesToRead));
+
+    uint32_t readOffset = m_lastReadSeq % SHARED_LOG_CAPACITY;
+    for (uint32_t i = 0; i < bytesToRead; ++i) {
+        rawBytes.append(pHeader->buffer[(readOffset + i) % SHARED_LOG_CAPACITY]);
+    }
+    m_lastReadSeq = currentSeq;
+
+    QString newText = QString::fromUtf8(rawBytes);
+    QStringList lines = newText.split('\n', Qt::SkipEmptyParts);
+
+    QString filter = m_txtFilter->text().trimmed();
+    for (const QString& line : lines) {
+        QString trimmed = line.trimmed();
+        if (trimmed.isEmpty()) continue;
+        m_allLogLines.append(trimmed);
+
+        if (filter.isEmpty() || trimmed.contains(filter, Qt::CaseInsensitive)) {
+            m_txtHookLog->appendPlainText(trimmed);
+        }
+    }
+
+    if (m_chkAutoScroll->isChecked()) {
+        m_txtHookLog->verticalScrollBar()->setValue(m_txtHookLog->verticalScrollBar()->maximum());
     }
 }
 
@@ -347,57 +335,9 @@ void DebugWindow::onFilterTextChanged(const QString& text) {
 void DebugWindow::onClearLogClicked() {
     m_txtHookLog->clear();
     m_allLogLines.clear();
-}
-
-void DebugWindow::onToggleLangClicked() {
-    HWND hIpc = HammerIpc::FindIpcWindow();
-    if (!hIpc) {
-        m_txtHookLog->appendPlainText("[CLIENT] 错误: 未检测到 Hammer IPC 窗口，无法切换");
-        return;
-    }
-
-    auto start = std::chrono::high_resolution_clock::now();
-    DWORD_PTR res = 0;
-    LRESULT ok = SendMessageTimeoutW(hIpc, WM_LOCALIZER_TOGGLE_LANG, 0, 0, SMTO_ABORTIFHUNG, 1000, &res);
-    auto elapsed = std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::high_resolution_clock::now() - start).count();
-
-    if (ok) {
-        m_lastKnownLang = static_cast<int>(res);
-        QString langStr = (res == 1) ? "🇨🇳 中文翻译" : ((res == 2) ? "🇺🇸 英文原文" : "已切换");
-        m_txtHookLog->appendPlainText(QString("[CLIENT] 🔀 语言切换成功 -> 当前模式: %1 (耗时: %2 μs)").arg(langStr).arg(elapsed));
-        queryHammerLanguageStatus();
-    } else {
-        m_txtHookLog->appendPlainText(QString("[CLIENT] ⚠️ 发送切换指令超时或失败 (错误代码: %1)").arg(GetLastError()));
-    }
-}
-
-void DebugWindow::onHotReloadClicked() {
-    MainWindow* mainWin = qobject_cast<MainWindow*>(parentWidget());
-    if (mainWin) {
-        bool ok = mainWin->performHotReload(false);
-        if (ok) {
-            m_txtHookLog->appendPlainText("[CLIENT] ⚡ FGD + Qt 词典全量热重载成功！无需重启 Hammer 即可渲染新翻译");
-        } else {
-            m_txtHookLog->appendPlainText("[CLIENT] ⚠️ 全量热重载执行完成（请检查启动器日志输出）");
-        }
-        return;
-    }
-
-    HWND hIpc = HammerIpc::FindIpcWindow();
-    if (!hIpc) {
-        m_txtHookLog->appendPlainText("[CLIENT] 错误: 未检测到 Hammer IPC 窗口，无法热重载");
-        return;
-    }
-
-    auto start = std::chrono::high_resolution_clock::now();
-    DWORD_PTR res = 0;
-    LRESULT ok = SendMessageTimeoutW(hIpc, WM_LOCALIZER_RELOAD_DICT, 0, 0, SMTO_ABORTIFHUNG, 2000, &res);
-    auto elapsed = std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::high_resolution_clock::now() - start).count();
-
-    if (ok) {
-        m_txtHookLog->appendPlainText(QString("[CLIENT] ⚡ 词典热重载成功！无需重启 Hammer 即可渲染新翻译 (耗时: %1 μs)").arg(elapsed));
-    } else {
-        m_txtHookLog->appendPlainText(QString("[CLIENT] ⚠️ 发送热重载指令超时或失败 (错误代码: %1)").arg(GetLastError()));
+    if (m_pSharedLog) {
+        const auto* pHeader = reinterpret_cast<const SharedLogHeader*>(m_pSharedLog);
+        m_lastReadSeq = pHeader->writeSeq;
     }
 }
 
@@ -438,40 +378,4 @@ void DebugWindow::queryLoadedModules() {
         } while (Module32NextW(hSnap, &me));
     }
     CloseHandle(hSnap);
-}
-
-void DebugWindow::onCopyReportClicked() {
-    QString report;
-    report += "==================== CS2 Hammer Localizer 完整诊断报告 ====================\n";
-    report += QString("生成时间: %1\n").arg(QDateTime::currentDateTime().toString("yyyy-MM-dd HH:mm:ss"));
-    report += QString("操作系统: Windows %1\n").arg(QSysInfo::prettyProductName());
-    report += QString("CS2 路径: %1\n").arg(QString::fromStdWString(m_cs2Root));
-    report += QString("Hammer 进程: %1 (PID: %2)\n").arg(m_lblHammerStatus->text()).arg(m_lblHammerPid->text());
-    report += QString("内存占用: %1\n").arg(m_lblHammerMem->text());
-    report += QString("IPC 状态: %1\n").arg(m_lblIpcStatus->text());
-    report += QString("当前语言: %1\n\n").arg(m_lblCurrentLang->text());
-
-    report += "--- [最近 40 行 Hook 日志] ---\n";
-    int total = m_allLogLines.size();
-    int start = (std::max)(0, total - 40);
-    for (int i = start; i < total; ++i) {
-        report += m_allLogLines[i] + "\n";
-    }
-    report += "\n";
-
-    report += "--- [已加载核心模块] ---\n";
-    int rowCount = m_tblModules->rowCount();
-    for (int r = 0; r < rowCount; ++r) {
-        QString modName = m_tblModules->item(r, 0) ? m_tblModules->item(r, 0)->text() : "";
-        QString modBase = m_tblModules->item(r, 1) ? m_tblModules->item(r, 1)->text() : "";
-        QString modSize = m_tblModules->item(r, 2) ? m_tblModules->item(r, 2)->text() : "";
-        report += QString("  - %1  (Base: %2, Size: %3)\n").arg(modName, -24).arg(modBase).arg(modSize);
-    }
-    report += "==============================================================================\n";
-
-    QClipboard* cb = QApplication::clipboard();
-    if (cb) {
-        cb->setText(report);
-        m_txtHookLog->appendPlainText("[CLIENT] 📋 完整诊断报告已复制到剪贴板！");
-    }
 }
