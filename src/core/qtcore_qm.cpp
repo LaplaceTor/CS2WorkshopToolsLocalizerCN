@@ -87,6 +87,11 @@ typedef void (__fastcall *fnQAction_setStatusTip)(void* pAction, const void* pQS
 typedef void (__fastcall *fnQAction_setWhatsThis)(void* pAction, const void* pQString);
 
 typedef void (__fastcall *fnQAbstractButton_setText)(void* pButton, const void* pQString);
+typedef void (__fastcall *fnQAbstractButton_setIcon)(void* pButton, const void* pIcon);
+typedef void (__fastcall *fnQToolButton_setDefaultAction)(void* pButton, void* pAction);
+typedef void* (__fastcall *fnQToolButton_defaultAction)(const void* pButton);
+typedef void (__fastcall *fnQAction_setIcon)(void* pAction, const void* pIcon);
+typedef bool (__fastcall *fnQObject_inherits)(const void* pObject, const char* classname);
 typedef void (__fastcall *fnQLabel_setText)(void* pLabel, const void* pQString);
 typedef void (__fastcall *fnQWidget_setWindowTitle)(void* pWidget, const void* pQString);
 typedef void (__fastcall *fnQGroupBox_setTitle)(void* pBox, const void* pQString);
@@ -126,6 +131,12 @@ static fnQWidget_insertAction g_o_QWidget_insertAction = nullptr;
 static fnQWidget_addAction g_o_QWidget_addAction = nullptr;
 static fnQAction_activate g_o_QAction_activate = nullptr;
 static fnQWidget_find g_pfn_QWidget_find = nullptr;
+
+static fnQAbstractButton_setIcon g_o_QAbstractButton_setIcon = nullptr;
+static fnQToolButton_setDefaultAction g_o_QToolButton_setDefaultAction = nullptr;
+static fnQToolButton_defaultAction g_pfn_QToolButton_defaultAction = nullptr;
+static fnQAction_setIcon g_pfn_QAction_setIcon = nullptr;
+static fnQObject_inherits g_pfn_QObject_inherits = nullptr;
 
 // 安全探测/更新标记：处于安全探测期间发生的异常属于预期的 SEH 捕获，VEH 绝对不应判定为崩溃或停用 Hook
 static std::atomic<bool> g_bInSafeProbe{false};
@@ -2190,6 +2201,48 @@ static void __fastcall hk_QAbstractButton_setText(void* pButton, const void* pQS
     });
 }
 
+static thread_local bool s_bInSyncIcon = false;
+
+static inline void SafeSyncButtonActionIcon(void* pButton, const void* pIcon) {
+    if (s_bInSyncIcon || !pButton || (uintptr_t)pButton < 0x10000 || !pIcon) {
+        return;
+    }
+    s_bInSyncIcon = true;
+    __try {
+        bool isToolButton = true;
+        if (g_pfn_QObject_inherits) {
+            isToolButton = g_pfn_QObject_inherits(pButton, "QToolButton");
+        }
+        if (isToolButton && g_pfn_QToolButton_defaultAction && g_pfn_QAction_setIcon) {
+            void* pAction = g_pfn_QToolButton_defaultAction(pButton);
+            if (pAction && (uintptr_t)pAction > 0x10000) {
+                g_pfn_QAction_setIcon(pAction, pIcon);
+            }
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+    }
+    s_bInSyncIcon = false;
+}
+
+static void __fastcall hk_QAbstractButton_setIcon(void* pButton, const void* pIcon) {
+    if (g_o_QAbstractButton_setIcon) {
+        g_o_QAbstractButton_setIcon(pButton, pIcon);
+    }
+    if (pButton && pIcon && !s_bInSyncIcon && g_pfn_QToolButton_defaultAction && g_pfn_QAction_setIcon) {
+        SafeProbeScope probeScope;
+        SafeSyncButtonActionIcon(pButton, pIcon);
+    }
+}
+
+static void __fastcall hk_QToolButton_setDefaultAction(void* pButton, void* pAction) {
+    if (g_o_QToolButton_setDefaultAction) {
+        g_o_QToolButton_setDefaultAction(pButton, pAction);
+    }
+    if (pAction && !g_pReloadFgdAction) {
+        CheckAndCacheReloadActionPtr(pAction);
+    }
+}
+
 static void __fastcall hk_QLabel_setText(void* pLabel, const void* pQString) {
     void* caller = _ReturnAddress();
     ForwardTranslatedQString(caller, pQString, TranslationSource::StaticUI, [&](const void* text) {
@@ -2409,9 +2462,24 @@ static bool TryHookQtToolsModules() {
             void* pActionSetStatus = (void*)GetProcAddress(hQtWidgets, "?setStatusTip@QAction@@QEAAXAEBVQString@@@Z");
             void* pActionSetWhats  = (void*)GetProcAddress(hQtWidgets, "?setWhatsThis@QAction@@QEAAXAEBVQString@@@Z");
             void* pButtonSetText   = (void*)GetProcAddress(hQtWidgets, "?setText@QAbstractButton@@QEAAXAEBVQString@@@Z");
+            void* pButtonSetIcon   = (void*)GetProcAddress(hQtWidgets, "?setIcon@QAbstractButton@@QEAAXAEBVQIcon@@@Z");
+            void* pToolButtonSetDefaultAction = (void*)GetProcAddress(hQtWidgets, "?setDefaultAction@QToolButton@@QEAAXPEAVQAction@@@Z");
             void* pLabelSetText    = (void*)GetProcAddress(hQtWidgets, "?setText@QLabel@@QEAAXAEBVQString@@@Z");
             void* pSetTitle        = (void*)GetProcAddress(hQtWidgets, "?setWindowTitle@QWidget@@QEAAXAEBVQString@@@Z");
             void* pGroupSetTitle   = (void*)GetProcAddress(hQtWidgets, "?setTitle@QGroupBox@@QEAAXAEBVQString@@@Z");
+
+            if (!g_pfn_QToolButton_defaultAction) {
+                g_pfn_QToolButton_defaultAction = (fnQToolButton_defaultAction)GetProcAddress(hQtWidgets, "?defaultAction@QToolButton@@QEBAPEAVQAction@@XZ");
+            }
+            if (!g_pfn_QAction_setIcon) {
+                g_pfn_QAction_setIcon = (fnQAction_setIcon)GetProcAddress(hQtWidgets, "?setIcon@QAction@@QEAAXAEBVQIcon@@@Z");
+            }
+            if (!g_pfn_QObject_inherits) {
+                HMODULE hQtCore = GetModuleHandleW(L"Qt5Core.dll");
+                if (hQtCore) {
+                    g_pfn_QObject_inherits = (fnQObject_inherits)GetProcAddress(hQtCore, "?inherits@QObject@@QEBA_NPEBD@Z");
+                }
+            }
 
             void* pTreeSetText     = (void*)GetProcAddress(hQtWidgets, "?setText@QTreeWidgetItem@@QEAAXHAEBVQString@@@Z");
             void* pTreeSetHeader   = (void*)GetProcAddress(hQtWidgets, "?setHeaderLabel@QTreeWidget@@QEAAXAEBVQString@@@Z");
@@ -2441,6 +2509,8 @@ static bool TryHookQtToolsModules() {
                 { pAddAction,           (void*)hk_QWidget_addAction,        (void**)&g_o_QWidget_addAction,        "QWidget::addAction" },
                 { pActivate,            (void*)hk_QAction_activate,         (void**)&g_o_QAction_activate,         "QAction::activate" },
                 { pButtonSetText,       (void*)hk_QAbstractButton_setText,  (void**)&g_o_QAbstractButton_setText,  "QAbstractButton::setText" },
+                { pButtonSetIcon,       (void*)hk_QAbstractButton_setIcon,  (void**)&g_o_QAbstractButton_setIcon,  "QAbstractButton::setIcon" },
+                { pToolButtonSetDefaultAction, (void*)hk_QToolButton_setDefaultAction, (void**)&g_o_QToolButton_setDefaultAction, "QToolButton::setDefaultAction" },
                 { pLabelSetText,        (void*)hk_QLabel_setText,           (void**)&g_o_QLabel_setText,           "QLabel::setText" },
                 { pSetTitle,            (void*)hk_QWidget_setWindowTitle,   (void**)&g_o_QWidget_setWindowTitle,   "QWidget::setWindowTitle" },
                 { pGroupSetTitle,       (void*)hk_QGroupBox_setTitle,       (void**)&g_o_QGroupBox_setTitle,       "QGroupBox::setTitle" },
@@ -2876,6 +2946,7 @@ extern "C" __declspec(dllexport) bool InitializeTranslator() {
     g_pfn_fromUtf8 = (fnQString_fromUtf8)GetProcAddress(hQtCore, "?fromUtf8@QString@@SA?AV1@PEBDH@Z");
     g_pfn_utf16 = (fnQString_utf16)GetProcAddress(hQtCore, "?utf16@QString@@QEBAPEBGXZ");
     g_pfn_QString_dtor = (fnQString_dtor)GetProcAddress(hQtCore, "??1QString@@QEAA@XZ");
+    g_pfn_QObject_inherits = (fnQObject_inherits)GetProcAddress(hQtCore, "?inherits@QObject@@QEBA_NPEBD@Z");
 
     // 优先通过 PePatcher 统一安全读取 LCLZ 补丁元数据头中的原始真实 QMetaObject::tr 地址
     PatchInfo patchInfo;
