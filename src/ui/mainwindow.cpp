@@ -8,7 +8,9 @@
 #include "core/path_constants.h"
 #include "service/dictionary_service.h"
 #include "service/localization_service.h"
+#include "service/dictionary_editor_service.h"
 #include "ui/debug_window.h"
+#include "ui/dictionary_editor_window.h"
 
 #include <windows.h>
 #include <thread>
@@ -104,6 +106,11 @@ MainWindow::MainWindow(const std::wstring& cs2Root, QWidget *parent)
     if (m_debugBtn) {
         connect(m_debugBtn, &QPushButton::clicked,
                 this, &MainWindow::onDebugClicked);
+    }
+
+    if (m_dictEditorBtn) {
+        connect(m_dictEditorBtn, &QPushButton::clicked,
+                this, &MainWindow::onDictEditorClicked);
     }
 
     connect(
@@ -566,10 +573,7 @@ void MainWindow::setupUi() {
 
     btnLayout->addLayout(actionGridLayout);
 
-    // 第三行：运行中实时联动控制（一键切换中英 / 免重启热重载）
-    QHBoxLayout* liveControlLayout = new QHBoxLayout();
-    liveControlLayout->setSpacing(6);
-
+    // 第三行：运行中实时联动控制与词典编辑器 (对齐 3x3 网格)
     m_toggleLangBtn = new QPushButton("🔀 切换原文 / 翻译", centralWidget);
     m_toggleLangBtn->setMinimumHeight(28);
     m_toggleLangBtn->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Preferred);
@@ -620,10 +624,35 @@ void MainWindow::setupUi() {
         "}"
     );
 
-    liveControlLayout->addWidget(m_toggleLangBtn);
-    liveControlLayout->addWidget(m_hotReloadBtn);
+    m_dictEditorBtn = new QPushButton("📝 词典编辑器", centralWidget);
+    m_dictEditorBtn->setMinimumHeight(28);
+    m_dictEditorBtn->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Preferred);
+    m_dictEditorBtn->setToolTip("打开词典运行时编辑器与实时未翻译捕获面板");
+    m_dictEditorBtn->setStyleSheet(
+        "QPushButton {"
+        "  background-color: #238636;"
+        "  color: white;"
+        "  font-weight: bold;"
+        "  font-size: 12px;"
+        "  border-radius: 4px;"
+        "}"
+        "QPushButton:hover {"
+        "  background-color: #2ea043;"
+        "}"
+        "QPushButton:pressed {"
+        "  background-color: #1a6327;"
+        "}"
+        "QPushButton:disabled {"
+        "  background-color: #2d333b;"
+        "  color: #636e7b;"
+        "}"
+    );
 
-    btnLayout->addLayout(liveControlLayout);
+    actionGridLayout->addWidget(m_toggleLangBtn, 2, 0);
+    actionGridLayout->addWidget(m_hotReloadBtn, 2, 1);
+    actionGridLayout->addWidget(m_dictEditorBtn, 2, 2);
+
+    btnLayout->addLayout(actionGridLayout);
 
     mainLayout->addLayout(btnLayout);
 
@@ -1938,6 +1967,12 @@ void MainWindow::onDebouncedHotReload() {
         return;
     }
 
+    // 防抖与编辑器操作节流：若 1000ms 内刚刚完成过编辑器的主动热重载，避免重复打扰
+    qint64 now = QDateTime::currentMSecsSinceEpoch();
+    if (now - m_lastEditorReloadTick < 1000) {
+        return;
+    }
+
     appendLog("[⚡] 检测到程序目录词典更新，自动执行 FGD + Qt 全量热重载...", "#58a6ff");
     performHotReload(true);
 }
@@ -1983,4 +2018,20 @@ void MainWindow::openDebugWindow() {
     dbg->show();
     dbg->raise();
     dbg->activateWindow();
+}
+
+void MainWindow::onDictEditorClicked() {
+    if (!m_dictEditorService) {
+        m_dictEditorService = new DictionaryEditorService(m_cs2Root, m_workingDir, m_hammerService, this);
+    }
+    if (!m_dictEditorWindow) {
+        m_dictEditorWindow = new DictionaryEditorWindow(
+            m_dictEditorService,
+            [this]() { return machineTranslationEnabled(); },
+            nullptr // 独立非模态窗口
+        );
+    }
+    m_dictEditorWindow->show();
+    m_dictEditorWindow->raise();
+    m_dictEditorWindow->activateWindow();
 }

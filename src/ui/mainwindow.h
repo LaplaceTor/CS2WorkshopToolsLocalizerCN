@@ -12,6 +12,8 @@ class QCheckBox;
 class QPushButton;
 class QTextEdit;
 class QLabel;
+class DictionaryEditorService;
+class DictionaryEditorWindow;
 
 class MainWindow : public QMainWindow {
     Q_OBJECT
@@ -35,6 +37,7 @@ private slots:
     void onToggleLangClicked();
     void onHotReloadClicked();
     void onDebugClicked();
+    void onDictEditorClicked();
     void onWatchedFileChanged(const QString& path);
     void onDebouncedHotReload();
 
@@ -97,6 +100,11 @@ private:
     QPushButton* m_toggleLangBtn;
     QPushButton* m_hotReloadBtn;
     QPushButton* m_debugBtn;
+    QPushButton* m_dictEditorBtn;
+
+    DictionaryEditorService* m_dictEditorService{nullptr};
+    DictionaryEditorWindow*  m_dictEditorWindow{nullptr};
+    qint64 m_lastEditorReloadTick = 0;
 
     class QFileSystemWatcher* m_fileWatcher;
     class QTimer* m_hotReloadDebounceTimer;

@@ -64,10 +64,12 @@ add_executable(CS2WorkshopToolsLocalizerCN WIN32
 
     src/ui/mainwindow.cpp
     src/ui/debug_window.cpp
+    src/ui/dictionary_editor_window.cpp
 
     src/service/localization_service.cpp
     src/service/dictionary_service.cpp
     src/service/hammer_service.cpp
+    src/service/dictionary_editor_service.cpp
 
     src/core/cs2_detector.cpp
     src/core/process_guard.cpp
@@ -76,6 +78,7 @@ add_executable(CS2WorkshopToolsLocalizerCN WIN32
     src/core/fgd_translator.cpp
     src/core/backup_manager.cpp
     src/core/dictionary_compiler.cpp
+    src/core/dictionary_text_updater.cpp
     src/core/launcher_config.cpp
     src/core/process_monitor.cpp
     src/core/hammer_ipc.cpp

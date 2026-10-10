@@ -18,6 +18,7 @@
 #include "core/fgd_core.h"
 #include "core/process_guard.h"
 #include "hde/hde64.h"
+#include "core/untranslated_capture.h"
 #include <filesystem>
 #include <fstream>
 
@@ -198,6 +199,7 @@ static std::atomic<bool> g_bDictLoaded{false};
 static std::atomic<bool> g_bTranslatorInitialized{false};
 static std::atomic<bool> g_bTranslatorInitFailed{false}; // 初始化失败后置位，避免每次 tr() 重试完整初始化
 static std::mutex g_TranslatorInitMutex;
+static capture::UntranslatedCaptureWriter g_UntranslatedCapture;
 
 // VEH 空写跳过守卫计数（100% 原子操作，保持 VEH 内 0 锁 0 IO）：
 // 10 秒滑动窗口内跳过 ≥1000 次判定为异常风暴，熔断后不再跳过、异常正常传播
@@ -1554,6 +1556,26 @@ static bool FindTranslationScoped(void* callerAddr, const char* text, std::strin
                     return true;
                 }
             }
+        }
+    }
+
+    // 运行时未翻译动态捕获：仅捕获 StaticUI 与经过清洗的 ItemWidget，严格忽略 Painter 绘制
+    if (!isFileOrPath && (source == TranslationSource::StaticUI || source == TranslationSource::ItemWidget)) {
+        bool isAlreadyTranslated = capture::ContainsChinese(text);
+        if (!isAlreadyTranslated) {
+            std::lock_guard<std::mutex> lock(g_DictMutex);
+            if (g_CommonReverseDict.find(textStr) != g_CommonReverseDict.end()) {
+                isAlreadyTranslated = true;
+            } else if (hasCaller) {
+                auto itRev = g_ScopedReverseDicts.find(callerStem);
+                if (itRev != g_ScopedReverseDicts.end() && itRev->second.find(textStr) != itRev->second.end()) {
+                    isAlreadyTranslated = true;
+                }
+            }
+        }
+
+        if (!isAlreadyTranslated) {
+            g_UntranslatedCapture.record(callerStemBuf, text);
         }
     }
 

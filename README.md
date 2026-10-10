@@ -16,8 +16,9 @@
   - [方式二：从源码构建](#方式二从源码构建)
 - [快速使用指南](#-快速使用指南)
 - [使用示例](#-使用示例)
-- [命令行辅助脚本](#-命令行辅助脚本)
+- [词典运行时编辑器与动态捕获](#-词典运行时编辑器与动态捕获)
 - [参与完善汉化：词条编写规范](#-参与完善汉化词条编写规范)
+- [辅助脚本说明](#-辅助脚本说明)
 - [项目结构与工作原理](#-项目结构与工作原理)
 - [贡献指南](#-贡献指南)
 - [常见问题 FAQ](#-常见问题-faq)
@@ -33,6 +34,8 @@
 - **🛡️ 纯净安全**：启动时自动备份游戏原版文件，**关闭工具后自动还原所有文件并清理临时补丁**，完全不修改、不污染您的 CS2 游戏目录。
 - **🎯 自动识别游戏**：启动时自动寻找 CS2 安装目录（Steam 注册表 / 库文件夹 / 常见盘符）和已有的 Addon 模组，无需手动配置。
 - **⚡ 实时生效**：翻译词条直接保存在文本文件中，改完无需编译——点击"热重载词典"即可在运行中的 Hammer 里立刻看到中文效果。
+- **📝 词典运行时编辑器**：内置独立编辑面板，支持直观检索、编辑、新增、删除词条，采用精准就地更新算法，完整保留原词典文件的行内注释与排版格式。
+- **🎯 实时未翻译动态捕获**：游戏运行期间自动捕获未收录的原生英文文本及其来源 DLL，点击即可一键填入并完成翻译与热重载。
 - **🤖 可选机翻兜底**：勾选"使用机翻"后自动引入 `*_fallback.jsonc` 兜底词典，未精翻的词条显示机翻结果，精翻词条始终保持最高优先级。
 - **🐞 调试监控**：内置调试窗口，可查看实时日志流、内存诊断与已加载模块。
 
@@ -142,6 +145,7 @@ cmake --build build --config Release
 | **🌐 更新在线翻译** | 从 GitHub / jsDelivr 拉取最新词典（Hammer 运行时不可用） |
 | **🔀 切换原文 / 翻译** | 运行中一键切换原文与中文，便于对照 |
 | **⚡ 热重载词典** | 运行中重新从磁盘读取词典，免重启生效（保存词典文件也会自动触发） |
+| **📝 词典编辑器** | 打开独立的词典编辑与动态捕获窗口，支持查找、编辑、新增、删除词条与捕获池联动 |
 | **🐞 调试监控** | 打开调试窗口，查看日志流与诊断信息 |
 | **📖 字典指南** | 打开词典编写说明 |
 
@@ -198,71 +202,39 @@ cmake --build build --config Release
 
 ---
 
-## 🧰 命令行辅助脚本
+## 📝 词典运行时编辑器与动态捕获
 
-所有脚本位于 `scripts/` 目录，需 **Python 3.8+**（Windows 下建议用 `python`，输出已做 UTF-8 兼容处理）。
+启动器内置了可视化的 **词典编辑器**，免去了手动查找 DLL、翻找文件、编辑 JSON 易导致语法错误的繁琐步骤。
 
-> 提示：下面示例中的路径全部指向**你本机 CS2 的安装目录**（如 `game\bin\win64\tools\`），与仓库目录无关；输出文件请自行指定到仓库外的临时位置。
+点击主界面第 3 行右侧的 **`📝 词典编辑器`** 按钮即可打开独立编辑面板（支持在 Hammer 运行中随时使用）：
 
-### `find_dll_strings.py` — 从 DLL 中查找界面原文
+### 1. 动态捕获池 (Live Capture) —— 告别盲猜英文原文
+在运行汉化版 Hammer 时，底层汉化模块会自动挂钩 Qt 翻译与渲染管线：
+- **实时拦截与去重**：遇到词典中尚未收录的原生英文时，自动记录其**来源 DLL**（如 `hammer`、`assetbrowser` 等）、**英文原文**、**触发频次**与时间戳。
+- **自动清洗**：已自动剔除纯数字、标点符号、文件路径/URL 以及动态拼接版本号等无效文本。
+- **一键填入**：在 **`🎯 运行时捕获池`** 列表中点击任意捕获到的未翻译项，右侧编辑卡片会自动填入其来源 DLL 与英文原文，光标直接聚焦到译文输入框。输入中文后点击 **`➕ 加入/新增词条`**，即可直接写入主词典并完成即时热重载！
 
-当在 `qt_translations.jsonc` 里加了词却不生效时，用它在 CS2 的 DLL 中搜出**完整的原始字符串**。
+### 2. 已收录词典库检索与就地精准编辑
+- **双向全文搜索**：支持在 **`📚 已收录词典库`** 中按 DLL 分组或全局检索英文 Key 与中文 Value（英文字母需至少 4 个，或中文至少 2 个）。
+- **来源清晰标记**：列表直观标注条目来自 `[主词典]`（绿色）还是 `[Fallback]` 兜底词典（黄色）。
+- **注释与排版无损保留**：内置定制的 JSONC 文本更新引擎，新增、修改或删除条目时采用就地精准替换/追加算法，**百分之百保留原词典文件中的每一个行内 `//` 注释与原始缩进排版**，绝不格式化破坏其它内容。
+- **联动热重载**：保存或新增词条后，若 Hammer 正在运行，会自动通过 IPC 发送热重载通知，毫秒级即时生效。
 
-```bash
-# 扫描 tools 目录下所有 DLL，查找包含 Transform 的字符串
-python scripts/find_dll_strings.py -f "D:\SteamLibrary\steamapps\common\Counter-Strike Global Offensive\game\bin\win64\tools\*.dll" -p "Transform"
+---
 
-# 单文件精确搜索
-python scripts/find_dll_strings.py -f "D:\...\tools\hammer.dll" -p "Transform"
+## 🧰 辅助脚本说明
 
-# 正则 + 忽略大小写
-python scripts/find_dll_strings.py -f "D:\...\tools\*.dll" -p "^(Open|Create).*" -i
+词典查重脚本位于 `scripts/` 目录，需 **Python 3.8+**：
 
-# 导出为可直接使用的词典模板 {"原文": ""}（输入为 CS2 安装目录下的工具 DLL）
-python scripts/find_dll_strings.py -f "D:\SteamLibrary\steamapps\common\Counter-Strike Global Offensive\game\bin\win64\tools\hammer.dll" -j -out hammer_extracted.jsonc
+### `check_duplicates.py` — 词典查重与语法校验（提交 PR 前必跑，CI 同款）
 
-# 搜索完自动用记事本打开结果
-python scripts/find_dll_strings.py -f "D:\...\tools\*.dll" -p "Grid" --open
-```
-
-常用参数：`-f/--file`（目标文件，支持通配符/目录）、`-p/--pattern`（关键字或正则）、`-out`、`-out-dir`、`-m/--min-len`、`-i`、`-o/--show-offset`、`-u/--unique`、`--raw`、`--all-sections`、`-j/--json`、`--open`。
-
-### `extract_fgd_strings.py` — 从 FGD 提取待翻译文本
-
-输入为 CS2 安装目录下的 `game` 目录（内含 `core/`、`csgo/`、`csgo_core/` 等 FGD 文件），默认输出 `fgd_extracted.jsonc`，并会与现有词典增量比对、只提取未翻译条目。
+在提交任何翻译词典改动前，请运行此脚本以确保 JSONC 语法合法且无重复 Key：
 
 ```bash
-# 从 CS2 安装目录提取待翻译文本
-python scripts/extract_fgd_strings.py -i "D:\SteamLibrary\steamapps\common\Counter-Strike Global Offensive\game"
-
-# 指定输出文件，并附带来源文件与行号注释
-python scripts/extract_fgd_strings.py -i "D:\...\game" -o fgd_extracted.jsonc --include-sources
-
-# 生成后自动查重
-python scripts/extract_fgd_strings.py -i "D:\...\game" -o fgd_extracted.jsonc --check-dup
-```
-
-### `translate_fallback.py` — 大模型批量生成机翻兜底词典
-
-兼容任何 OpenAI 接口规范的服务（llama.cpp / Ollama / vLLM / DeepSeek / Qwen …）。
-
-```bash
-# 使用本地默认服务 http://127.0.0.1:8080 翻译全部字典
-python scripts/translate_fallback.py
-
-# 只翻译 Qt 词典，3 线程、每批 10 行
-python scripts/translate_fallback.py --file qt --threads 3 --batch-size 10
-
-# 使用云端接口
-python scripts/translate_fallback.py --api-url https://api.deepseek.com/v1/chat/completions --api-key sk-xxxx --model deepseek-chat
-```
-
-支持环境变量：`TRANSLATION_API_URL` / `OPENAI_API_BASE` / `OPENAI_API_KEY` / `TRANSLATION_MODEL`。
-
-### `check_duplicates.py` — 词典查重（提交前必跑，CI 同款）
-
-```bash
+# 检查默认 translations 目录下所有词典
 python scripts/check_duplicates.py
+
+# 检查特定词典文件
 python scripts/check_duplicates.py translations/qt_translations.jsonc translations/fgd_translations.jsonc
 ```
 
@@ -400,8 +372,8 @@ translations/
 
 ### 🔍 改了词条却没生效？
 
-这通常是因为该界面的英文文本**不是孤立的单词**，而是包含在更长的完整字符串、格式化占位符或特殊前缀（`&` 快捷键、`...`、`%s` 占位符等）中。
-用 [`find_dll_strings.py`](#-命令行辅助脚本) 从 DLL 中扫出完整原文，复制填入对应子块即可。
+这通常是因为该界面的英文文本**不是孤立的单词**，而是包含在更长的完整字符串、格式化占位符或特定前缀（`&` 快捷键、`...`、`%s` 占位符等）中，或者位于特定的子工具 DLL 模块内。
+打开启动器的 **`📝 词典编辑器`** → 切换到 **`🎯 运行时捕获池`**，在 Hammer 中触发该界面操作，即可自动捕获到未翻译的真实原生字符串及其所属 DLL，点击即可一键填入并保存。
 
 ---
 
@@ -413,10 +385,12 @@ CS2WorkshopToolsLocalizerCN/
 │   ├── main.cpp            # 程序入口
 │   ├── ui/                 # UI 层：只负责控件、状态刷新与用户提示
 │   │   ├── mainwindow.*    # 主界面（读取 UI 状态 → 调用 Service → 展示结果）
+│   │   ├── dictionary_editor_window.*  # 词典运行时编辑与捕获池面板
 │   │   └── debug_window.*  # 调试监控窗口
 │   ├── service/            # Service 层：业务流程编排，不依赖任何 Qt 控件
 │   │   ├── localization_service.*  # 备份 → FGD 内存引擎 → Qt 补丁 → 还原
 │   │   ├── dictionary_service.*    # 在线词典下载 / JSONC 校验 / 原子落盘
+│   │   ├── dictionary_editor_service.* # 词典聚合检索、共享内存捕获拉取与更新编排
 │   │   └── hammer_service.*        # HAMMER 启动、进程监控、IPC、热重载
 │   ├── core/               # Core 层：具体功能实现，不反向依赖 UI
 │   │   ├── cs2_detector.*      # CS2 / Addon 目录检测（注册表 + 库文件夹 + 常见路径）
@@ -425,6 +399,8 @@ CS2WorkshopToolsLocalizerCN/
 │   │   ├── fgd_translator.* / fgd_core.*  # FGD 实体定义纯内存汉化与解析
 │   │   ├── pe_patcher.*        # Qt5Core.dll 的 PE Code Cave 注入与重定向
 │   │   ├── dictionary_compiler.*# JSONC 词典解析、模块子块与 fallback 合并
+│   │   ├── dictionary_text_updater.* # JSONC 注释保留就地文本更新引擎
+│   │   ├── untranslated_capture.h   # 跨进程未翻译原生字符串共享内存协议
 │   │   ├── process_monitor.*   # HAMMER 进程存活性三路探测
 │   │   ├── hammer_ipc.*        # 与运行中的 HAMMER 通信
 │   │   ├── launcher_config.*   # 启动器配置持久化（config.ini）
@@ -434,7 +410,7 @@ CS2WorkshopToolsLocalizerCN/
 │   └── ...
 ├── third_party/minhook/    # Git 子模块
 ├── translations/           # 汉化词典（社区贡献主战场）
-├── scripts/                # Python 辅助脚本
+├── scripts/                # 辅助脚本（查重与校验）
 ├── tests/                  # 组件测试
 └── .github/workflows/      # CI：词典查重、Release 打包
 ```
@@ -448,7 +424,7 @@ CS2WorkshopToolsLocalizerCN/
 ### 贡献汉化词条（无需编程）
 
 1. **Fork** 本仓库，基于 `main` 建分支：`git checkout -b trans/hammer-toolbar`。
-2. 修改 `translations/` 下的**精翻字典**（`qt_translations.jsonc`、`fgd_translations.jsonc`、`fgd_override.jsonc`）。
+2. 修改 `translations/` 下的**精翻字典**（`qt_translations.jsonc`、`fgd_translations.jsonc`、`fgd_override.jsonc`），亦可使用启动器的 **`📝 词典编辑器`** 可视化编辑并保存。
 3. 本地自查（务必执行，CI 会跑同款检查）：
    ```bash
    python scripts/check_duplicates.py
@@ -463,7 +439,7 @@ CS2WorkshopToolsLocalizerCN/
 - ✅ 一个英文原文在同一作用域内**只能出现一次**（查重脚本会拦截重复 Key）。
 - ✅ 术语保持一致：`Translate → 平移`、`Normal → 法线`、`Bake → 烘焙`、`Mutator → 修改器`、`Entity → 实体`、`Brush → 笔刷` 等。
 - ❌ 不要提交整批未经人工校对的机翻结果。
-- ❌ 不要手工编辑 `qt_fallback.jsonc` / `fgd_fallback.jsonc`（由 `translate_fallback.py` 生成）。
+- ❌ 不要手工编辑 `qt_fallback.jsonc` / `fgd_fallback.jsonc`（由兜底脚本生成）。
 - ❌ 不要改动与本次翻译无关的内容，避免大范围格式化造成冲突。
 
 ### 贡献代码
@@ -493,7 +469,7 @@ A：不会。注入前已对原版 Qt5Core.dll 做完整备份（保存在启动
 A：本工具仅修改本地 Workshop Tools 的界面文本，不注入、不修改 CS2 游戏主程序逻辑，也不联网参与对局。请自行判断风险，作者不对使用后果负责。
 
 **Q：为什么有些界面仍是英文？**
-A：该文本可能未收录进词典，或原文是带占位符/快捷键的完整长字符串。用 `find_dll_strings.py` 找到完整原文后加入词典，或勾选"使用机翻"启用兜底。
+A：该文本可能未收录进词典，或原文是带占位符/快捷键的完整长字符串。可点击启动器的 **`📝 词典编辑器`** → **`🎯 运行时捕获池`** 实时捕获并一键添加汉化，或勾选"使用机翻"启用兜底。
 
 ---
 
