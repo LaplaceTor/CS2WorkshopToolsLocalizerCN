@@ -9325,7 +9325,6 @@
   "baseitem": "基础物品",
   "Tool '%s' missing required type.": "工具 '%s' 缺少必需的类型。",
   "restriction": "限制",
-  "tool": "工具",
   "type": "类型",
   "stickers": "印花",
   "weapon": "武器",
