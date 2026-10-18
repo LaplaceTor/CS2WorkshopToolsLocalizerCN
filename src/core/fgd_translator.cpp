@@ -173,27 +173,13 @@ bool FgdTranslator::LoadOverrideDictionary(const std::wstring& jsonPath, FgdOver
     return !outOverride.empty();
 }
 
-std::string FgdTranslator::TranslateLine(const std::string& line, const std::unordered_map<std::string, std::string>& dict) {
-    return FgdCore::TranslateLine(line, dict);
-}
-
 std::string FgdTranslator::TranslateLine(
     const std::string& line,
     const std::unordered_map<std::string, std::string>& dict,
     const FgdOverrideData& overrideData,
-    std::string& inOutCurrentClass
+    FgdCore::LineState& state
 ) {
-    return FgdCore::TranslateLine(line, dict, overrideData, inOutCurrentClass);
-}
-
-std::string FgdTranslator::TranslateLine(
-    const std::string& line,
-    const std::unordered_map<std::string, std::string>& dict,
-    const FgdOverrideData& overrideData,
-    std::string& inOutCurrentClass,
-    std::string& inOutPendingClassDesc
-) {
-    return FgdCore::TranslateLine(line, dict, overrideData, inOutCurrentClass, inOutPendingClassDesc);
+    return FgdCore::TranslateLine(line, dict, overrideData, state);
 }
 
 

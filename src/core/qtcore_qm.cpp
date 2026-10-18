@@ -633,7 +633,11 @@ static std::atomic<bool> g_bFgdCacheLoaded{false};
 
 static std::unordered_map<std::string, std::string> g_FgdDict;
 static FgdOverrideData g_FgdOverrideData;
+// g_FgdDictMutex：只保护数据本身的读写/交换
 static std::mutex g_FgdDictMutex;
+// g_FgdLoadMutex：串行化「从磁盘加载词典」，与数据锁分离，避免 I/O 期间阻塞读线程
+static std::mutex g_FgdLoadMutex;
+// g_bFgdDictLoaded：表示「数据已就绪」，仅在 swap 完成后置 true
 static std::atomic<bool> g_bFgdDictLoaded{false};
 
 static void LoadFgdOverridePureCpp(const std::wstring& path, FgdOverrideData& outOverride) {
@@ -676,10 +680,18 @@ static void LoadFgdOverridePureCpp(const std::wstring& path, FgdOverrideData& ou
     }
 }
 
-static void EnsureFgdDictLoaded() {
-    if (g_bFgdDictLoaded.load(std::memory_order_acquire)) return;
-    std::lock_guard<std::mutex> lock(g_FgdDictMutex);
-    if (g_bFgdDictLoaded.load(std::memory_order_relaxed)) return;
+// 强制从磁盘重新解析 FGD 词典 / 覆盖词典。
+// 【并发约定】
+//   - g_FgdLoadMutex 只用于串行化「加载器本身」，持锁期间不做文件 I/O；
+//   - g_FgdDictMutex 只保护数据（g_FgdDict / g_FgdOverrideData）的交换；
+//   - g_bFgdDictLoaded 表示「数据已就绪」，因此只在 swap 完成后才置 true。
+//     早期实现在 I/O 开始前就置 true，导致并发读线程看到「已加载」却读到空表。
+static bool LoadFgdDictionariesFromDisk(bool bForce) {
+    if (!bForce && g_bFgdDictLoaded.load(std::memory_order_acquire)) return true;
+
+    // 串行化加载器：避免两个线程同时做一遍完整的磁盘解析
+    std::lock_guard<std::mutex> loadLock(g_FgdLoadMutex);
+    if (!bForce && g_bFgdDictLoaded.load(std::memory_order_acquire)) return true;
 
     std::wstring binDir = GetBinDirectory();
     std::wstring appDir = L"";
@@ -710,7 +722,7 @@ static void EnsureFgdDictLoaded() {
 
     if (appDir.empty()) {
         LogHook("[FGD] Error: Cannot find launcher appDir pointer for FGD dictionaries from %ls", appDirPointerPath.c_str());
-        return;
+        return false;
     }
 
     std::wstring fgdDictPath = appDir + L"\\translations\\fgd_translations.jsonc";
@@ -731,24 +743,62 @@ static void EnsureFgdDictLoaded() {
         }
     }
 
+    // ---- 锁外解析（文件 I/O 与 JSONC 解析）----
+    std::unordered_map<std::string, std::string> newFgdDict;
+    FgdOverrideData newOverride;
+    bool parsed = true;
+
     if (!fgdDictPath.empty()) {
         std::unordered_map<std::wstring, std::unordered_map<std::string, std::string>> dummyScoped;
         std::wstring err;
-        DictionaryCompiler::ParseJsoncFileToMaps(fgdDictPath, g_FgdDict, dummyScoped, err, fgdFallbackPath);
+        if (!DictionaryCompiler::ParseJsoncFileToMaps(fgdDictPath, newFgdDict, dummyScoped, err, fgdFallbackPath)) {
+            LogHook("[FGD] Failed to parse fgd_translations.jsonc: %ls", err.c_str());
+            parsed = false;
+        }
     }
     if (!fgdOverridePath.empty()) {
-        LoadFgdOverridePureCpp(fgdOverridePath, g_FgdOverrideData);
+        LoadFgdOverridePureCpp(fgdOverridePath, newOverride);
     }
 
-    LogHook("[FGD] Loaded %zu FGD translation keys (dict=%ls, fallback=%ls), %zu override keys",
+    if (!parsed) {
+        // 解析失败：不替换现有词典，也不置「已加载」，
+        // 以便下次（或用户修正词典后点热重载）还能重试。
+        return false;
+    }
+
+    // ---- 原子替换 ----
+    {
+        std::lock_guard<std::mutex> lock(g_FgdDictMutex);
+        g_FgdDict.swap(newFgdDict);
+        g_FgdOverrideData = std::move(newOverride);
+    }
+
+    LogHook("[FGD] %s %zu FGD translation keys (dict=%ls, fallback=%ls), %zu override keys",
+            bForce ? "Reloaded" : "Loaded",
             g_FgdDict.size(), fgdDictPath.empty() ? L"none" : fgdDictPath.c_str(), fgdFallbackPath.empty() ? L"none" : fgdFallbackPath.c_str(),
             g_FgdOverrideData.globalProperties.size() + g_FgdOverrideData.ioOverrides.size() + g_FgdOverrideData.classDescriptions.size());
 
+    // 数据已就绪，这时才发布「已加载」标志
     g_bFgdDictLoaded.store(true, std::memory_order_release);
+    return true;
+}
+
+static void EnsureFgdDictLoaded() {
+    LoadFgdDictionariesFromDisk(false);
 }
 
 static void PrecompileFgdBuffers() {
     EnsureFgdDictLoaded();
+
+    // 复制一份词典快照：本函数扫描/翻译全部 .fgd 可能耗时较久，
+    // 期间热重载可能原子替换 g_FgdDict，直接在循环里读取会导致数据竞争。
+    std::unordered_map<std::string, std::string> fgdDictSnapshot;
+    FgdOverrideData fgdOverrideSnapshot;
+    {
+        std::lock_guard<std::mutex> lock(g_FgdDictMutex);
+        fgdDictSnapshot = g_FgdDict;
+        fgdOverrideSnapshot = g_FgdOverrideData;
+    }
 
     std::wstring binDir = GetBinDirectory();
     fs::path binPath(binDir);
@@ -774,7 +824,7 @@ static void PrecompileFgdBuffers() {
                         inFile.close();
 
                         std::string transContent;
-                        if (FgdCore::TranslateContent(rawContent, transContent, g_FgdDict, g_FgdOverrideData) && !transContent.empty()) {
+                        if (FgdCore::TranslateContent(rawContent, transContent, fgdDictSnapshot, fgdOverrideSnapshot) && !transContent.empty()) {
                             std::string filenameLower = entry.path().filename().string();
                             std::transform(filenameLower.begin(), filenameLower.end(), filenameLower.begin(), ::tolower);
                             newCache[filenameLower] = transContent;
@@ -854,7 +904,15 @@ static bool __fastcall hk_ReadFileToBuffer(
         if (SafeGetBufferMemory(pBuffer, pRawData, rawSize) && pRawData && rawSize > 0) {
             std::string rawContent(pRawData, static_cast<size_t>(rawSize));
             std::string jitTrans;
-            if (FgdCore::TranslateContent(rawContent, jitTrans, g_FgdDict, g_FgdOverrideData) && !jitTrans.empty()) {
+            // 锁内快速复制词典快照，锁外再翻译，避免长时间持有 FGD 词典锁
+            std::unordered_map<std::string, std::string> fgdDictCopy;
+            FgdOverrideData fgdOverrideCopy;
+            {
+                std::lock_guard<std::mutex> dictLock(g_FgdDictMutex);
+                fgdDictCopy = g_FgdDict;
+                fgdOverrideCopy = g_FgdOverrideData;
+            }
+            if (FgdCore::TranslateContent(rawContent, jitTrans, fgdDictCopy, fgdOverrideCopy) && !jitTrans.empty()) {
                 transData = std::move(jitTrans);
                 found = true;
                 std::lock_guard<std::mutex> lock(g_FgdCacheMutex);
@@ -2020,7 +2078,12 @@ static void ReloadTranslations() {
         LoadMasterTranslations();
     }
 
-    // 重新预编译所有 FGD 内存缓存
+    // 【修复】强制从磁盘重新解析 FGD 词典与覆盖词典。
+    // 此前 EnsureFgdDictLoaded() 会因 g_bFgdDictLoaded 已置位而直接返回，
+    // 导致热重载后新增的 FGD 词条永远不生效（只有重启 Hammer 才会读到）。
+    LoadFgdDictionariesFromDisk(true);
+
+    // 重新预编译所有 FGD 内存缓存（内部会重新按新词典翻译每个 .fgd）
     PrecompileFgdBuffers();
 
     // 自动触发 Hammer 原生 'Reload .FGD Files'

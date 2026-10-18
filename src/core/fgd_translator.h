@@ -22,24 +22,14 @@ public:
     // 加载 FGD 覆盖字典文件 (fgd_override.jsonc)
     static bool LoadOverrideDictionary(const std::wstring& jsonPath, FgdOverrideData& outOverride);
 
-    // 翻译单行 FGD 内容（带类状态机跟踪与跨行说明覆盖支持）
+    // 翻译单行 FGD 内容（带完整跨行状态：类作用域 + 多行字符串拼接）。
+    // 调用方需持有 LineState 并在同一文件各行间复用；整链折叠请用 FgdCore::TranslateContent。
     static std::string TranslateLine(
         const std::string& line,
         const std::unordered_map<std::string, std::string>& dict,
         const FgdOverrideData& overrideData,
-        std::string& inOutCurrentClass,
-        std::string& inOutPendingClassDesc
+        FgdCore::LineState& state
     );
-
-    static std::string TranslateLine(
-        const std::string& line,
-        const std::unordered_map<std::string, std::string>& dict,
-        const FgdOverrideData& overrideData,
-        std::string& inOutCurrentClass
-    );
-
-    // 兼容重载（无需状态与覆盖时）
-    static std::string TranslateLine(const std::string& line, const std::unordered_map<std::string, std::string>& dict);
 
     // 确保 FGD 翻译字典存在，若不存在则自动生成带详细说明与范例的模板字典
     static bool EnsureFgdDictionaryExists(const std::wstring& jsonPath, const std::wstring& fallbackCachePath, std::wstring& outNotice);

@@ -489,16 +489,48 @@ def extract_from_fgd_file(filepath: str):
             if i < n and full_text[i] == '=':
                 i += 1
                 # 寻找类说明与主体块 [...]
+                #
+                # 【关键】Valve 原版 FGD 大量使用 C 风格跨行字符串拼接书写类说明，例如：
+                #     @SolidClass base(Targetname, Parentname ) = func_bomb_target:
+                #         "Bomb Target. ...\n\n" +
+                #         "When the bomb is planted ... handles " +
+                #         "all of the bomb planting and scoring logic – ..."
+                # 若按单个字面量提取，会把一句话拆成互不相干的片段，
+                # 既无法翻译、也无法在运行时按整段匹配。
+                # 因此这里把「整条说明」作为一个词条提取：
+                #   * 相邻字面量按 FGD 转义解码后再拼接
+                #   * 同一物理行内的多个字面量之间直接首尾相接
+                #   * 物理换行本身不产生字符（与 FGD 运行时语义一致），
+                #     需要换行必须由原文字面量里显式写的 "\n" 提供
+                desc_literals = []      # 已解码的字面量内容
+                desc_line_no = current_line
                 while i < n and full_text[i] != '[':
                     if full_text[i] == '\n':
                         current_line += 1
-                    elif full_text[i] == '"':
+                        i += 1
+                        continue
+                    # 跳过行注释：被注释掉的字面量不属于类说明
+                    if full_text[i] == '/' and i + 1 < n and full_text[i + 1] == '/':
+                        i += 2
+                        while i < n and full_text[i] != '\n':
+                            i += 1
+                        continue
+                    if full_text[i] == '"':
                         desc_text, next_i = parse_quoted_string_at(full_text, i)
-                        if desc_text and desc_text.strip() and not is_pure_path_string(desc_text) and not is_code_identifier_or_constant(desc_text):
-                            entries.append((desc_text, "Class Description", f"{base_name}:{current_line}"))
+                        if desc_text is not None:
+                            desc_literals.append(desc_text)
                         i = next_i
                         continue
                     i += 1
+
+                if desc_literals:
+                    # 【语义】FGD 中相邻字面量以 '+' 连接时是「直接首尾相接」，
+                    # 物理换行不产生任何字符；需要换行必须显式写 "\n"。
+                    # 因此这里按运行时的真实语义拼接（不解码转义，与引擎的「原样链」一致），
+                    # 不做任何额外分隔，保证生成的键与运行时拼接链逐字节一致。
+                    desc_text = "".join(desc_literals)
+                    if desc_text.strip() and not is_pure_path_string(desc_text) and not is_code_identifier_or_constant(desc_text):
+                        entries.append((desc_text, "Class Description", f"{base_name}:{desc_line_no}"))
 
                 if i < n and full_text[i] == '[':
                     # 进入类属性主体块

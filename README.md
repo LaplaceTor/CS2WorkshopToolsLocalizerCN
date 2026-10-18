@@ -329,6 +329,30 @@ translations/
 
 > ⚠️ 实体底层的英文标识符（如 `targetname`、`angles`）会被工具自动保护，**只翻译展示文本与描述说明**即可。
 
+#### 多行拼接说明（`"..." + "..."`）怎么翻？
+
+原版 FGD 里很多实体说明是用 C 风格字符串**跨行拼接**写的，`func_bomb_target` 就是一个典型例子：
+
+```text
+@SolidClass base(Targetname, Parentname ) = func_bomb_target:
+	"Bomb Target. The terrorists can place C4 explosives while standing in this zone.\n\n" +
+	"When the bomb is planted and explodes inside this area, the BombExplode outputs are fired. The game handles " +
+	"all of the bomb planting and scoring logic – the BombExplode outputs are provided to add visual and damage effects."
+```
+
+引擎会先把整条拼接链还原成**一整段文本**再去查词典，因此收录词条时，请把「拼接后的完整说明」作为一条词条：
+
+```jsonc
+// 键 = 拼接后的完整说明；换行写成 \n（JSON 里即 \\n），与 \n 转义解码后的文本一致。
+"Bomb Target. ...zone.\n\nWhen the bomb ... handles all of the bomb planting ... /effects.": "炸弹目标区。……",
+```
+
+> 💡 **不要逐行抄写**：FGD 中相邻字面量是直接首尾相接的——物理换行不产生任何字符，只有原文写出的 `\n` 才是真换行。
+> 按行抄写会把一句话拆成互不相干的片段，永远匹配不到。英文原文里字面量自带的结尾空格也必须原样保留。
+>
+> 💡 运行 `python scripts/extract_fgd_strings.py` 可直接生成这种形态的待翻译键，无需手动拼装。
+
+
 ### 3️⃣ `fgd_override.jsonc`（实体键值描述补充与覆盖）
 
 用于给 Valve 原版 FGD 中**缺失悬停描述**或**需要个性化说明**的属性 (Key)、实体类 (Class)、I/O 补充中文。

@@ -120,5 +120,26 @@
   "+Stage End": "+阶段结束",
   "Steam Audio Custom Data Settings": "Steam音频自定义数据设置",
   "Steam Audio Pathing Settings": "Steam音频寻路设置",
-  "Steam Audio Reverb Settings": "Steam音频混响设置"
+  "Steam Audio Reverb Settings": "Steam音频混响设置",
+
+  // ==============================================================================
+  // 多行拼接实体说明（FGD 中写作 "..." + "..." 跨行拼接的类说明）
+  // ------------------------------------------------------------------------------
+  // 【重要】以下词条的键是「拼接后的完整说明」，不是某一行字面量：
+  //   * 原版 FGD 常把一句话拆成多行字符串再拼接，逐行收录无法命中；
+  //   引擎会先把整条拼接链还原为完整文本（\n 转义解码为真实换行），再来查表。
+  //   * 键中的换行请写成 "\n" 转义（JSON 字符串内即 \\n），行与行之间由引擎补齐。
+  //   * 也可改为逐段收录（键为单个字面量，注意保留字面量结尾的空格），引擎同样支持。
+  // ==============================================================================
+
+  // func_bomb_target —— 炸弹安放区域
+  "Bomb Target. The terrorists can place C4 explosives while standing in this zone.\n\nWhen the bomb is planted and explodes inside this area, the BombExplode outputs are fired. The game handles all of the bomb planting and scoring logic – the BombExplode outputs are provided to add visual and damage effects.": "炸弹目标区。恐怖分子站在此区域内即可安放 C4 炸药。\n\n当炸弹在本区域内被安放并引爆时，会触发 BombExplode 输出。游戏的安放与计分逻辑全部由自身处理——提供 BombExplode 输出是为了让你添加视觉效果与伤害效果。",
+  "Heist Mode bomb target": "劫案模式炸弹目标",
+  "This is a Bomb Target designed for the Heist game mode.": "这是一个为劫案（Heist）游戏模式设计的炸弹目标。",
+  "Bomb Mount Target": "炸弹安放挂载目标",
+  "Bomb Site": "炸弹点位",
+  "Bomb Power": "炸弹威力",
+  "Fires when C4 explodes": "C4 爆炸时触发",
+  "Fires when a C4 is planted": "C4 被安放时触发",
+  "Fires when a C4 is defused": "C4 被拆除时触发"
 }
