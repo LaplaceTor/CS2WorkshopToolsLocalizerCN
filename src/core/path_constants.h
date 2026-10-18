@@ -45,6 +45,15 @@ inline constexpr const wchar_t* kInjectDll      = L"qtcore_qm.dll";
 inline constexpr const wchar_t* kQtDictFile     = L"qt_translations.jsonc";
 inline constexpr const wchar_t* kBackupManifest = L"backup_manifest.json";
 
+// 启动器与监控需要统一维护的 5 个翻译词典文件名
+inline constexpr const wchar_t* const kAllDictFiles[] = {
+    L"qt_translations.jsonc",
+    L"qt_fallback.jsonc",
+    L"fgd_translations.jsonc",
+    L"fgd_override.jsonc",
+    L"fgd_fallback.jsonc"
+};
+
 // ---------------------------------------------------------------------------
 // 路径组合
 // ---------------------------------------------------------------------------

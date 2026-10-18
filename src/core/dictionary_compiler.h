@@ -3,6 +3,7 @@
 #include <vector>
 #include <unordered_map>
 #include <cstdint>
+#include "core/fgd_core.h"
 
 class DictionaryCompiler {
 public:
@@ -26,6 +27,13 @@ public:
         std::unordered_map<std::wstring, std::unordered_map<std::string, std::string>>& outScoped,
         std::wstring& outError,
         const std::wstring& fallbackJsonPath = L""
+    );
+
+    // 解析 fgd_override.jsonc（完整支持 properties / io / classes 嵌套对象及 displayName）
+    static bool ParseFgdOverrideFile(
+        const std::wstring& jsonPath,
+        struct FgdOverrideData& outOverride,
+        std::wstring& outError
     );
 
     // 去除 JSONC 注释与尾随逗号辅助函数

@@ -19,8 +19,9 @@ public:
     static constexpr const wchar_t* kWindowTitle = L"CS2_Hammer_Localizer_MsgWnd";
 
     // 自定义消息 ID
-    static constexpr unsigned int kMsgToggleLang = WM_USER + 101;  // 切换原文 / 翻译
-    static constexpr unsigned int kMsgReloadDict = WM_USER + 102;  // 热重载 FGD + Qt 词典
+    static constexpr unsigned int kMsgToggleLang   = WM_USER + 101;  // 切换原文 / 翻译
+    static constexpr unsigned int kMsgReloadDict   = WM_USER + 102;  // 热重载 FGD + Qt 词典
+    static constexpr unsigned int kMsgQueryStatus  = WM_USER + 103;  // 查询当前语言状态 (1: 中文, 2: 英文)
 
     // 查找 HAMMER 注册的 IPC 窗口。
     // 优先在仅消息窗口(HWND_MESSAGE)中查找，失败时退回全局查找。未找到返回 nullptr。

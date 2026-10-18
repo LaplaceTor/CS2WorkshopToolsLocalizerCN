@@ -37,6 +37,9 @@ set(LAYERED_INCLUDE_ROOT ${CMAKE_CURRENT_SOURCE_DIR}/src)
 # 1. 编译注入 DLL qtcore_qm.dll
 add_library(qtcore_qm SHARED
     src/core/qtcore_qm.cpp
+    src/core/qm/translation_engine.cpp
+    src/core/qm/fgd_memory_hook.cpp
+    src/core/qm/qt_hooks.cpp
     src/core/process_guard.cpp
     src/core/hook_manager.cpp
     src/core/pe_patcher.cpp

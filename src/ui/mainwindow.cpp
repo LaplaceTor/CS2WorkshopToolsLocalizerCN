@@ -380,185 +380,48 @@ void MainWindow::setupUi() {
         QSizePolicy::Preferred
     );
 
-    m_injectBtn->setStyleSheet(
-        "QPushButton {"
-        "  background-color: #8957e5;"
-        "  color: white;"
-        "  font-weight: bold;"
-        "  font-size: 12px;"
-        "  border-radius: 5px;"
-        "}"
-        "QPushButton:hover {"
-        "  background-color: #a371f7;"
-        "}"
-        "QPushButton:pressed {"
-        "  background-color: #6e40b8;"
-        "}"
-        "QPushButton:disabled {"
-        "  background-color: #2d333b;"
-        "  color: #636e7b;"
-        "}"
-    );
+    auto MakeButtonStyle = [](const char* normal, const char* hover, const char* pressed, int radius = 4, const char* textColor = "white") {
+        return QString(
+            "QPushButton { background-color: %1; color: %2; font-weight: bold; font-size: 12px; border-radius: %3px; }"
+            "QPushButton:hover { background-color: %4; }"
+            "QPushButton:pressed { background-color: %5; }"
+            "QPushButton:disabled { background-color: #2d333b; color: #636e7b; }"
+        ).arg(normal, textColor).arg(radius).arg(hover, pressed);
+    };
+
+    m_injectBtn->setStyleSheet(MakeButtonStyle("#8957e5", "#a371f7", "#6e40b8", 5));
 
     // 启动 HAMMER
-    m_launchBtn =
-        new QPushButton(
-            "启动 HAMMER 汉化版",
-            centralWidget
-        );
-
+    m_launchBtn = new QPushButton("启动 HAMMER 汉化版", centralWidget);
     m_launchBtn->setMinimumHeight(36);
-
-    m_launchBtn->setSizePolicy(
-        QSizePolicy::Expanding,
-        QSizePolicy::Preferred
-    );
-
-    m_launchBtn->setStyleSheet(
-        "QPushButton {"
-        "  background-color: #2ea043;"
-        "  color: white;"
-        "  font-weight: bold;"
-        "  font-size: 12px;"
-        "  border-radius: 5px;"
-        "}"
-        "QPushButton:hover {"
-        "  background-color: #3fb950;"
-        "}"
-        "QPushButton:pressed {"
-        "  background-color: #238636;"
-        "}"
-        "QPushButton:disabled {"
-        "  background-color: #2d333b;"
-        "  color: #636e7b;"
-        "}"
-    );
+    m_launchBtn->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Preferred);
+    m_launchBtn->setStyleSheet(MakeButtonStyle("#2ea043", "#3fb950", "#238636", 5));
 
     // 还原
-    m_restoreBtn =
-        new QPushButton(
-            "还原",
-            centralWidget
-        );
-
+    m_restoreBtn = new QPushButton("还原", centralWidget);
     m_restoreBtn->setMinimumHeight(36);
-
-    m_restoreBtn->setSizePolicy(
-        QSizePolicy::Expanding,
-        QSizePolicy::Preferred
-    );
-
-    m_restoreBtn->setStyleSheet(
-        "QPushButton {"
-        "  background-color: #444c56;"
-        "  color: #adbac7;"
-        "  font-weight: bold;"
-        "  font-size: 12px;"
-        "  border-radius: 5px;"
-        "}"
-        "QPushButton:hover {"
-        "  background-color: #545d68;"
-        "  color: white;"
-        "}"
-        "QPushButton:pressed {"
-        "  background-color: #373e47;"
-        "}"
-        "QPushButton:disabled {"
-        "  background-color: #2d333b;"
-        "  color: #636e7b;"
-        "}"
-    );
+    m_restoreBtn->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Preferred);
+    m_restoreBtn->setStyleSheet(MakeButtonStyle("#444c56", "#545d68", "#373e47", 5, "#adbac7"));
 
     // 第二行：在线更新 / 字典指南 / 调试监控
-    m_updateBtn =
-        new QPushButton(
-            "🌐 更新在线翻译",
-            centralWidget
-        );
-
+    m_updateBtn = new QPushButton("🌐 更新在线翻译", centralWidget);
     m_updateBtn->setMinimumHeight(28);
+    m_updateBtn->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Preferred);
+    m_updateBtn->setStyleSheet(MakeButtonStyle("#0969da", "#218bff", "#0550ae"));
 
-    m_updateBtn->setSizePolicy(
-        QSizePolicy::Expanding,
-        QSizePolicy::Preferred
-    );
-
-    m_updateBtn->setStyleSheet(
-        "QPushButton {"
-        "  background-color: #0969da;"
-        "  color: white;"
-        "  font-weight: bold;"
-        "  font-size: 12px;"
-        "  border-radius: 4px;"
-        "}"
-        "QPushButton:hover {"
-        "  background-color: #218bff;"
-        "}"
-        "QPushButton:pressed {"
-        "  background-color: #0550ae;"
-        "}"
-        "QPushButton:disabled {"
-        "  background-color: #2d333b;"
-        "  color: #636e7b;"
-        "}"
-    );
-
-    m_helpBtn =
-        new QPushButton(
-            "📖 字典指南",
-            centralWidget
-        );
-
+    m_helpBtn = new QPushButton("📖 字典指南", centralWidget);
     m_helpBtn->setMinimumHeight(28);
-
-    m_helpBtn->setSizePolicy(
-        QSizePolicy::Expanding,
-        QSizePolicy::Preferred
-    );
-
-    m_helpBtn->setStyleSheet(
-        "QPushButton {"
-        "  background-color: #1f6feb;"
-        "  color: white;"
-        "  font-weight: bold;"
-        "  font-size: 12px;"
-        "  border-radius: 4px;"
-        "}"
-        "QPushButton:hover {"
-        "  background-color: #388bfd;"
-        "}"
-        "QPushButton:pressed {"
-        "  background-color: #1158c7;"
-        "}"
-        "QPushButton:disabled {"
-        "  background-color: #2d333b;"
-        "  color: #636e7b;"
-        "}"
-    );
+    m_helpBtn->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Preferred);
+    m_helpBtn->setStyleSheet(MakeButtonStyle("#1f6feb", "#388bfd", "#1158c7"));
 
     m_debugBtn = new QPushButton("🐞 调试监控", centralWidget);
     m_debugBtn->setMinimumHeight(28);
-    m_debugBtn->setSizePolicy(
-        QSizePolicy::Expanding,
-        QSizePolicy::Preferred
-    );
+    m_debugBtn->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Preferred);
     m_debugBtn->setToolTip("打开专用调试监控窗口，查看实时日志流、模块诊断与快捷控制");
     m_debugBtn->setStyleSheet(
-        "QPushButton {"
-        "  background-color: #21262d;"
-        "  color: #58a6ff;"
-        "  font-weight: bold;"
-        "  font-size: 12px;"
-        "  border-radius: 4px;"
-        "  border: 1px solid #30363d;"
-        "}"
-        "QPushButton:hover {"
-        "  background-color: #30363d;"
-        "  border-color: #58a6ff;"
-        "}"
-        "QPushButton:pressed {"
-        "  background-color: #161b22;"
-        "}"
+        "QPushButton { background-color: #21262d; color: #58a6ff; font-weight: bold; font-size: 12px; border-radius: 4px; border: 1px solid #30363d; }"
+        "QPushButton:hover { background-color: #30363d; border-color: #58a6ff; }"
+        "QPushButton:pressed { background-color: #161b22; }"
     );
 
     // 第一行添加至网格
@@ -579,74 +442,20 @@ void MainWindow::setupUi() {
     m_toggleLangBtn->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Preferred);
     m_toggleLangBtn->setEnabled(false);
     m_toggleLangBtn->setToolTip("需在 Hammer 运行中时使用（一键切换原文/翻译）");
-    m_toggleLangBtn->setStyleSheet(
-        "QPushButton {"
-        "  background-color: #d29922;"
-        "  color: white;"
-        "  font-weight: bold;"
-        "  font-size: 12px;"
-        "  border-radius: 4px;"
-        "}"
-        "QPushButton:hover {"
-        "  background-color: #e3b341;"
-        "}"
-        "QPushButton:pressed {"
-        "  background-color: #bb8009;"
-        "}"
-        "QPushButton:disabled {"
-        "  background-color: #2d333b;"
-        "  color: #636e7b;"
-        "}"
-    );
+    m_toggleLangBtn->setStyleSheet(MakeButtonStyle("#d29922", "#e3b341", "#bb8009"));
 
     m_hotReloadBtn = new QPushButton("⚡ 热重载词典", centralWidget);
     m_hotReloadBtn->setMinimumHeight(28);
     m_hotReloadBtn->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Preferred);
     m_hotReloadBtn->setEnabled(false);
     m_hotReloadBtn->setToolTip("需在 Hammer 运行中时使用（重新从磁盘读取词典，无需重启 Hammer）");
-    m_hotReloadBtn->setStyleSheet(
-        "QPushButton {"
-        "  background-color: #8957e5;"
-        "  color: white;"
-        "  font-weight: bold;"
-        "  font-size: 12px;"
-        "  border-radius: 4px;"
-        "}"
-        "QPushButton:hover {"
-        "  background-color: #a371f7;"
-        "}"
-        "QPushButton:pressed {"
-        "  background-color: #6e40b8;"
-        "}"
-        "QPushButton:disabled {"
-        "  background-color: #2d333b;"
-        "  color: #636e7b;"
-        "}"
-    );
+    m_hotReloadBtn->setStyleSheet(MakeButtonStyle("#8957e5", "#a371f7", "#6e40b8"));
 
     m_dictEditorBtn = new QPushButton("📝 词典编辑器", centralWidget);
     m_dictEditorBtn->setMinimumHeight(28);
     m_dictEditorBtn->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Preferred);
     m_dictEditorBtn->setToolTip("打开词典运行时编辑器与实时未翻译捕获面板");
-    m_dictEditorBtn->setStyleSheet(
-        "QPushButton {"
-        "  background-color: #238636;"
-        "  color: white;"
-        "  font-weight: bold;"
-        "  font-size: 12px;"
-        "  border-radius: 4px;"
-        "}"
-        "QPushButton:hover {"
-        "  background-color: #2ea043;"
-        "}"
-        "QPushButton:pressed {"
-        "  background-color: #1a6327;"
-        "}"
-        "QPushButton:disabled {"
-        "  background-color: #2d333b;"
-        "  color: #636e7b;"
-        "}"
-    );
+    m_dictEditorBtn->setStyleSheet(MakeButtonStyle("#238636", "#2ea043", "#1a6327"));
 
     actionGridLayout->addWidget(m_toggleLangBtn, 2, 0);
     actionGridLayout->addWidget(m_hotReloadBtn, 2, 1);
@@ -1907,11 +1716,9 @@ void MainWindow::setupFileWatcher() {
 
     QStringList filesToWatch;
     auto addDictFiles = [&](const fs::path& dir) {
-        filesToWatch << QString::fromStdWString((dir / L"qt_translations.jsonc").wstring());
-        filesToWatch << QString::fromStdWString((dir / L"qt_fallback.jsonc").wstring());
-        filesToWatch << QString::fromStdWString((dir / L"fgd_translations.jsonc").wstring());
-        filesToWatch << QString::fromStdWString((dir / L"fgd_override.jsonc").wstring());
-        filesToWatch << QString::fromStdWString((dir / L"fgd_fallback.jsonc").wstring());
+        for (const wchar_t* fn : paths::kAllDictFiles) {
+            filesToWatch << QString::fromStdWString((dir / fn).wstring());
+        }
     };
     addDictFiles(transDir);
     if (fs::exists(parentTransDir)) {
@@ -1945,11 +1752,9 @@ void MainWindow::onDebouncedHotReload() {
     // 重新挂载可能因原子写入丢失的监视路径
     QStringList filesToWatch;
     auto addDictFiles = [&](const fs::path& dir) {
-        filesToWatch << QString::fromStdWString((dir / L"qt_translations.jsonc").wstring());
-        filesToWatch << QString::fromStdWString((dir / L"qt_fallback.jsonc").wstring());
-        filesToWatch << QString::fromStdWString((dir / L"fgd_translations.jsonc").wstring());
-        filesToWatch << QString::fromStdWString((dir / L"fgd_override.jsonc").wstring());
-        filesToWatch << QString::fromStdWString((dir / L"fgd_fallback.jsonc").wstring());
+        for (const wchar_t* fn : paths::kAllDictFiles) {
+            filesToWatch << QString::fromStdWString((dir / fn).wstring());
+        }
     };
     addDictFiles(transDir);
     if (fs::exists(parentTransDir)) {

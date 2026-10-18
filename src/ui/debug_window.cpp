@@ -3,6 +3,7 @@
 #include "core/cs2_detector.h"
 #include "core/hammer_ipc.h"
 #include "core/path_constants.h"
+#include "core/shared_log.h"
 #include <windows.h>
 #include <psapi.h>
 #include <tlhelp32.h>
@@ -13,25 +14,6 @@
 #include <QHeaderView>
 #include <QScrollBar>
 #include <QApplication>
-
-#ifndef WM_LOCALIZER_QUERY_STATUS
-#define WM_LOCALIZER_QUERY_STATUS  (WM_USER + 103)
-#endif
-
-
-
-// 跨进程共享内存日志环形缓冲区（100% 纯内存传输，0 磁盘 I/O）
-static constexpr const wchar_t* SHARED_LOG_MEM_NAME = L"Local\\CS2_Hammer_Localizer_SharedLog";
-static constexpr size_t SHARED_LOG_CAPACITY = 128 * 1024; // 128 KB 环形缓冲区
-
-#pragma pack(push, 4)
-struct SharedLogHeader {
-    uint32_t magic;         // 0x5A4C434C ('LCLZ')
-    uint32_t writeSeq;      // 单调递增写入总字节数
-    uint32_t writeOffset;   // 当前写入环形偏移
-    char buffer[SHARED_LOG_CAPACITY];
-};
-#pragma pack(pop)
 
 DebugWindow::DebugWindow(const std::wstring& cs2Root, QWidget* parent)
     : QDialog(parent)
@@ -247,7 +229,7 @@ void DebugWindow::queryHammerLanguageStatus() {
     }
 
     DWORD_PTR res = 0;
-    LRESULT ok = SendMessageTimeoutW(hIpc, WM_LOCALIZER_QUERY_STATUS, 0, 0, SMTO_ABORTIFHUNG, 300, &res);
+    LRESULT ok = SendMessageTimeoutW(hIpc, HammerIpc::kMsgQueryStatus, 0, 0, SMTO_ABORTIFHUNG, 300, &res);
     if (ok) {
         m_lastKnownLang = static_cast<int>(res);
         if (res == 1) {
@@ -263,12 +245,12 @@ void DebugWindow::queryHammerLanguageStatus() {
 void DebugWindow::pollHookRuntimeLog() {
     if (!m_pSharedLog) {
         if (!m_hSharedLogMap) {
-            m_hSharedLogMap = OpenFileMappingW(FILE_MAP_READ, FALSE, SHARED_LOG_MEM_NAME);
+            m_hSharedLogMap = OpenFileMappingW(FILE_MAP_READ, FALSE, shared_log::kSharedLogMemName);
         }
         if (m_hSharedLogMap) {
-            m_pSharedLog = MapViewOfFile(reinterpret_cast<HANDLE>(m_hSharedLogMap), FILE_MAP_READ, 0, 0, sizeof(SharedLogHeader));
+            m_pSharedLog = MapViewOfFile(reinterpret_cast<HANDLE>(m_hSharedLogMap), FILE_MAP_READ, 0, 0, sizeof(shared_log::SharedLogHeader));
             if (m_pSharedLog) {
-                const auto* pHeader = reinterpret_cast<const SharedLogHeader*>(m_pSharedLog);
+                const auto* pHeader = reinterpret_cast<const shared_log::SharedLogHeader*>(m_pSharedLog);
                 if (pHeader->magic != 0x5A4C434C) {
                     UnmapViewOfFile(m_pSharedLog);
                     m_pSharedLog = nullptr;
@@ -279,13 +261,13 @@ void DebugWindow::pollHookRuntimeLog() {
 
     if (!m_pSharedLog) return;
 
-    const auto* pHeader = reinterpret_cast<const SharedLogHeader*>(m_pSharedLog);
+    const auto* pHeader = reinterpret_cast<const shared_log::SharedLogHeader*>(m_pSharedLog);
     uint32_t currentSeq = pHeader->writeSeq;
     if (currentSeq == m_lastReadSeq) return;
 
     // 若写入跨度超出缓冲区大小，对齐至最新有效窗口
-    if (currentSeq < m_lastReadSeq || (currentSeq - m_lastReadSeq) > SHARED_LOG_CAPACITY) {
-        m_lastReadSeq = (currentSeq > SHARED_LOG_CAPACITY) ? (currentSeq - SHARED_LOG_CAPACITY) : 0;
+    if (currentSeq < m_lastReadSeq || (currentSeq - m_lastReadSeq) > shared_log::kSharedLogCapacity) {
+        m_lastReadSeq = (currentSeq > shared_log::kSharedLogCapacity) ? (currentSeq - shared_log::kSharedLogCapacity) : 0;
     }
 
     uint32_t bytesToRead = currentSeq - m_lastReadSeq;
@@ -294,9 +276,9 @@ void DebugWindow::pollHookRuntimeLog() {
     QByteArray rawBytes;
     rawBytes.reserve(static_cast<int>(bytesToRead));
 
-    uint32_t readOffset = m_lastReadSeq % SHARED_LOG_CAPACITY;
+    uint32_t readOffset = m_lastReadSeq % shared_log::kSharedLogCapacity;
     for (uint32_t i = 0; i < bytesToRead; ++i) {
-        rawBytes.append(pHeader->buffer[(readOffset + i) % SHARED_LOG_CAPACITY]);
+        rawBytes.append(pHeader->buffer[(readOffset + i) % shared_log::kSharedLogCapacity]);
     }
     m_lastReadSeq = currentSeq;
 
@@ -336,7 +318,7 @@ void DebugWindow::onClearLogClicked() {
     m_txtHookLog->clear();
     m_allLogLines.clear();
     if (m_pSharedLog) {
-        const auto* pHeader = reinterpret_cast<const SharedLogHeader*>(m_pSharedLog);
+        const auto* pHeader = reinterpret_cast<const shared_log::SharedLogHeader*>(m_pSharedLog);
         m_lastReadSeq = pHeader->writeSeq;
     }
 }

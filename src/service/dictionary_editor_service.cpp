@@ -2,6 +2,7 @@
 #include "core/dictionary_paths.h"
 #include "core/dictionary_compiler.h"
 #include "core/dictionary_text_updater.h"
+#include "core/encoding_util.h"
 #include <algorithm>
 #include <filesystem>
 
@@ -67,7 +68,7 @@ std::vector<std::string> DictionaryEditorService::getAvailableModules(DictType t
 
     modules.push_back("common");
     for (const auto& kv : scopedDicts) {
-        std::string sMod(kv.first.begin(), kv.first.end());
+        std::string sMod = enc::WideToUtf8(kv.first);
         if (sMod != "common") {
             modules.push_back(sMod);
         }
@@ -115,7 +116,7 @@ std::vector<DictEntryRecord> DictionaryEditorService::searchEntries(
         }
         // scoped 分组
         for (const auto& sec : masterScoped) {
-            std::string modStr(sec.first.begin(), sec.first.end());
+            std::string modStr = enc::WideToUtf8(sec.first);
             if (!filterByModule || targetModule == modStr) {
                 for (const auto& kv : sec.second) {
                     if (matchText(kv.first, kv.second)) {
@@ -145,14 +146,7 @@ std::vector<DictEntryRecord> DictionaryEditorService::searchEntries(
             for (const auto& kv : fallbackCommon) {
                 if (matchText(kv.first, kv.second)) {
                     // 若主词典中已存在此 key，则忽略 Fallback 项（以主词典为准）
-                    bool alreadyInMaster = false;
-                    for (const auto& r : results) {
-                        if (r.key == kv.first) {
-                            alreadyInMaster = true;
-                            break;
-                        }
-                    }
-                    if (!alreadyInMaster) {
+                    if (masterCommon.find(kv.first) == masterCommon.end()) {
                         results.push_back({DictSource::Fallback, "", kv.first, kv.second});
                     }
                 }

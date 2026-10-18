@@ -298,9 +298,235 @@ private:
         return false;
     }
 
+public:
+    bool ParseFgdOverride(FgdOverrideData& outOverride, std::wstring& outError) {
+        SkipWhitespace();
+        if (m_idx >= m_len || m_str[m_idx] != '{') {
+            outError = L"JSON 根节点必须为对象 '{'";
+            return false;
+        }
+        m_idx++; // skip '{'
+
+        while (true) {
+            SkipWhitespace();
+            if (m_idx >= m_len) {
+                outError = L"JSON 解析异常结束，缺少闭合 '}'";
+                return false;
+            }
+            if (m_str[m_idx] == '}') {
+                m_idx++;
+                break;
+            }
+
+            std::string key;
+            if (!ParseString(key, outError)) return false;
+
+            SkipWhitespace();
+            if (m_idx >= m_len || m_str[m_idx] != ':') {
+                outError = L"JSON 缺少冒号 ':' 分隔符";
+                return false;
+            }
+            m_idx++;
+            SkipWhitespace();
+
+            if (key == "properties" && m_idx < m_len && m_str[m_idx] == '{') {
+                m_idx++; // skip '{'
+                while (true) {
+                    SkipWhitespace();
+                    if (m_idx >= m_len) { outError = L"properties 缺少 '}'"; return false; }
+                    if (m_str[m_idx] == '}') { m_idx++; break; }
+
+                    std::string pKey;
+                    if (!ParseString(pKey, outError)) return false;
+                    SkipWhitespace();
+                    if (m_idx >= m_len || m_str[m_idx] != ':') { outError = L"缺少冒号"; return false; }
+                    m_idx++;
+                    SkipWhitespace();
+
+                    FgdPropertyOverride prop;
+                    if (m_idx < m_len && m_str[m_idx] == '"') {
+                        std::string desc;
+                        if (!ParseString(desc, outError)) return false;
+                        prop.description = desc;
+                    } else if (m_idx < m_len && m_str[m_idx] == '{') {
+                        m_idx++; // skip '{'
+                        while (true) {
+                            SkipWhitespace();
+                            if (m_idx >= m_len) { outError = L"缺少 '}'"; return false; }
+                            if (m_str[m_idx] == '}') { m_idx++; break; }
+                            std::string subField;
+                            if (!ParseString(subField, outError)) return false;
+                            SkipWhitespace();
+                            if (m_idx >= m_len || m_str[m_idx] != ':') { outError = L"缺少冒号"; return false; }
+                            m_idx++;
+                            SkipWhitespace();
+                            std::string subVal;
+                            if (!ParseString(subVal, outError)) return false;
+                            if (subField == "description") prop.description = subVal;
+                            else if (subField == "displayName") prop.displayName = subVal;
+                            SkipWhitespace();
+                            if (m_idx < m_len && m_str[m_idx] == ',') m_idx++;
+                        }
+                    } else {
+                        outError = L"不支持的属性覆盖值类型";
+                        return false;
+                    }
+
+                    if (!prop.description.empty() || !prop.displayName.empty()) {
+                        outOverride.globalProperties[pKey] = std::move(prop);
+                    }
+                    SkipWhitespace();
+                    if (m_idx < m_len && m_str[m_idx] == ',') m_idx++;
+                }
+            } else if (key == "io" && m_idx < m_len && m_str[m_idx] == '{') {
+                m_idx++; // skip '{'
+                while (true) {
+                    SkipWhitespace();
+                    if (m_idx >= m_len) { outError = L"io 缺少 '}'"; return false; }
+                    if (m_str[m_idx] == '}') { m_idx++; break; }
+
+                    std::string ioKey;
+                    if (!ParseString(ioKey, outError)) return false;
+                    SkipWhitespace();
+                    if (m_idx >= m_len || m_str[m_idx] != ':') { outError = L"缺少冒号"; return false; }
+                    m_idx++;
+                    SkipWhitespace();
+
+                    std::string ioDesc;
+                    if (m_idx < m_len && m_str[m_idx] == '"') {
+                        if (!ParseString(ioDesc, outError)) return false;
+                    } else if (m_idx < m_len && m_str[m_idx] == '{') {
+                        m_idx++;
+                        while (true) {
+                            SkipWhitespace();
+                            if (m_idx >= m_len) { outError = L"缺少 '}'"; return false; }
+                            if (m_str[m_idx] == '}') { m_idx++; break; }
+                            std::string subF;
+                            if (!ParseString(subF, outError)) return false;
+                            SkipWhitespace();
+                            if (m_idx >= m_len || m_str[m_idx] != ':') return false;
+                            m_idx++;
+                            SkipWhitespace();
+                            std::string subV;
+                            if (!ParseString(subV, outError)) return false;
+                            if (subF == "description") ioDesc = subV;
+                            SkipWhitespace();
+                            if (m_idx < m_len && m_str[m_idx] == ',') m_idx++;
+                        }
+                    }
+                    if (!ioDesc.empty()) {
+                        outOverride.ioOverrides[ioKey] = ioDesc;
+                    }
+                    SkipWhitespace();
+                    if (m_idx < m_len && m_str[m_idx] == ',') m_idx++;
+                }
+            } else if (key == "classes" && m_idx < m_len && m_str[m_idx] == '{') {
+                m_idx++; // skip '{'
+                while (true) {
+                    SkipWhitespace();
+                    if (m_idx >= m_len) { outError = L"classes 缺少 '}'"; return false; }
+                    if (m_str[m_idx] == '}') { m_idx++; break; }
+
+                    std::string clsName;
+                    if (!ParseString(clsName, outError)) return false;
+                    SkipWhitespace();
+                    if (m_idx >= m_len || m_str[m_idx] != ':') { outError = L"缺少冒号"; return false; }
+                    m_idx++;
+                    SkipWhitespace();
+
+                    if (m_idx < m_len && m_str[m_idx] == '"') {
+                        std::string cDesc;
+                        if (!ParseString(cDesc, outError)) return false;
+                        if (!cDesc.empty()) outOverride.classDescriptions[clsName] = cDesc;
+                    } else if (m_idx < m_len && m_str[m_idx] == '{') {
+                        m_idx++; // skip '{'
+                        while (true) {
+                            SkipWhitespace();
+                            if (m_idx >= m_len) { outError = L"缺少 '}'"; return false; }
+                            if (m_str[m_idx] == '}') { m_idx++; break; }
+
+                            std::string fName;
+                            if (!ParseString(fName, outError)) return false;
+                            SkipWhitespace();
+                            if (m_idx >= m_len || m_str[m_idx] != ':') return false;
+                            m_idx++;
+                            SkipWhitespace();
+
+                            if (fName == "description" && m_idx < m_len && m_str[m_idx] == '"') {
+                                std::string cDesc;
+                                if (!ParseString(cDesc, outError)) return false;
+                                if (!cDesc.empty()) outOverride.classDescriptions[clsName] = cDesc;
+                            } else if (fName == "properties" && m_idx < m_len && m_str[m_idx] == '{') {
+                                m_idx++; // skip '{'
+                                while (true) {
+                                    SkipWhitespace();
+                                    if (m_idx >= m_len) return false;
+                                    if (m_str[m_idx] == '}') { m_idx++; break; }
+
+                                    std::string cpKey;
+                                    if (!ParseString(cpKey, outError)) return false;
+                                    SkipWhitespace();
+                                    if (m_idx >= m_len || m_str[m_idx] != ':') return false;
+                                    m_idx++;
+                                    SkipWhitespace();
+
+                                    FgdPropertyOverride cpProp;
+                                    if (m_idx < m_len && m_str[m_idx] == '"') {
+                                        std::string cpDesc;
+                                        if (!ParseString(cpDesc, outError)) return false;
+                                        cpProp.description = cpDesc;
+                                    } else if (m_idx < m_len && m_str[m_idx] == '{') {
+                                        m_idx++;
+                                        while (true) {
+                                            SkipWhitespace();
+                                            if (m_idx >= m_len) return false;
+                                            if (m_str[m_idx] == '}') { m_idx++; break; }
+                                            std::string sf;
+                                            if (!ParseString(sf, outError)) return false;
+                                            SkipWhitespace();
+                                            if (m_idx >= m_len || m_str[m_idx] != ':') return false;
+                                            m_idx++;
+                                            SkipWhitespace();
+                                            std::string sv;
+                                            if (!ParseString(sv, outError)) return false;
+                                            if (sf == "description") cpProp.description = sv;
+                                            else if (sf == "displayName") cpProp.displayName = sv;
+                                            SkipWhitespace();
+                                            if (m_idx < m_len && m_str[m_idx] == ',') m_idx++;
+                                        }
+                                    }
+                                    if (!cpProp.description.empty() || !cpProp.displayName.empty()) {
+                                        outOverride.classProperties[clsName][cpKey] = std::move(cpProp);
+                                    }
+                                    SkipWhitespace();
+                                    if (m_idx < m_len && m_str[m_idx] == ',') m_idx++;
+                                }
+                            }
+                            SkipWhitespace();
+                            if (m_idx < m_len && m_str[m_idx] == ',') m_idx++;
+                        }
+                    }
+                    SkipWhitespace();
+                    if (m_idx < m_len && m_str[m_idx] == ',') m_idx++;
+                }
+            } else if (!key.empty() && key[0] != '_') {
+                // 顶层简写
+                if (m_idx < m_len && m_str[m_idx] == '"') {
+                    std::string desc;
+                    if (!ParseString(desc, outError)) return false;
+                    FgdPropertyOverride prop;
+                    prop.description = desc;
+                    outOverride.globalProperties[key] = std::move(prop);
+                }
+            }
+
+            SkipWhitespace();
+            if (m_idx < m_len && m_str[m_idx] == ',') m_idx++;
+        }
+        return true;
+    }
+
     static std::wstring NormalizeSectionName(const std::string& name) {
-        // name 来自 JSONC，是 UTF-8。早期实现按字节 static_cast<wchar_t> 强转，
-        // 中文 section 名会被拆成一串乱码，导致词典永远查不中。
         std::wstring wname = enc::Utf8ToWide(name);
         if (wname.empty()) {
             return {};
@@ -316,6 +542,30 @@ private:
     size_t m_idx;
     size_t m_len;
 };
+
+static bool ReadFileToString(const std::wstring& path, std::string& outContent, std::wstring& outError) {
+    FILE* fp = _wfopen(path.c_str(), L"rb");
+    if (!fp) {
+        outError = L"无法打开源文件: " + path;
+        return false;
+    }
+    fseek(fp, 0, SEEK_END);
+    long fsize = ftell(fp);
+    fseek(fp, 0, SEEK_SET);
+    if (fsize <= 0 || fsize > static_cast<long>(DictionaryCompiler::MAX_JSON_FILE_SIZE)) {
+        fclose(fp);
+        outError = L"文件为空或大小超出 16MB 安全上限: " + path;
+        return false;
+    }
+    outContent.resize(static_cast<size_t>(fsize));
+    size_t fRead = fread(outContent.data(), 1, static_cast<size_t>(fsize), fp);
+    fclose(fp);
+    if (fRead != static_cast<size_t>(fsize)) {
+        outError = L"读取文件失败 (读取不完整): " + path;
+        return false;
+    }
+    return true;
+}
 
 } // namespace
 
@@ -335,17 +585,12 @@ bool DictionaryCompiler::ParseJsoncStringToMaps(
         return false;
     }
 
-    // 1. 去除注释与尾随逗号
     std::string cleanJson = StripJsonComments(jsonContent.data(), jsonContent.size());
-
-    // 2. 解析为分块字典结构
     SimpleJsonParser parser(cleanJson);
     if (!parser.Parse(outCommon, outScoped, outError)) {
         return false;
     }
 
-    // 3. 生效容量上限。这两个常量此前只是声明，从未被检查，
-    //    词典文件异常膨胀时会在注入进程里无上限吃内存。
     if (outScoped.size() > MAX_TOTAL_SECTIONS) {
         outError = L"作用域数量超出上限 (" + std::to_wstring(MAX_TOTAL_SECTIONS) + L")";
         return false;
@@ -363,6 +608,21 @@ bool DictionaryCompiler::ParseJsoncStringToMaps(
     return (!outCommon.empty() || !outScoped.empty());
 }
 
+bool DictionaryCompiler::ParseFgdOverrideFile(
+    const std::wstring& jsonPath,
+    FgdOverrideData& outOverride,
+    std::wstring& outError
+) {
+    outOverride = FgdOverrideData();
+    std::string rawData;
+    if (!ReadFileToString(jsonPath, rawData, outError)) {
+        return false;
+    }
+    std::string clean = StripJsonComments(rawData.data(), rawData.size());
+    SimpleJsonParser parser(clean);
+    return parser.ParseFgdOverride(outOverride, outError);
+}
+
 bool DictionaryCompiler::ParseJsoncFileToMaps(
     const std::wstring& jsonPath,
     std::unordered_map<std::string, std::string>& outCommon,
@@ -375,63 +635,19 @@ bool DictionaryCompiler::ParseJsoncFileToMaps(
 
     // 1. 若提供了 fallback 字典，先加载 fallback 作为兜底层
     if (!fallbackJsonPath.empty() && fs::exists(fallbackJsonPath)) {
-        FILE* fbFp = _wfopen(fallbackJsonPath.c_str(), L"rb");
-        if (fbFp) {
-            fseek(fbFp, 0, SEEK_END);
-            long fbSize = ftell(fbFp);
-            fseek(fbFp, 0, SEEK_SET);
-            if (fbSize > 0 && fbSize <= static_cast<long>(MAX_JSON_FILE_SIZE)) {
-                std::string fbStr(static_cast<size_t>(fbSize), '\0');
-                size_t fbRead = fread(fbStr.data(), 1, static_cast<size_t>(fbSize), fbFp);
-                fclose(fbFp);
-                fbFp = nullptr;
-
-                // 短读视为 fallback 字典无效，跳过解析，继续加载主字典
-                if (fbRead == static_cast<size_t>(fbSize)) {
-                    std::string cleanFb = StripJsonComments(fbStr.data(), fbStr.size());
-                    std::wstring fbErr;
-                    SimpleJsonParser fbParser(cleanFb);
-                    fbParser.Parse(outCommon, outScoped, fbErr);
-                }
-            } else {
-                fclose(fbFp);
-            }
+        std::string fbStr;
+        std::wstring fbErr;
+        if (ReadFileToString(fallbackJsonPath, fbStr, fbErr)) {
+            std::string cleanFb = StripJsonComments(fbStr.data(), fbStr.size());
+            SimpleJsonParser fbParser(cleanFb);
+            fbParser.Parse(outCommon, outScoped, fbErr);
         }
     }
 
     // 2. 加载主字典覆盖/补充
-    FILE* fp = _wfopen(jsonPath.c_str(), L"rb");
-    if (!fp) {
-        if (!outCommon.empty() || !outScoped.empty()) {
-            return true; // fallback 字典有效
-        }
-        outError = L"无法打开源 JSONC 文件: " + jsonPath;
-        return false;
-    }
-
-    fseek(fp, 0, SEEK_END);
-    long fsize = ftell(fp);
-    fseek(fp, 0, SEEK_SET);
-    if (fsize <= 0 || fsize > static_cast<long>(MAX_JSON_FILE_SIZE)) {
-        fclose(fp);
-        if (!outCommon.empty() || !outScoped.empty()) {
-            return true;
-        }
-        outError = L"源 JSONC 文件为空或大小超出 16MB 安全上限";
-        return false;
-    }
-
-    std::string jsonStr(static_cast<size_t>(fsize), '\0');
-    size_t fRead = fread(jsonStr.data(), 1, static_cast<size_t>(fsize), fp);
-    fclose(fp);
-
-    if (fRead != static_cast<size_t>(fsize)) {
-        // 短读：源文件内容不完整
-        if (!outCommon.empty() || !outScoped.empty()) {
-            return true;
-        }
-        outError = L"读取源 JSONC 文件失败 (读取不完整): " + jsonPath;
-        return false;
+    std::string jsonStr;
+    if (!ReadFileToString(jsonPath, jsonStr, outError)) {
+        return (!outCommon.empty() || !outScoped.empty());
     }
 
     std::string cleanPrimary = StripJsonComments(jsonStr.data(), jsonStr.size());
@@ -440,6 +656,19 @@ bool DictionaryCompiler::ParseJsoncFileToMaps(
         if (!outCommon.empty() || !outScoped.empty()) {
             return true;
         }
+        return false;
+    }
+
+    if (outScoped.size() > MAX_TOTAL_SECTIONS) {
+        outError = L"作用域数量超出上限 (" + std::to_wstring(MAX_TOTAL_SECTIONS) + L")";
+        return false;
+    }
+    size_t totalEntries = outCommon.size();
+    for (const auto& scoped : outScoped) {
+        totalEntries += scoped.second.size();
+    }
+    if (totalEntries > MAX_TOTAL_ENTRIES) {
+        outError = L"词条总数超出上限 (" + std::to_wstring(MAX_TOTAL_ENTRIES) + L")";
         return false;
     }
 

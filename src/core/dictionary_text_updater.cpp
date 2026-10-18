@@ -97,25 +97,68 @@ FileLines ReadLines(const std::wstring& filePath, std::string& err) {
     return res;
 }
 
-bool WriteLines(const std::wstring& filePath, const FileLines& fl, std::string& err) {
-    std::ofstream file(filePath, std::ios::binary | std::ios::trunc);
-    if (!file.is_open()) {
-        err = "无法打开词典文件进行写入";
-        return false;
-    }
+#include <windows.h>
 
-    if (fl.hasBom) {
-        const unsigned char bom[3] = {0xEF, 0xBB, 0xBF};
-        file.write(reinterpret_cast<const char*>(bom), 3);
+// 检查索引 idx 处的双引号是否被转义（考虑前面连续反斜杠奇偶性）
+bool IsQuoteEscaped(const std::string& s, size_t idx) {
+    if (idx == 0 || s[idx] != '\"') return false;
+    size_t slashCount = 0;
+    size_t i = idx;
+    while (i > 0 && s[i - 1] == '\\') {
+        slashCount++;
+        i--;
     }
+    return (slashCount % 2) != 0;
+}
 
-    for (size_t i = 0; i < fl.lines.size(); ++i) {
-        file << fl.lines[i];
-        if (i + 1 < fl.lines.size()) {
-            file << "\r\n";
+// 在字符串中查找不在双引号内的 // 注释起始位置
+size_t FindCommentOutsideStrings(const std::string& line) {
+    bool inString = false;
+    for (size_t i = 0; i < line.size(); ++i) {
+        if (line[i] == '\"' && !IsQuoteEscaped(line, i)) {
+            inString = !inString;
+        } else if (!inString && line[i] == '/' && i + 1 < line.size() && line[i + 1] == '/') {
+            return i;
         }
     }
-    file.close();
+    return std::string::npos;
+}
+
+bool WriteLines(const std::wstring& filePath, const FileLines& fl, std::string& err) {
+    std::wstring tmpPath = filePath + L".tmp." + std::to_wstring(GetCurrentProcessId());
+    {
+        std::ofstream file(tmpPath, std::ios::binary | std::ios::trunc);
+        if (!file.is_open()) {
+            err = "无法打开临时词典文件进行写入";
+            return false;
+        }
+
+        if (fl.hasBom) {
+            const unsigned char bom[3] = {0xEF, 0xBB, 0xBF};
+            file.write(reinterpret_cast<const char*>(bom), 3);
+        }
+
+        for (size_t i = 0; i < fl.lines.size(); ++i) {
+            file << fl.lines[i];
+            if (i + 1 < fl.lines.size()) {
+                file << "\r\n";
+            }
+        }
+        file.flush();
+        if (!file.good()) {
+            file.close();
+            DeleteFileW(tmpPath.c_str());
+            err = "写入临时词典文件失败";
+            return false;
+        }
+        file.close();
+    }
+
+    if (!MoveFileExW(tmpPath.c_str(), filePath.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
+        DeleteFileW(tmpPath.c_str());
+        err = "原子替换词典文件失败 (错误码: " + std::to_string(GetLastError()) + ")";
+        return false;
+    }
     return true;
 }
 
@@ -137,7 +180,7 @@ bool FindModuleBounds(const std::vector<std::string>& lines, const std::string& 
                         bool inString = false;
                         for (size_t k = 0; k < lines[j].size(); ++k) {
                             char c = lines[j][k];
-                            if (c == '\"' && (k == 0 || lines[j][k - 1] != '\\')) {
+                            if (c == '\"' && !IsQuoteEscaped(lines[j], k)) {
                                 inString = !inString;
                             } else if (!inString) {
                                 if (c == '/' && k + 1 < lines[j].size() && lines[j][k + 1] == '/') {
@@ -178,7 +221,7 @@ bool FindKeyLine(const std::vector<std::string>& lines, size_t startLine, size_t
         size_t keyPos = line.find(targetKey);
         if (keyPos != std::string::npos) {
             // 确保不是注释内部
-            size_t commentPos = line.find("//");
+            size_t commentPos = FindCommentOutsideStrings(line);
             if (commentPos != std::string::npos && commentPos < keyPos) {
                 continue;
             }
@@ -195,7 +238,7 @@ bool FindKeyLine(const std::vector<std::string>& lines, size_t startLine, size_t
 
 // 移除行尾有效字符处的逗号（保留行末注释与空白）
 void RemoveTrailingComma(std::string& line) {
-    size_t commentPos = line.find("//");
+    size_t commentPos = FindCommentOutsideStrings(line);
     std::string commentPart = (commentPos != std::string::npos) ? line.substr(commentPos) : "";
     std::string codePart = (commentPos != std::string::npos) ? line.substr(0, commentPos) : line;
 
@@ -213,7 +256,7 @@ void RemoveTrailingComma(std::string& line) {
 
 // 确保行尾有效字符处带有逗号（保留行末注释与空白）
 void EnsureTrailingComma(std::string& line) {
-    size_t commentPos = line.find("//");
+    size_t commentPos = FindCommentOutsideStrings(line);
     std::string commentPart = (commentPos != std::string::npos) ? line.substr(commentPos) : "";
     std::string codePart = (commentPos != std::string::npos) ? line.substr(0, commentPos) : line;
 
@@ -270,10 +313,10 @@ UpdateResult UpdateEntry(
         return {false, "解析键值对行值引号失败: " + line};
     }
 
-    // 寻找匹配的闭合引号（跳过转义 \"）
+    // 寻找匹配的闭合引号（跳过转义 \"，考虑双反斜杠）
     size_t valQuoteEnd = std::string::npos;
     for (size_t i = valQuoteStart + 1; i < line.size(); ++i) {
-        if (line[i] == '\"' && line[i - 1] != '\\') {
+        if (line[i] == '\"' && !IsQuoteEscaped(line, i)) {
             valQuoteEnd = i;
             break;
         }
@@ -443,7 +486,7 @@ UpdateResult DeleteEntry(
     // 检查此行是否带有尾随逗号
     bool deletedLineHadComma = false;
     {
-        size_t cPos = fl.lines[keyLine].find("//");
+        size_t cPos = FindCommentOutsideStrings(fl.lines[keyLine]);
         std::string code = (cPos != std::string::npos) ? fl.lines[keyLine].substr(0, cPos) : fl.lines[keyLine];
         int li = static_cast<int>(code.size()) - 1;
         while (li >= 0 && (code[li] == ' ' || code[li] == '\t')) li--;
