@@ -35,6 +35,7 @@ std::wstring GetBinDirectory();
 
 // 模块地址与快照查询管理
 bool GetCallerModuleName(void* callerAddr, wchar_t* outStem, size_t stemMaxLen);
+bool ResolveCallerModuleName(void* directCallerAddr, wchar_t* outStem, size_t stemMaxLen);
 bool AddModuleRange(HMODULE hMod, const std::wstring& overrideStem = L"");
 bool RemoveModuleRangeByBase(uintptr_t base);
 void InvalidateUnloadedModules();

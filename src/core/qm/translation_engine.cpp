@@ -339,6 +339,83 @@ bool MatchAndTranslateInternal(const std::unordered_map<std::string, std::string
     return false;
 }
 
+// 判断模块是否为 Qt / UI 基础框架透传层（回溯调用栈时应跳过，以定位上层业务工具模块）
+inline bool IsQtFrameworkModule(const wchar_t* stem) {
+    if (!stem || stem[0] == L'\0') return false;
+    return (_wcsicmp(stem, L"qt5widgets") == 0 ||
+            _wcsicmp(stem, L"qt5gui") == 0 ||
+            _wcsicmp(stem, L"qt5core") == 0 ||
+            _wcsicmp(stem, L"qt5concurrent") == 0 ||
+            _wcsicmp(stem, L"qtadvanceddocking-qt5") == 0 ||
+            _wcsicmp(stem, L"qtcore_qm") == 0);
+}
+
+// 计算反向还原候选英文词的 UI 规范度权重（分值越高越优先作为中文 -> 英文反向还原结果）
+int ComputeReverseCandidateScore(const std::string& en) {
+    if (en.empty()) return -100;
+
+    int score = 0;
+    unsigned char firstChar = static_cast<unsigned char>(en[0]);
+    bool startsUpper = (firstChar >= 'A' && firstChar <= 'Z');
+    bool startsLower = (firstChar >= 'a' && firstChar <= 'z');
+
+    bool hasLower = false;
+    bool hasUpper = false;
+    bool hasUnderscore = false;
+    bool hasAmpersand = false;
+
+    for (char ch : en) {
+        unsigned char c = static_cast<unsigned char>(ch);
+        if (c >= 'a' && c <= 'z') hasLower = true;
+        else if (c >= 'A' && c <= 'Z') hasUpper = true;
+        else if (c == '_') hasUnderscore = true;
+        else if (c == '&') hasAmpersand = true;
+    }
+
+    if (startsUpper && hasLower) {
+        // 标准 TitleCase / SentenceCase（如 "Tool", "Selection Tool"）—— 标准 UI 首选形态
+        score += 30;
+    } else if (startsUpper && !hasLower) {
+        // 全大写专有名词或缩写（如 "OK", "FOV", "UV"）—— 次优 UI 形态
+        score += 20;
+    } else if (!startsLower && hasUpper) {
+        // 非字母开头但包含大写字母（如 "[Shift+X] Tool"）
+        score += 10;
+    } else if (startsLower && hasUpper) {
+        // camelCase 内部标识符（如 "toolName"）
+        score += 5;
+    } else {
+        // 全小写词（如 "tool", "type"）—— 多为底层 Schema 属性名，反向还原优先级最低
+        score += 0;
+    }
+
+    if (hasUnderscore) score -= 15; // snake_case 标识符（如 "base_item"）
+    if (hasAmpersand)  score -= 5;  // 含 '&' 加速符的变体优先让位给纯净词条
+
+    return score;
+}
+
+// 按 UI 规范度权重插入反向字典，消除多对一映射下的全小写覆盖退化与哈希遍历顺序不确定性
+void InsertReverseEntryWithPriority(std::unordered_map<std::string, std::string>& revDict,
+                                    const std::string& en,
+                                    const std::string& cn) {
+    if (en.empty() || cn.empty()) return;
+    auto it = revDict.find(cn);
+    if (it == revDict.end()) {
+        revDict.emplace(cn, en);
+        return;
+    }
+
+    int oldScore = ComputeReverseCandidateScore(it->second);
+    int newScore = ComputeReverseCandidateScore(en);
+    if (newScore > oldScore) {
+        it->second = en;
+    } else if (newScore == oldScore && en < it->second) {
+        // 分值相同时按字典序稳定裁决，保证跨平台/跨桶序 100% 确定性
+        it->second = en;
+    }
+}
+
 } // namespace
 
 std::wstring GetBinDirectory() {
@@ -370,6 +447,32 @@ bool GetCallerModuleName(void* callerAddr, wchar_t* outBuf, size_t maxLen) {
     }
 
     return false;
+}
+
+bool ResolveCallerModuleName(void* directCallerAddr, wchar_t* outBuf, size_t maxLen) {
+    if (!outBuf || maxLen == 0) return false;
+    outBuf[0] = L'\0';
+
+    // 1. 极速路径 (Fast Path)：直接检查一层返回地址，若已命中非 Qt 框架层模块则直接返回（0 栈回溯开销）
+    bool hasDirect = (directCallerAddr != nullptr && GetCallerModuleName(directCallerAddr, outBuf, maxLen));
+    if (hasDirect && !IsQtFrameworkModule(outBuf)) {
+        return true;
+    }
+
+    // 2. 栈回溯路径 (Stack Walk)：当直接调用者位于 Qt5Widgets/Qt5Gui 等框架内部时，向上回溯定位真实业务工具模块
+    void* stack[10] = {0};
+    WORD frames = RtlCaptureStackBackTrace(1, 10, stack, nullptr);
+    wchar_t frameStem[64] = {0};
+    for (WORD i = 0; i < frames; ++i) {
+        if (GetCallerModuleName(stack[i], frameStem, 64)) {
+            if (!IsQtFrameworkModule(frameStem)) {
+                wcsncpy_s(outBuf, maxLen, frameStem, _TRUNCATE);
+                return (outBuf[0] != L'\0');
+            }
+        }
+    }
+
+    return hasDirect;
 }
 
 bool AddModuleRange(HMODULE hMod, const std::wstring& overrideStem) {
@@ -450,13 +553,28 @@ void ScanKnownToolModules() {
         L"met.dll",
         L"sfm.dll",
         L"postprocessing.dll",
+        L"postprocessingeditor.dll",
         L"smartprops_editor.dll",
+        L"smartprops.dll",
         L"pulse_editor.dll",
+        L"pulse_system.dll",
         L"subtool_modeldoc.dll",
         L"subtool_worldeditor.dll",
         L"subtool_particle.dll",
+        L"subrecteditor.dll",
+        L"cs2_item_editor.dll",
+        L"cs2_workshop_manager.dll",
         L"worldeditor.dll",
         L"assetbrowser.dll",
+        L"assetpreview.dll",
+        L"assetrename.dll",
+        L"assetsystem.dll",
+        L"propertyeditor.dll",
+        L"toolframework2.dll",
+        L"toolscenenodes.dll",
+        L"helpsystem.dll",
+        L"modeldoc_utils.dll",
+        L"resourcecompiler.dll",
         L"vconsole2.dll",
         L"particles.dll",
         L"worldrenderer.dll",
@@ -470,6 +588,8 @@ void ScanKnownToolModules() {
         L"rendersystemdx11.dll",
         L"scenesystem.dll",
         L"tier0.dll",
+        L"qtadvanceddocking-qt5.dll",
+        L"qt5concurrent.dll",
         L"qt5widgets.dll",
         L"qt5gui.dll",
         L"qt5core.dll"
@@ -541,31 +661,84 @@ void LoadMasterTranslations() {
         }
     }
 
+    // 分层解析兜底字典与主字典，保证：
+    // 1. 正向字典：主字典覆盖兜底字典；
+    // 2. 反向字典：主字典条目绝对优先于兜底字典，同层级内部按 UI 规范度权重（TitleCase > 全小写）稳定裁决。
+    std::unordered_map<std::string, std::string> fbCommon;
+    std::unordered_map<std::wstring, std::unordered_map<std::string, std::string>> fbScoped;
+    if (!fallbackPath.empty()) {
+        std::wstring fbErr;
+        DictionaryCompiler::ParseJsoncFileToMaps(fallbackPath, fbCommon, fbScoped, fbErr);
+    }
+
+    std::unordered_map<std::string, std::string> primaryCommon;
+    std::unordered_map<std::wstring, std::unordered_map<std::string, std::string>> primaryScoped;
     std::wstring err;
-    if (DictionaryCompiler::ParseJsoncFileToMaps(jsoncPath, g_CommonDict, g_ScopedDicts, err, fallbackPath)) {
+    bool primaryOk = DictionaryCompiler::ParseJsoncFileToMaps(jsoncPath, primaryCommon, primaryScoped, err);
+
+    std::unordered_map<std::string, std::string> newCommonDict = fbCommon;
+    for (const auto& kv : primaryCommon) {
+        newCommonDict[kv.first] = kv.second;
+    }
+
+    std::unordered_map<std::wstring, std::unordered_map<std::string, std::string>> newScopedDicts = fbScoped;
+    for (const auto& sec : primaryScoped) {
+        auto& targetSec = newScopedDicts[sec.first];
+        for (const auto& kv : sec.second) {
+            targetSec[kv.first] = kv.second;
+        }
+    }
+
+    if (primaryOk || !newCommonDict.empty() || !newScopedDicts.empty()) {
         shared_log::LogHook("[DICT] Loaded JSONC dictionary from %ls (fallback: %ls): %zu common, %zu scoped modules",
             jsoncPath.c_str(), fallbackPath.empty() ? L"none" : fallbackPath.c_str(),
-            g_CommonDict.size(), g_ScopedDicts.size());
+            newCommonDict.size(), newScopedDicts.size());
     } else {
         shared_log::LogHook("[DICT] Failed to load JSONC dictionary from %ls: %ls", jsoncPath.c_str(), err.c_str());
     }
 
-    g_CommonReverseDict.clear();
-    g_CommonReverseCache.clear();
-    for (const auto& kv : g_CommonDict) {
-        if (!kv.first.empty() && !kv.second.empty()) {
-            g_CommonReverseDict[kv.second] = kv.first;
+    // 构建公共反向字典：先对兜底词条做规范度优选，再由主字典优选词条高优先级覆盖
+    std::unordered_map<std::string, std::string> newCommonReverseDict;
+    for (const auto& kv : fbCommon) {
+        InsertReverseEntryWithPriority(newCommonReverseDict, kv.first, kv.second);
+    }
+    std::unordered_map<std::string, std::string> primaryCommonRev;
+    for (const auto& kv : primaryCommon) {
+        InsertReverseEntryWithPriority(primaryCommonRev, kv.first, kv.second);
+    }
+    for (const auto& kv : primaryCommonRev) {
+        newCommonReverseDict[kv.first] = kv.second;
+    }
+
+    // 构建模块作用域反向字典
+    std::unordered_map<std::wstring, std::unordered_map<std::string, std::string>> newScopedReverseDicts;
+    for (const auto& sec : fbScoped) {
+        auto& revMap = newScopedReverseDicts[sec.first];
+        for (const auto& kv : sec.second) {
+            InsertReverseEntryWithPriority(revMap, kv.first, kv.second);
         }
     }
-    g_ScopedReverseDicts.clear();
-    g_ScopedReverseCaches.clear();
-    for (const auto& sec : g_ScopedDicts) {
-        auto& revMap = g_ScopedReverseDicts[sec.first];
+    for (const auto& sec : primaryScoped) {
+        std::unordered_map<std::string, std::string> primarySecRev;
         for (const auto& kv : sec.second) {
-            if (!kv.first.empty() && !kv.second.empty()) {
-                revMap[kv.second] = kv.first;
-            }
+            InsertReverseEntryWithPriority(primarySecRev, kv.first, kv.second);
         }
+        auto& revMap = newScopedReverseDicts[sec.first];
+        for (const auto& kv : primarySecRev) {
+            revMap[kv.first] = kv.second;
+        }
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(g_DictMutex);
+        g_CommonDict.swap(newCommonDict);
+        g_CommonCache.clear();
+        g_ScopedDicts.swap(newScopedDicts);
+        g_ScopedCaches.clear();
+        g_CommonReverseDict.swap(newCommonReverseDict);
+        g_CommonReverseCache.clear();
+        g_ScopedReverseDicts.swap(newScopedReverseDicts);
+        g_ScopedReverseCaches.clear();
     }
 }
 
@@ -657,6 +830,11 @@ bool FindTranslationScoped(void* callerAddr, const char* text, std::string& outR
     if (!g_bTranslationEnabled.load(std::memory_order_relaxed)) return false;
     if (!g_bDictLoaded.load(std::memory_order_acquire)) return false;
 
+    // 绘制热路径短路：已包含中文字符的文本无需再次执行正向查表与栈回溯
+    if (source == TranslationSource::Painter && capture::ContainsChinese(text)) {
+        return false;
+    }
+
     std::string textStr(text);
 
     bool isFileOrPath = IsFilePathOrIdentifier(textStr);
@@ -665,27 +843,33 @@ bool FindTranslationScoped(void* callerAddr, const char* text, std::string& outR
     }
 
     wchar_t callerStemBuf[64] = {0};
-    bool hasCaller = (callerAddr != nullptr && GetCallerModuleName(callerAddr, callerStemBuf, 64));
+    bool hasCaller = ResolveCallerModuleName(callerAddr, callerStemBuf, 64);
     std::wstring callerStem = hasCaller ? callerStemBuf : L"";
 
-    if (source != TranslationSource::StaticUI && hasCaller && callerStem == L"assetbrowser") {
-        return false;
-    }
-
     if (source == TranslationSource::Painter) {
-        if (textStr.find('_') != std::string::npos) {
+        bool explicitlyInScope = false;
+        if (hasCaller) {
             std::lock_guard<std::mutex> lock(g_DictMutex);
-            if (g_CommonDict.find(textStr) == g_CommonDict.end()) {
-                return false;
+            auto itSec = g_ScopedDicts.find(callerStem);
+            if (itSec != g_ScopedDicts.end() && itSec->second.find(textStr) != itSec->second.end()) {
+                explicitlyInScope = true;
             }
         }
-        if (!textStr.empty() && textStr.find(' ') == std::string::npos) {
-            bool allLower = true;
-            for (char c : textStr) {
-                if (!islower((unsigned char)c)) { allLower = false; break; }
+        if (!explicitlyInScope) {
+            if (textStr.find('_') != std::string::npos) {
+                std::lock_guard<std::mutex> lock(g_DictMutex);
+                if (g_CommonDict.find(textStr) == g_CommonDict.end()) {
+                    return false;
+                }
             }
-            if (allLower) {
-                return false;
+            if (!textStr.empty() && textStr.find(' ') == std::string::npos) {
+                bool allLower = true;
+                for (char c : textStr) {
+                    if (!islower((unsigned char)c)) { allLower = false; break; }
+                }
+                if (allLower) {
+                    return false;
+                }
             }
         }
     }
@@ -770,6 +954,11 @@ bool FindTranslationScoped(void* callerAddr, const char* text, std::string& outR
                     return true;
                 }
             }
+        }
+
+        // 资产浏览器 (assetbrowser.dll) 包含大量动态用户资源项，未命中其专属字典时非静态 UI 严禁回退至通用词典
+        if (source != TranslationSource::StaticUI && callerStem == L"assetbrowser") {
+            return false;
         }
 
         if (callerStem != L"hammer") {
@@ -859,7 +1048,7 @@ bool FindReverseTranslationScoped(void* callerAddr, const char* text, std::strin
 
     std::string textStr(text);
     wchar_t callerStemBuf[64] = {0};
-    bool hasCaller = (callerAddr != nullptr && GetCallerModuleName(callerAddr, callerStemBuf, 64));
+    bool hasCaller = ResolveCallerModuleName(callerAddr, callerStemBuf, 64);
     std::wstring callerStem = hasCaller ? callerStemBuf : L"";
 
     auto tryDirectScopedReverse = [&](const std::unordered_map<std::string, std::string>& revDict,
@@ -975,6 +1164,17 @@ bool FindReverseTranslationScoped(void* callerAddr, const char* text, std::strin
     if (!g_CommonReverseDict.empty()) {
         if (tryDirectScopedReverse(g_CommonReverseDict, g_CommonReverseCache)) {
             return true;
+        }
+    }
+
+    // 兜底：若由 Qt 底层异步重绘触发（栈上仅有 Qt 框架模块）且未在 common/hammer 命中，遍历其余工具作用域反向字典
+    if (!hasCaller || IsQtFrameworkModule(callerStemBuf)) {
+        for (const auto& sec : g_ScopedReverseDicts) {
+            if (sec.first == L"hammer") continue;
+            auto& secCache = g_ScopedReverseCaches[sec.first];
+            if (tryDirectScopedReverse(sec.second, secCache)) {
+                return true;
+            }
         }
     }
 
