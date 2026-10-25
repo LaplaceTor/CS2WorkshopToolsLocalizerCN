@@ -39,6 +39,7 @@ private slots:
     void onDebugClicked();
     void onDictEditorClicked();
     void onNewAddonClicked();
+    void onRemoveAddonClicked();
     void onWatchedFileChanged(const QString& path);
     void onDebouncedHotReload();
 
@@ -91,6 +92,7 @@ private:
 
     QComboBox*   m_addonCombo{nullptr};
     QPushButton* m_newAddonBtn{nullptr};
+    QPushButton* m_removeAddonBtn{nullptr};
     QLineEdit*   m_argsEdit{nullptr};
     QCheckBox*   m_useMachineTransCheck{nullptr};
 

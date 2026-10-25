@@ -2,13 +2,21 @@
 
 #include <filesystem>
 #include <system_error>
+#include <vector>
+#include <algorithm>
 
 #include <QFileInfo>
 #include <QTimer>
 #include <QFile>
 #include <QRegularExpression>
+#include <QStringList>
 
 #include <windows.h>
+#include <shellapi.h>
+#include <restartmanager.h>
+
+#pragma comment(lib, "Rstrtmgr.lib")
+#pragma comment(lib, "Shell32.lib")
 
 #include "core/backup_manager.h"
 #include "core/cs2_detector.h"
@@ -16,6 +24,199 @@
 #include "core/path_constants.h"
 
 namespace fs = std::filesystem;
+
+namespace {
+
+// 通过 Windows Restart Manager 探测占用指定文件的进程信息
+QString QueryLockingProcesses(const std::vector<std::wstring>& filePaths) {
+    if (filePaths.empty()) {
+        return QString();
+    }
+
+    DWORD dwSession = 0;
+    WCHAR szSessionKey[CCH_RM_SESSION_KEY + 1] = { 0 };
+    DWORD dwErr = RmStartSession(&dwSession, 0, szSessionKey);
+    if (dwErr != ERROR_SUCCESS) {
+        return QString();
+    }
+
+    std::vector<LPCWSTR> pszFiles;
+    pszFiles.reserve(filePaths.size());
+    for (const auto& fp : filePaths) {
+        pszFiles.push_back(fp.c_str());
+    }
+
+    dwErr = RmRegisterResources(dwSession, static_cast<UINT>(pszFiles.size()), pszFiles.data(), 0, NULL, 0, NULL);
+    if (dwErr != ERROR_SUCCESS) {
+        RmEndSession(dwSession);
+        return QString();
+    }
+
+    UINT nProcInfoNeeded = 0;
+    UINT nProcInfo = 0;
+    DWORD dwRebootReasons = RmRebootReasonNone;
+    dwErr = RmGetList(dwSession, &nProcInfoNeeded, &nProcInfo, NULL, &dwRebootReasons);
+
+    QStringList processNames;
+    if (nProcInfoNeeded > 0) {
+        std::vector<RM_PROCESS_INFO> procInfos(nProcInfoNeeded);
+        nProcInfo = nProcInfoNeeded;
+        dwErr = RmGetList(dwSession, &nProcInfoNeeded, &nProcInfo, procInfos.data(), &dwRebootReasons);
+        if (dwErr == ERROR_SUCCESS) {
+            for (UINT i = 0; i < nProcInfo; ++i) {
+                QString appName = QString::fromWCharArray(procInfos[i].strAppName);
+                DWORD pid = procInfos[i].Process.dwProcessId;
+                if (appName.isEmpty()) {
+                    processNames << QString("PID: %1").arg(pid);
+                } else {
+                    processNames << QString("%1 (PID: %2)").arg(appName).arg(pid);
+                }
+            }
+        }
+    }
+
+    RmEndSession(dwSession);
+    processNames.removeDuplicates();
+    return processNames.join(", ");
+}
+
+// 检查目录内所有文件是否存在共享冲突，并探测目录本身是否被外部程序（命令行 cd / 资源管理器）锁定
+bool CheckDirectoryInUse(const fs::path& dirPath, QString& outReason) {
+    std::error_code ec;
+    if (!fs::exists(dirPath, ec) || !fs::is_directory(dirPath, ec)) {
+        return false;
+    }
+
+    // 1. 全文件独占句柄测试
+    std::vector<std::wstring> lockedFiles;
+    try {
+        for (const auto& entry : fs::recursive_directory_iterator(dirPath)) {
+            if (entry.is_regular_file()) {
+                const std::wstring filePath = entry.path().wstring();
+                HANDLE hFile = CreateFileW(
+                    filePath.c_str(),
+                    GENERIC_READ | DELETE,
+                    0, // 0 = 独占共享模式
+                    NULL,
+                    OPEN_EXISTING,
+                    FILE_ATTRIBUTE_NORMAL,
+                    NULL
+                );
+
+                if (hFile == INVALID_HANDLE_VALUE) {
+                    DWORD err = GetLastError();
+                    if (err == ERROR_ACCESS_DENIED) {
+                        hFile = CreateFileW(
+                            filePath.c_str(),
+                            GENERIC_READ,
+                            0,
+                            NULL,
+                            OPEN_EXISTING,
+                            FILE_ATTRIBUTE_NORMAL,
+                            NULL
+                        );
+                        if (hFile != INVALID_HANDLE_VALUE) {
+                            CloseHandle(hFile);
+                            continue;
+                        }
+                        err = GetLastError();
+                    }
+
+                    if (err == ERROR_SHARING_VIOLATION || err == ERROR_LOCK_VIOLATION || err == ERROR_ACCESS_DENIED) {
+                        lockedFiles.push_back(filePath);
+                    }
+                } else {
+                    CloseHandle(hFile);
+                }
+            }
+        }
+    } catch (const std::exception& ex) {
+        outReason = QString("遍历检查目录失败: %1").arg(ex.what());
+        return true;
+    }
+
+    if (!lockedFiles.empty()) {
+        const QString procs = QueryLockingProcesses(lockedFiles);
+        QString fileListStr;
+        const size_t maxShow = 3;
+        for (size_t i = 0; i < (std::min)(lockedFiles.size(), maxShow); ++i) {
+            fileListStr += "\n  • " + QString::fromStdWString(lockedFiles[i]);
+        }
+        if (lockedFiles.size() > maxShow) {
+            fileListStr += QString("\n  • ...等共 %1 个文件").arg(lockedFiles.size());
+        }
+
+        if (!procs.isEmpty()) {
+            outReason = QString("检测到以下文件正被其他程序占用 (占用进程: %1)：%2")
+                            .arg(procs, fileListStr);
+        } else {
+            outReason = QString("检测到以下文件正被其他程序锁定或占用：%1")
+                            .arg(fileListStr);
+        }
+        return true;
+    }
+
+    // 2. 目录级原子重命名探测（检测命令行 cd / 资源管理器当前路径驻留等目录句柄占用）
+    const fs::path parentDir = dirPath.parent_path();
+    const fs::path probePath = parentDir / (dirPath.filename().wstring() + L".__probe_lock__");
+
+    if (MoveFileExW(dirPath.c_str(), probePath.c_str(), 0)) {
+        MoveFileExW(probePath.c_str(), dirPath.c_str(), 0);
+    } else {
+        const DWORD dirErr = GetLastError();
+        if (dirErr == ERROR_ACCESS_DENIED || dirErr == ERROR_SHARING_VIOLATION) {
+            std::vector<std::wstring> sampleFiles;
+            try {
+                for (const auto& entry : fs::directory_iterator(dirPath)) {
+                    sampleFiles.push_back(entry.path().wstring());
+                    if (sampleFiles.size() >= 5) break;
+                }
+            } catch (...) {}
+
+            const QString procs = QueryLockingProcesses(sampleFiles);
+            if (!procs.isEmpty()) {
+                outReason = QString("目录【%1】正被其他程序锁定使用 (占用进程: %2)。\n请先关闭相关程序再重试。")
+                                .arg(QString::fromStdWString(dirPath.wstring()), procs);
+            } else {
+                outReason = QString("目录【%1】正被其他程序或命令行窗口占用。\n请确认无程序正在该目录中运行或浏览后重试。")
+                                .arg(QString::fromStdWString(dirPath.wstring()));
+            }
+            return true;
+        }
+    }
+
+    return false;
+}
+
+// 调用 Windows Shell API 将目录完整移入系统回收站
+bool MoveDirectoryToRecycleBin(const fs::path& dirPath, QString& outError) {
+    std::error_code ec;
+    if (!fs::exists(dirPath, ec)) {
+        return true;
+    }
+
+    // SHFileOperation 要求 double null 结尾的绝对路径，且不能使用正斜杠
+    std::wstring fullPath = fs::absolute(dirPath, ec).wstring();
+    std::replace(fullPath.begin(), fullPath.end(), L'/', L'\\');
+    fullPath.push_back(L'\0');
+
+    SHFILEOPSTRUCTW fileOp = { 0 };
+    fileOp.wFunc  = FO_DELETE;
+    fileOp.pFrom  = fullPath.c_str();
+    fileOp.fFlags = FOF_ALLOWUNDO | FOF_NOCONFIRMATION | FOF_NOERRORUI | FOF_SILENT;
+
+    const int res = SHFileOperationW(&fileOp);
+    if (res != 0 || fileOp.fAnyOperationsAborted) {
+        outError = QString("移入回收站失败 (路径: %1, 错误代码: %2)")
+                       .arg(QString::fromStdWString(dirPath.wstring()))
+                       .arg(res);
+        return false;
+    }
+
+    return true;
+}
+
+} // namespace
 
 HammerService::HammerService(QObject* parent)
     : QObject(parent)
@@ -187,6 +388,70 @@ HammerService::CreateAddonResult HammerService::createAddon(const std::wstring& 
     fs::remove(contentAddonPath / L"resourcecopy.log", ignoreEc);
 
     log(QString("[+] 成功创建新 Addon 项目: %1").arg(addon), "#a6e22e");
+
+    result.ok = true;
+    result.addonName = addon;
+    return result;
+}
+
+HammerService::RemoveAddonResult HammerService::removeAddon(const std::wstring& cs2Root, const QString& rawAddonName) {
+    RemoveAddonResult result;
+    const QString addon = rawAddonName.trimmed().toLower();
+
+    if (addon.isEmpty()) {
+        result.error = "项目名称不能为空。";
+        return result;
+    }
+
+    if (isExcludedAddon(addon)) {
+        result.error = QString("“%1”为 CS2 官方内置只读项目，受保护不可移除。").arg(addon);
+        return result;
+    }
+
+    if (isRunning() || Cs2Detector::IsCs2ProcessRunning()) {
+        result.error = "检测到 CS2 或 Hammer 正在运行中，无法移除项目。\n请先完全退出 CS2 / Hammer。";
+        return result;
+    }
+
+    const fs::path cs2RootPath(cs2Root);
+    const fs::path contentAddonPath = paths::Addons(cs2RootPath) / addon.toStdWString();
+    const fs::path gameAddonPath    = paths::GameAddons(cs2RootPath) / addon.toStdWString();
+
+    std::error_code ec;
+    const bool contentExists = fs::exists(contentAddonPath, ec);
+    const bool gameExists    = fs::exists(gameAddonPath, ec);
+
+    if (!contentExists && !gameExists) {
+        result.error = QString("未找到项目“%1”对应的 content 或 game 目录。").arg(addon);
+        return result;
+    }
+
+    // 阶段 1：全量占用检测（原子预检，任一处被占用则完全不执行任何删除）
+    QString contentReason;
+    if (contentExists && CheckDirectoryInUse(contentAddonPath, contentReason)) {
+        result.error = QString("Content 目录占用检测未通过：\n%1").arg(contentReason);
+        return result;
+    }
+
+    QString gameReason;
+    if (gameExists && CheckDirectoryInUse(gameAddonPath, gameReason)) {
+        result.error = QString("Game 目录占用检测未通过：\n%1").arg(gameReason);
+        return result;
+    }
+
+    // 阶段 2：安全移入 Windows 回收站
+    QString recycleError;
+    if (contentExists && !MoveDirectoryToRecycleBin(contentAddonPath, recycleError)) {
+        result.error = recycleError;
+        return result;
+    }
+
+    if (gameExists && !MoveDirectoryToRecycleBin(gameAddonPath, recycleError)) {
+        result.error = recycleError;
+        return result;
+    }
+
+    log(QString("[+] 成功将 Addon 项目“%1”移入回收站").arg(addon), "#a6e22e");
 
     result.ok = true;
     result.addonName = addon;

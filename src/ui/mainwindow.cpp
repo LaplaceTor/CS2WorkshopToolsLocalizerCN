@@ -118,6 +118,11 @@ MainWindow::MainWindow(const std::wstring& cs2Root, QWidget *parent)
                 this, &MainWindow::onNewAddonClicked);
     }
 
+    if (m_removeAddonBtn) {
+        connect(m_removeAddonBtn, &QPushButton::clicked,
+                this, &MainWindow::onRemoveAddonClicked);
+    }
+
     connect(
         m_addonCombo,
         &QComboBox::currentIndexChanged,
@@ -317,8 +322,21 @@ void MainWindow::setupUi() {
         "QPushButton:disabled { background-color: #2d333b; color: #636e7b; }"
     );
 
+    m_removeAddonBtn =
+        new QPushButton("移除项目", configGroup);
+
+    m_removeAddonBtn->setMinimumHeight(28);
+    m_removeAddonBtn->setToolTip("移除当前选中的 Addon 项目（移入回收站）");
+    m_removeAddonBtn->setStyleSheet(
+        "QPushButton { background-color: #da3633; color: white; font-weight: bold; font-size: 12px; border-radius: 4px; padding: 0 12px; }"
+        "QPushButton:hover { background-color: #f85149; }"
+        "QPushButton:pressed { background-color: #b62324; }"
+        "QPushButton:disabled { background-color: #2d333b; color: #636e7b; }"
+    );
+
     addonRowLayout->addWidget(m_addonCombo);
     addonRowLayout->addWidget(m_newAddonBtn);
+    addonRowLayout->addWidget(m_removeAddonBtn);
 
     configLayout->addWidget(
         addonLabel,
@@ -697,6 +715,9 @@ void MainWindow::setUiBusy(bool busy) {
     if (m_newAddonBtn) {
         m_newAddonBtn->setEnabled(!busy && !m_hammerService->isRunning());
     }
+    if (m_removeAddonBtn) {
+        m_removeAddonBtn->setEnabled(!busy && !m_hammerService->isRunning() && hasValidSelectedAddon());
+    }
     m_argsEdit->setEnabled(!busy);
 
     if (busy) {
@@ -809,13 +830,20 @@ void MainWindow::updateActionButtonState() {
         );
     }
 
+    // 检查是否存在可用且合法的 Addon 项目
+    const bool validAddon = hasValidSelectedAddon();
+
     if (m_newAddonBtn) {
         m_newAddonBtn->setEnabled(!hammerRunning && !m_workerBusy);
     }
+    if (m_removeAddonBtn) {
+        m_removeAddonBtn->setEnabled(!hammerRunning && !m_workerBusy && validAddon);
+        m_removeAddonBtn->setToolTip(validAddon ?
+            "将当前选中的 Addon 项目移入系统回收站（包含 content 与 game 目录）" :
+            "当前无可用 Addon 项目可移除");
+    }
 
     // 启动 HAMMER：
-    // 检查是否存在可用且合法的 Addon 项目
-    const bool validAddon = hasValidSelectedAddon();
     if (!validAddon) {
         m_launchBtn->setEnabled(false);
         m_launchBtn->setToolTip(
@@ -1916,6 +1944,87 @@ void MainWindow::onNewAddonClicked() {
     connect(nameEdit, &QLineEdit::returnPressed, &dlg, doCreate);
 
     dlg.exec();
+}
+
+
+void MainWindow::onRemoveAddonClicked() {
+    if (m_hammerService->isRunning()) {
+        QMessageBox::warning(this, "警告", "Hammer 正在运行中，无法移除项目！");
+        return;
+    }
+
+    if (m_workerBusy) {
+        QMessageBox::information(this, "提示", "后台操作正在进行中，请稍候再试。");
+        return;
+    }
+
+    if (LocalizationService::IsCs2Running()) {
+        QMessageBox::warning(this, "警告", "检测到 CS2 正在运行，请先退出 CS2 / Hammer 后再执行移除。");
+        return;
+    }
+
+    if (!hasValidSelectedAddon()) {
+        QMessageBox::information(this, "提示", "当前未选择可移除的 Addon 项目。");
+        return;
+    }
+
+    const QString addonName = LauncherConfig::NormalizeAddonName(m_addonCombo->currentText()).toLower();
+
+    if (HammerService::isExcludedAddon(addonName)) {
+        QMessageBox::warning(this, "受保护项目", QString("“%1”为 CS2 官方内置只读项目，受保护不可移除！").arg(addonName));
+        return;
+    }
+
+    const fs::path cs2Root(m_cs2Root);
+    const fs::path contentPath = paths::Addons(cs2Root) / addonName.toStdWString();
+    const fs::path gamePath = paths::GameAddons(cs2Root) / addonName.toStdWString();
+
+    const int ret = QMessageBox::question(
+        this,
+        "确认移除项目",
+        QString("确定要将 Addon 项目【%1】移入系统回收站吗？\n\n"
+                "即将移除的目录：\n"
+                "• Content 目录：%2\n"
+                "• Game 目录：%3\n\n"
+                "提示：移除后可在 Windows 回收站中还原。若目录正被其他程序占用，操作将被安全中止。")
+            .arg(addonName)
+            .arg(QString::fromStdWString(contentPath.wstring()))
+            .arg(QString::fromStdWString(gamePath.wstring())),
+        QMessageBox::Yes | QMessageBox::No,
+        QMessageBox::No
+    );
+
+    if (ret != QMessageBox::Yes) {
+        return;
+    }
+
+    appendLog(QString("[*] 正在执行项目【%1】移除前占用检测与安全删除...").arg(addonName), "#66d9ef");
+    m_statusLabel->setText(QString("状态: 正在移除项目 %1...").arg(addonName));
+
+    const HammerService::RemoveAddonResult res = m_hammerService->removeAddon(m_cs2Root, addonName);
+    if (!res.ok) {
+        appendLog(QString("[-] 移除项目【%1】被中止：%2").arg(addonName, res.error), "#f92672");
+        m_statusLabel->setText("状态: 移除项目失败或被占用");
+        QMessageBox::warning(
+            this,
+            "无法移除项目",
+            QString("未能成功移除项目【%1】：\n\n%2").arg(addonName, res.error)
+        );
+        return;
+    }
+
+    appendLog(QString("[+] 项目【%1】已成功移入系统回收站。").arg(addonName), "#a6e22e");
+    m_statusLabel->setText("状态: 项目已成功移除");
+
+    populateAddons();
+    saveSettings();
+    updateActionButtonState();
+
+    QMessageBox::information(
+        this,
+        "移除成功",
+        QString("项目【%1】已成功移入系统回收站！").arg(addonName)
+    );
 }
 
 void MainWindow::setupFileWatcher() {

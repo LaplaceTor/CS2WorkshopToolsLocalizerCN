@@ -112,6 +112,7 @@ target_link_libraries(CS2WorkshopToolsLocalizerCN PRIVATE
     shell32
     version
     psapi
+    rstrtmgr
 )
 
 # 复制字典文件目录和 DLL 到输出目录方便调试运行

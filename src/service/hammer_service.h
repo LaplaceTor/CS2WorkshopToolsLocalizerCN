@@ -44,6 +44,12 @@ public:
         QString error;     // 失败原因
     };
 
+    struct RemoveAddonResult {
+        bool    ok    = false;
+        QString addonName; // 被移除的项目名
+        QString error;     // 失败或占用详情
+    };
+
     // 热重载结果：磁盘侧与 IPC 侧分开，便于上层分别提示
     struct ReloadResult {
         bool      ipcOk  = false;  // 是否成功通知到运行中的 Hammer
@@ -73,6 +79,9 @@ public:
 
     // 新建 Addon 项目（从 addon_template 完整复刻模板并在磁盘上创建 content & game 目录）
     CreateAddonResult createAddon(const std::wstring& cs2Root, const QString& rawAddonName);
+
+    // 移除指定的 Addon 项目（全量占用预检通过后移入 Windows 回收站）
+    RemoveAddonResult removeAddon(const std::wstring& cs2Root, const QString& rawAddonName);
 
     // 启动 HAMMER（cs2.exe -addon <addon> -tools -vulkan [用户参数]）。
     // 返回 true 仅代表进程已成功发起启动，后续失败通过 startFailed 信号外抛。
