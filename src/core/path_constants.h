@@ -42,8 +42,16 @@ inline constexpr const wchar_t* kQt5CoreDll     = L"Qt5Core.dll";
 inline constexpr const wchar_t* kQt5WidgetsDll  = L"Qt5Widgets.dll";
 inline constexpr const wchar_t* kQt5GuiDll      = L"Qt5Gui.dll";
 inline constexpr const wchar_t* kInjectDll      = L"qtcore_qm.dll";
+inline constexpr const wchar_t* kResourceCopyExe = L"resourcecopy.exe";
 inline constexpr const wchar_t* kQtDictFile     = L"qt_translations.jsonc";
 inline constexpr const wchar_t* kBackupManifest = L"backup_manifest.json";
+
+// CS2 自带只读/隐藏 Addon 名称（扫描与新建时均排除）
+inline constexpr const wchar_t* const kExcludedAddons[] = {
+    L"addon_template",
+    L"cs_script_demo",
+    L"workshop_items"
+};
 
 // 启动器与监控需要统一维护的 5 个翻译词典文件名
 inline constexpr const wchar_t* const kAllDictFiles[] = {
@@ -78,9 +86,19 @@ inline fs::path Qt5Widgets(const fs::path& cs2Root) {
     return Win64Bin(cs2Root) / kQt5WidgetsDll;
 }
 
+// <cs2Root>/game/bin/win64/resourcecopy.exe
+inline fs::path ResourceCopyExe(const fs::path& cs2Root) {
+    return Win64Bin(cs2Root) / kResourceCopyExe;
+}
+
 // <cs2Root>/content/csgo_addons
 inline fs::path Addons(const fs::path& cs2Root) {
     return cs2Root / kContentDir / kAddonsDir;
+}
+
+// <cs2Root>/game/csgo_addons
+inline fs::path GameAddons(const fs::path& cs2Root) {
+    return cs2Root / kGameDir / kAddonsDir;
 }
 
 // <dir>/backup_manifest.json

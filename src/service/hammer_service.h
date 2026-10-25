@@ -38,6 +38,12 @@ public:
         QString error;  // 启动失败原因（供上层弹窗展示）
     };
 
+    struct CreateAddonResult {
+        bool    ok    = false;
+        QString addonName; // 规范化后的小写项目名
+        QString error;     // 失败原因
+    };
+
     // 热重载结果：磁盘侧与 IPC 侧分开，便于上层分别提示
     struct ReloadResult {
         bool      ipcOk  = false;  // 是否成功通知到运行中的 Hammer
@@ -59,8 +65,14 @@ public:
     // 此时 isRunning() 为 false 但 IPC 窗口存在，热重载仍然可以送达。
     bool isIpcAvailable() const;
 
-    // 列出指定 CS2 安装目录下的可用 Addon 模组（供启动配置下拉框使用）
+    // 检查给定的 Addon 名称是否为游戏内置只读/隐藏排除项（不区分大小写）
+    static bool isExcludedAddon(const QString& addonName);
+
+    // 列出指定 CS2 安装目录下的可用 Addon 模组（已排除内置只读项，供启动配置下拉框使用）
     static std::vector<std::wstring> availableAddons(const std::wstring& cs2Root);
+
+    // 新建 Addon 项目（从 addon_template 完整复刻模板并在磁盘上创建 content & game 目录）
+    CreateAddonResult createAddon(const std::wstring& cs2Root, const QString& rawAddonName);
 
     // 启动 HAMMER（cs2.exe -addon <addon> -tools -vulkan [用户参数]）。
     // 返回 true 仅代表进程已成功发起启动，后续失败通过 startFailed 信号外抛。

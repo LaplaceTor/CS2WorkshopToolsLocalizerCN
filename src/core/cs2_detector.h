@@ -3,6 +3,8 @@
 #include <string>
 #include <vector>
 
+class QString;
+
 class Cs2Detector {
 public:
     // 检测 CS2 根目录路径（返回 true 表示检测成功）
@@ -17,7 +19,11 @@ public:
     // 获取 CS2 的 content/csgo_addons 目录
     static std::wstring GetAddonsDir(const std::wstring& cs2Root);
 
-    // 扫描 content/csgo_addons 下的所有可用 Addon 列表
+    // 检查给定的 Addon 名称是否为游戏内置只读/隐藏排除项（不区分大小写）
+    static bool IsExcludedAddon(const std::wstring& addonName);
+    static bool IsExcludedAddon(const QString& addonName);
+
+    // 扫描 content/csgo_addons 下的所有可用 Addon 列表（已自动排除内置只读项）
     static std::vector<std::wstring> GetAvailableAddons(const std::wstring& cs2Root);
 
     // 检测指定 PID 的进程是否在运行
@@ -35,4 +41,3 @@ private:
     static bool CheckCommonDrivePaths(std::wstring& outPath);
     static bool ParseSteamLibraryFolders(const std::wstring& vdfPath, std::vector<std::wstring>& outLibraries);
 };
-

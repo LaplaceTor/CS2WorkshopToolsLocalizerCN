@@ -38,6 +38,7 @@ private slots:
     void onHotReloadClicked();
     void onDebugClicked();
     void onDictEditorClicked();
+    void onNewAddonClicked();
     void onWatchedFileChanged(const QString& path);
     void onDebouncedHotReload();
 
@@ -59,6 +60,9 @@ private:
 
     // 更新“仅注入 / 启动 HAMMER / 还原”三个核心按钮状态
     void updateActionButtonState();
+
+    // 检查当前是否选择了有效且非排除项的 Addon
+    bool hasValidSelectedAddon() const;
 
     // 判断当前是否处于有效的“已注入”状态（对 core 的只读状态查询 + 本地异步校验缓存）
     bool isPatchDeployedAndValid();
@@ -85,33 +89,34 @@ private:
     std::wstring m_cs2Root;
     std::wstring m_workingDir;
 
-    QComboBox* m_addonCombo;
-    QLineEdit* m_argsEdit;
-    QCheckBox* m_useMachineTransCheck;
+    QComboBox*   m_addonCombo{nullptr};
+    QPushButton* m_newAddonBtn{nullptr};
+    QLineEdit*   m_argsEdit{nullptr};
+    QCheckBox*   m_useMachineTransCheck{nullptr};
 
     // 核心操作按钮
-    QPushButton* m_injectBtn;
-    QPushButton* m_launchBtn;
-    QPushButton* m_restoreBtn;
+    QPushButton* m_injectBtn{nullptr};
+    QPushButton* m_launchBtn{nullptr};
+    QPushButton* m_restoreBtn{nullptr};
 
     // 其他功能按钮
-    QPushButton* m_updateBtn;
-    QPushButton* m_helpBtn;
-    QPushButton* m_toggleLangBtn;
-    QPushButton* m_hotReloadBtn;
-    QPushButton* m_debugBtn;
-    QPushButton* m_dictEditorBtn;
+    QPushButton* m_updateBtn{nullptr};
+    QPushButton* m_helpBtn{nullptr};
+    QPushButton* m_toggleLangBtn{nullptr};
+    QPushButton* m_hotReloadBtn{nullptr};
+    QPushButton* m_debugBtn{nullptr};
+    QPushButton* m_dictEditorBtn{nullptr};
 
     DictionaryEditorService* m_dictEditorService{nullptr};
     DictionaryEditorWindow*  m_dictEditorWindow{nullptr};
     qint64 m_lastEditorReloadTick = 0;
 
-    class QFileSystemWatcher* m_fileWatcher;
-    class QTimer* m_hotReloadDebounceTimer;
+    class QFileSystemWatcher* m_fileWatcher{nullptr};
+    class QTimer* m_hotReloadDebounceTimer{nullptr};
 
-    QTextEdit* m_logEdit;
-    QLabel* m_statusLabel;
-    QLabel* m_cs2PathLabel;
+    QTextEdit* m_logEdit{nullptr};
+    QLabel*    m_statusLabel{nullptr};
+    QLabel*    m_cs2PathLabel{nullptr};
 
     // Service 层：业务流程编排，MainWindow 只负责传参与展示结果
     DictionaryService* m_dictionaryService;

@@ -71,15 +71,35 @@ std::wstring Cs2Detector::GetAddonsDir(const std::wstring& cs2Root) {
     return paths::Addons(p).wstring();
 }
 
+bool Cs2Detector::IsExcludedAddon(const std::wstring& addonName) {
+    for (const wchar_t* excluded : paths::kExcludedAddons) {
+        if (_wcsicmp(addonName.c_str(), excluded) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+bool Cs2Detector::IsExcludedAddon(const QString& addonName) {
+    for (const wchar_t* excluded : paths::kExcludedAddons) {
+        if (addonName.compare(QString::fromWCharArray(excluded), Qt::CaseInsensitive) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
 std::vector<std::wstring> Cs2Detector::GetAvailableAddons(const std::wstring& cs2Root) {
     std::vector<std::wstring> addons;
-    QString addonsPath = QString::fromStdWString(cs2Root) + "/content/csgo_addons";
+    QString addonsPath = QString::fromStdWString(paths::Addons(cs2Root).wstring());
     QDir dir(addonsPath);
     if (dir.exists()) {
         QStringList entries = dir.entryList(QDir::Dirs | QDir::NoDotAndDotDot, QDir::Name);
         addons.reserve(entries.size());
         for (const QString& entry : entries) {
-            addons.push_back(entry.toStdWString());
+            if (!IsExcludedAddon(entry)) {
+                addons.push_back(entry.toStdWString());
+            }
         }
     }
     return addons;
@@ -206,4 +226,3 @@ bool Cs2Detector::DetectCs2(std::wstring& outCs2Root) {
     if (CheckCommonDrivePaths(outCs2Root)) return true;
     return false;
 }
-

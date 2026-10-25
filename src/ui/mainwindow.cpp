@@ -113,11 +113,19 @@ MainWindow::MainWindow(const std::wstring& cs2Root, QWidget *parent)
                 this, &MainWindow::onDictEditorClicked);
     }
 
+    if (m_newAddonBtn) {
+        connect(m_newAddonBtn, &QPushButton::clicked,
+                this, &MainWindow::onNewAddonClicked);
+    }
+
     connect(
         m_addonCombo,
         &QComboBox::currentIndexChanged,
         this,
-        &MainWindow::saveSettings
+        [this](int) {
+            saveSettings();
+            updateActionButtonState();
+        }
     );
 
     connect(
@@ -287,10 +295,30 @@ void MainWindow::setupUi() {
             configGroup
         );
 
+    QHBoxLayout* addonRowLayout = new QHBoxLayout();
+    addonRowLayout->setContentsMargins(0, 0, 0, 0);
+    addonRowLayout->setSpacing(6);
+
     m_addonCombo =
         new QComboBox(configGroup);
 
     m_addonCombo->setMinimumHeight(28);
+    m_addonCombo->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Fixed);
+
+    m_newAddonBtn =
+        new QPushButton("新建项目", configGroup);
+
+    m_newAddonBtn->setMinimumHeight(28);
+    m_newAddonBtn->setToolTip("创建全新的 Addon 模组项目");
+    m_newAddonBtn->setStyleSheet(
+        "QPushButton { background-color: #238636; color: white; font-weight: bold; font-size: 12px; border-radius: 4px; padding: 0 12px; }"
+        "QPushButton:hover { background-color: #2ea043; }"
+        "QPushButton:pressed { background-color: #1a6327; }"
+        "QPushButton:disabled { background-color: #2d333b; color: #636e7b; }"
+    );
+
+    addonRowLayout->addWidget(m_addonCombo);
+    addonRowLayout->addWidget(m_newAddonBtn);
 
     configLayout->addWidget(
         addonLabel,
@@ -298,8 +326,8 @@ void MainWindow::setupUi() {
         0
     );
 
-    configLayout->addWidget(
-        m_addonCombo,
+    configLayout->addLayout(
+        addonRowLayout,
         0,
         1
     );
@@ -526,21 +554,20 @@ void MainWindow::setupUi() {
 void MainWindow::populateAddons() {
     m_addonCombo->clear();
 
-    std::vector<std::wstring> addons =
+    const std::vector<std::wstring> addons =
         HammerService::availableAddons(
             m_cs2Root
         );
 
-    if (addons.empty()) {
+    for (const auto& addon : addons) {
         m_addonCombo->addItem(
-            "addon_template (默认模组)"
+            QString::fromStdWString(addon)
         );
-    } else {
-        for (const auto& addon : addons) {
-            m_addonCombo->addItem(
-                QString::fromStdWString(addon)
-            );
-        }
+    }
+
+    if (m_addonCombo->count() == 0) {
+        m_addonCombo->setPlaceholderText("暂无可用项目，请点击右侧【新建项目】");
+        m_addonCombo->setCurrentIndex(-1);
     }
 }
 
@@ -557,7 +584,7 @@ void MainWindow::loadSettings() {
 
     // 恢复选择的目标 Addon：先精确匹配，再退化为「名称 + 空格」前缀匹配
     int index = -1;
-    if (!saved.selectedAddon.isEmpty()) {
+    if (!saved.selectedAddon.isEmpty() && !HammerService::isExcludedAddon(saved.selectedAddon)) {
         index = m_addonCombo->findText(saved.selectedAddon);
         if (index == -1) {
             const QString prefix = saved.selectedAddon + " ";
@@ -575,16 +602,29 @@ void MainWindow::loadSettings() {
         m_addonCombo->setCurrentIndex(index);
     } else if (m_addonCombo->count() > 0) {
         m_addonCombo->setCurrentIndex(0);
+    } else {
+        m_addonCombo->setCurrentIndex(-1);
     }
 }
 
 void MainWindow::saveSettings() {
     LauncherSettings settings;
-    settings.selectedAddon   = LauncherConfig::NormalizeAddonName(m_addonCombo->currentText());
+    settings.selectedAddon   = hasValidSelectedAddon() ? LauncherConfig::NormalizeAddonName(m_addonCombo->currentText()) : QString();
     settings.launchArgs      = m_argsEdit->text();
     settings.useMachineTrans = machineTranslationEnabled();
 
     LauncherConfig::Save(m_workingDir, settings);
+}
+
+bool MainWindow::hasValidSelectedAddon() const {
+    if (!m_addonCombo || m_addonCombo->count() == 0 || m_addonCombo->currentIndex() < 0) {
+        return false;
+    }
+    const QString addon = LauncherConfig::NormalizeAddonName(m_addonCombo->currentText());
+    if (addon.isEmpty()) {
+        return false;
+    }
+    return !HammerService::isExcludedAddon(addon);
 }
 
 void MainWindow::appendLog(
@@ -654,6 +694,9 @@ bool MainWindow::runHeavyInWorker(const std::function<bool()>& task) {
 void MainWindow::setUiBusy(bool busy) {
     m_updateBtn->setEnabled(!busy);
     m_addonCombo->setEnabled(!busy);
+    if (m_newAddonBtn) {
+        m_newAddonBtn->setEnabled(!busy && !m_hammerService->isRunning());
+    }
     m_argsEdit->setEnabled(!busy);
 
     if (busy) {
@@ -766,18 +809,29 @@ void MainWindow::updateActionButtonState() {
         );
     }
 
-    // 启动 HAMMER：
-    // 无论是否已经注入都允许点击
-    m_launchBtn->setEnabled(true);
+    if (m_newAddonBtn) {
+        m_newAddonBtn->setEnabled(!hammerRunning && !m_workerBusy);
+    }
 
-    if (injected) {
+    // 启动 HAMMER：
+    // 检查是否存在可用且合法的 Addon 项目
+    const bool validAddon = hasValidSelectedAddon();
+    if (!validAddon) {
+        m_launchBtn->setEnabled(false);
         m_launchBtn->setToolTip(
-            "当前已注入，将跳过注入并直接启动 HAMMER"
+            "当前无可用 Addon 项目，请先点击【新建项目】创建"
         );
     } else {
-        m_launchBtn->setToolTip(
-            "当前未注入，启动 HAMMER 前会自动完成注入"
-        );
+        m_launchBtn->setEnabled(true);
+        if (injected) {
+            m_launchBtn->setToolTip(
+                "当前已注入，将跳过注入并直接启动 HAMMER"
+            );
+        } else {
+            m_launchBtn->setToolTip(
+                "当前未注入，启动 HAMMER 前会自动完成注入"
+            );
+        }
     }
 
     // 未注入 -> 禁止还原
@@ -913,7 +967,6 @@ void MainWindow::onLaunchClicked() {
             "提示",
             "Hammer 已经在运行中，请勿重复启动！"
         );
-
         return;
     }
 
@@ -923,7 +976,16 @@ void MainWindow::onLaunchClicked() {
             "提示",
             "后台操作正在进行中，请稍候再试。"
         );
+        return;
+    }
 
+    if (!hasValidSelectedAddon()) {
+        QMessageBox::warning(
+            this,
+            "无法启动",
+            "当前未选择或不存在可用的 Addon 模组项目！\n\n"
+            "请点击“目标 Addon 模组”右侧的【新建项目】按钮创建一个项目后再启动。"
+        );
         return;
     }
 
@@ -1698,6 +1760,162 @@ void MainWindow::onToggleLangClicked() {
     } else {
         appendLog("[!] 未检测到运行中的 Hammer 汉化模块 IPC 窗口（请确保 Hammer 正在运行）", "#f92672");
     }
+}
+
+void MainWindow::onNewAddonClicked() {
+    if (m_hammerService->isRunning()) {
+        QMessageBox::warning(this, "警告", "Hammer 正在运行中，无法创建新 Addon 项目！");
+        return;
+    }
+
+    QDialog dlg(this);
+    dlg.setWindowTitle("新建 Addon 项目");
+    dlg.setFixedWidth(420);
+    dlg.setStyleSheet(
+        "QDialog { background-color: #1e1e1e; color: #d4d4d4; }"
+        "QLabel { color: #d4d4d4; font-size: 12px; }"
+        "QLineEdit { background-color: #2d333b; color: #f0f6fc; border: 1px solid #444c56; border-radius: 4px; padding: 4px 8px; font-size: 12px; }"
+        "QLineEdit:focus { border: 1px solid #58a6ff; }"
+    );
+
+    QVBoxLayout* layout = new QVBoxLayout(&dlg);
+    layout->setContentsMargins(16, 16, 16, 16);
+    layout->setSpacing(10);
+
+    QLabel* titleLabel = new QLabel("请输入新 Addon 项目名称：", &dlg);
+    titleLabel->setStyleSheet("font-weight: bold; color: #f0f6fc;");
+    layout->addWidget(titleLabel);
+
+    QLineEdit* nameEdit = new QLineEdit(&dlg);
+    nameEdit->setPlaceholderText("例如: my_addon");
+    nameEdit->setClearButtonEnabled(true);
+    nameEdit->setMinimumHeight(30);
+    layout->addWidget(nameEdit);
+
+    QLabel* tipLabel = new QLabel("名称必须以英文字母开头，只能包含字母、数字和下划线。", &dlg);
+    tipLabel->setWordWrap(true);
+    tipLabel->setStyleSheet("color: #8b949e; font-size: 11px;");
+    layout->addWidget(tipLabel);
+
+    QHBoxLayout* btnLayout = new QHBoxLayout();
+    btnLayout->setSpacing(8);
+    btnLayout->addStretch();
+
+    QPushButton* cancelBtn = new QPushButton("取消", &dlg);
+    cancelBtn->setMinimumHeight(30);
+    cancelBtn->setStyleSheet(
+        "QPushButton { background-color: #30363d; color: #c9d1d9; border: 1px solid #484f58; border-radius: 4px; padding: 4px 14px; font-size: 12px; }"
+        "QPushButton:hover { background-color: #3c444d; }"
+    );
+    connect(cancelBtn, &QPushButton::clicked, &dlg, &QDialog::reject);
+
+    QPushButton* createBtn = new QPushButton("创建", &dlg);
+    createBtn->setMinimumHeight(30);
+    createBtn->setEnabled(false);
+    createBtn->setStyleSheet(
+        "QPushButton { background-color: #238636; color: white; font-weight: bold; border-radius: 4px; padding: 4px 18px; font-size: 12px; }"
+        "QPushButton:hover { background-color: #2ea043; }"
+        "QPushButton:pressed { background-color: #1a6327; }"
+        "QPushButton:disabled { background-color: #21262d; color: #6e7681; border: 1px solid #30363d; }"
+    );
+    btnLayout->addWidget(cancelBtn);
+    btnLayout->addWidget(createBtn);
+
+    layout->addLayout(btnLayout);
+
+    auto validateInput = [&]() {
+        const QString text = nameEdit->text().trimmed();
+        if (text.isEmpty()) {
+            tipLabel->setText("名称必须以英文字母开头，只能包含字母、数字和下划线。");
+            tipLabel->setStyleSheet("color: #8b949e; font-size: 11px;");
+            createBtn->setEnabled(false);
+            return;
+        }
+
+        static const QRegularExpression reg(QStringLiteral("^[a-zA-Z][a-zA-Z0-9_]*$"));
+        if (!reg.match(text).hasMatch()) {
+            tipLabel->setText("❌ 名称必须以英文字母开头，且只能包含英文字母、数字和下划线。");
+            tipLabel->setStyleSheet("color: #f85149; font-size: 11px;");
+            createBtn->setEnabled(false);
+            return;
+        }
+
+        const QString lower = text.toLower();
+        if (HammerService::isExcludedAddon(lower)) {
+            tipLabel->setText(QString("❌ “%1”为 CS2 官方内置只读项目，不可使用。").arg(lower));
+            tipLabel->setStyleSheet("color: #f85149; font-size: 11px;");
+            createBtn->setEnabled(false);
+            return;
+        }
+
+        bool exists = false;
+        for (int i = 0; i < m_addonCombo->count(); ++i) {
+            const QString existing = LauncherConfig::NormalizeAddonName(m_addonCombo->itemText(i));
+            if (existing.compare(lower, Qt::CaseInsensitive) == 0) {
+                exists = true;
+                break;
+            }
+        }
+
+        if (!exists) {
+            const fs::path cs2Root(m_cs2Root);
+            if (fs::exists(paths::Addons(cs2Root) / lower.toStdWString()) ||
+                fs::exists(paths::GameAddons(cs2Root) / lower.toStdWString())) {
+                exists = true;
+            }
+        }
+
+        if (exists) {
+            tipLabel->setText(QString("❌ 项目“%1”已存在，请换用其他名称。").arg(lower));
+            tipLabel->setStyleSheet("color: #f85149; font-size: 11px;");
+            createBtn->setEnabled(false);
+            return;
+        }
+
+        tipLabel->setText(QString("✓ 名称可用（将自动创建为: %1）").arg(lower));
+        tipLabel->setStyleSheet("color: #3fb950; font-size: 11px;");
+        createBtn->setEnabled(true);
+    };
+
+    connect(nameEdit, &QLineEdit::textChanged, &dlg, validateInput);
+
+    auto doCreate = [&]() {
+        if (!createBtn->isEnabled()) {
+            return;
+        }
+        const QString addonName = nameEdit->text().trimmed().toLower();
+        appendLog(QString("[*] 正在创建新 Addon 项目: %1 ...").arg(addonName), "#66d9ef");
+
+        const HammerService::CreateAddonResult res = m_hammerService->createAddon(m_cs2Root, addonName);
+        if (!res.ok) {
+            appendLog(QString("[-] 创建 Addon 失败: %1").arg(res.error), "#f92672");
+            QMessageBox::critical(&dlg, "创建失败", "创建 Addon 项目失败：\n" + res.error);
+            return;
+        }
+
+        appendLog(QString("[+] Addon 项目“%1”创建并初始化成功！").arg(res.addonName), "#a6e22e");
+        populateAddons();
+
+        const int newIdx = m_addonCombo->findText(res.addonName);
+        if (newIdx >= 0) {
+            m_addonCombo->setCurrentIndex(newIdx);
+        }
+        saveSettings();
+        updateActionButtonState();
+
+        dlg.accept();
+
+        QMessageBox::information(
+            this,
+            "创建成功",
+            QString("成功创建 Addon 项目【%1】！\n已自动为您选中该项目。").arg(res.addonName)
+        );
+    };
+
+    connect(createBtn, &QPushButton::clicked, &dlg, doCreate);
+    connect(nameEdit, &QLineEdit::returnPressed, &dlg, doCreate);
+
+    dlg.exec();
 }
 
 void MainWindow::setupFileWatcher() {
