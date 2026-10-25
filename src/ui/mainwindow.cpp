@@ -361,6 +361,8 @@ void MainWindow::setupUi() {
 
     m_argsEdit->setMinimumHeight(28);
 
+    m_argsEdit->setText("-gpuraytracing");
+
     m_argsEdit->setPlaceholderText(
         "例如: -gpuraytracing"
     );
@@ -592,8 +594,12 @@ void MainWindow::populateAddons() {
 void MainWindow::loadSettings() {
     const LauncherSettings saved = LauncherConfig::Load(m_workingDir);
 
-    // 恢复附加启动参数
-    m_argsEdit->setText(saved.launchArgs);
+    // 恢复附加启动参数（若为空则使用默认值 -gpuraytracing）
+    if (saved.launchArgs.trimmed().isEmpty()) {
+        m_argsEdit->setText("-gpuraytracing");
+    } else {
+        m_argsEdit->setText(saved.launchArgs);
+    }
 
     // 恢复使用机翻设置
     if (m_useMachineTransCheck) {

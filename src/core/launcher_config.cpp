@@ -26,7 +26,11 @@ LauncherSettings LauncherConfig::Load(const std::wstring& workingDir) {
 
     LauncherSettings s;
     s.selectedAddon   = settings.value(kKeySelectedAddon, QString()).toString().trimmed();
-    s.launchArgs      = settings.value(kKeyLaunchArgs, QString()).toString();
+    QString args      = settings.value(kKeyLaunchArgs, "-gpuraytracing").toString().trimmed();
+    if (args.isEmpty()) {
+        args = "-gpuraytracing";
+    }
+    s.launchArgs      = args;
     s.useMachineTrans = settings.value(kKeyUseMachineTrans, true).toBool();
     return s;
 }

@@ -9,9 +9,9 @@
 #include <QString>
 
 struct LauncherSettings {
-    QString selectedAddon;          // 上次选择的 Addon 名
-    QString launchArgs;             // 附加启动参数
-    bool    useMachineTrans = true; // 是否启用机翻
+    QString selectedAddon;                     // 上次选择的 Addon 名
+    QString launchArgs = "-gpuraytracing";     // 附加启动参数，默认 -gpuraytracing
+    bool    useMachineTrans = true;            // 是否启用机翻
 };
 
 class LauncherConfig {
