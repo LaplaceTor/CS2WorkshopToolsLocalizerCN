@@ -59,4 +59,9 @@ bool FindReverseTranslationScopedW(void* callerAddr, const wchar_t* wstr, std::s
 // 文件路径与文件名保护检测
 bool IsFilePathOrIdentifier(const std::string& s);
 
+// FGD 输入/输出 (I/O) 标识符保护（防止在列表/下拉框/绘制中被误译为中文导致实体找不到目标输入）
+void RegisterProtectedFgdIoNames(const std::vector<std::string>& names);
+void ExtractAndRegisterFgdIoNames(const std::string& fgdContent);
+bool IsProtectedFgdIoName(const std::string& s);
+
 } // namespace qm

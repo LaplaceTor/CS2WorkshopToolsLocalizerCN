@@ -143,6 +143,7 @@ bool __fastcall hk_ReadFileToBuffer(
         int rawSize = 0;
         if (SafeGetBufferMemory(pBuffer, pRawData, rawSize) && pRawData && rawSize > 0) {
             std::string rawContent(pRawData, static_cast<size_t>(rawSize));
+            ExtractAndRegisterFgdIoNames(rawContent);
             std::string jitTrans;
             std::unordered_map<std::string, std::string> fgdDictCopy;
             FgdOverrideData fgdOverrideCopy;
@@ -295,6 +296,15 @@ bool LoadFgdDictionariesFromDisk(bool bForce) {
         return false;
     }
 
+    if (!newOverride.ioOverrides.empty()) {
+        std::vector<std::string> overrideIoNames;
+        overrideIoNames.reserve(newOverride.ioOverrides.size());
+        for (const auto& kv : newOverride.ioOverrides) {
+            overrideIoNames.push_back(kv.first);
+        }
+        RegisterProtectedFgdIoNames(overrideIoNames);
+    }
+
     {
         std::lock_guard<std::mutex> lock(g_FgdDictMutex);
         g_FgdDict.swap(newFgdDict);
@@ -347,6 +357,8 @@ void PrecompileFgdBuffers() {
                     if (inFile.is_open()) {
                         std::string rawContent((std::istreambuf_iterator<char>(inFile)), std::istreambuf_iterator<char>());
                         inFile.close();
+
+                        ExtractAndRegisterFgdIoNames(rawContent);
 
                         std::string transContent;
                         if (FgdCore::TranslateContent(rawContent, transContent, fgdDictSnapshot, fgdOverrideSnapshot) && !transContent.empty()) {

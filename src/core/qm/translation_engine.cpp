@@ -10,6 +10,7 @@
 #include <cctype>
 #include <mutex>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 namespace qm {
@@ -34,6 +35,51 @@ std::unordered_map<std::wstring, std::unordered_map<std::string, std::string>> g
 std::mutex g_DictMutex;
 std::once_flag g_dictInitFlag;
 std::atomic<bool> g_bDictLoaded{false};
+
+std::mutex g_ProtectedFgdIoMutex;
+std::unordered_set<std::string> g_ProtectedFgdIoNames{
+    "command", "trigger", "enable", "disable", "toggle",
+    "open", "close", "lock", "unlock", "start", "stop",
+    "kill", "killhierarchy", "reset", "cancel", "cancelpending",
+    "break", "use", "press", "alpha", "color", "scale", "skin",
+    "add", "subtract", "multiply", "divide", "compare", "test",
+    "display", "fade", "ignite", "ignitelifetime", "explode",
+    "spawn", "wake", "sleep", "touch", "activate", "deactivate",
+    "play", "playsound", "startsound", "stopsound", "pause", "resume",
+    "pitch", "volume", "show", "hide", "clear", "reload",
+    "increment", "decrement", "setvalue", "setvaluenofire", "getvalue",
+    "sethitmax", "sethitmin", "sethealth", "addhealth", "removehealth",
+    "setparent", "clearparent", "setparentattachment",
+    "setparentattachmentmaintainoffset", "followentity", "addoutput",
+    "fireuser1", "fireuser2", "fireuser3", "fireuser4",
+    "turnon", "turnoff", "setanimation", "setdefaultanimation",
+    "setplaybackrate", "setbodygroup", "setmaterialgroup",
+    "enablemotion", "disablemotion", "enableshadow", "disableshadow",
+    "enabledraw", "disabledraw", "enabledamageforces", "disabledamageforces",
+    "ontrigger", "onstarttouch", "onendtouch", "onstarttouchall", "onendtouchall",
+    "onpressed", "onin", "onout", "onopen", "onclose",
+    "onfullyopen", "onfullyclosed", "onblockedopening", "onblockedclosing",
+    "onunblockedopening", "onunblockedclosing", "onlockeduse", "onbreak",
+    "onhealthchanged", "ontakedamage", "ondamaged", "onkilled", "onignite",
+    "onuser1", "onuser2", "onuser3", "onuser4", "onspawn",
+    "ontimer", "ontimerhigh", "ontimerlow", "ontrue", "onfalse",
+    "onpass", "onfail", "ondefault", "outvalue",
+    "onhitmin", "onhitmax", "ongetvalue", "onchangedfrommin", "onchangedfrommax"
+};
+
+std::string NormalizeProtectedIoCandidate(const std::string& s) {
+    size_t first = s.find_first_not_of(" \t\r\n");
+    if (first == std::string::npos) return "";
+    size_t last = s.find_last_not_of(" \t\r\n");
+    std::string out;
+    out.reserve(last - first + 1);
+    for (size_t i = first; i <= last; ++i) {
+        char c = s[i];
+        if (c == '&') continue;
+        out.push_back(static_cast<char>(std::tolower(static_cast<unsigned char>(c))));
+    }
+    return out;
+}
 
 capture::UntranslatedCaptureWriter g_UntranslatedCapture;
 
@@ -825,6 +871,113 @@ bool IsFilePathOrIdentifier(const std::string& s) {
     return false;
 }
 
+void RegisterProtectedFgdIoNames(const std::vector<std::string>& names) {
+    if (names.empty()) return;
+    std::lock_guard<std::mutex> lock(g_ProtectedFgdIoMutex);
+    for (const std::string& name : names) {
+        std::string norm = NormalizeProtectedIoCandidate(name);
+        if (!norm.empty()) {
+            g_ProtectedFgdIoNames.insert(std::move(norm));
+        }
+    }
+}
+
+void ExtractAndRegisterFgdIoNames(const std::string& fgdContent) {
+    if (fgdContent.empty()) return;
+
+    std::vector<std::string> extracted;
+    size_t lineStart = 0;
+    const size_t n = fgdContent.size();
+
+    while (lineStart < n) {
+        size_t lineEnd = fgdContent.find('\n', lineStart);
+        if (lineEnd == std::string::npos) {
+            lineEnd = n;
+        }
+
+        // 剥离引号外的 // 单行注释
+        size_t codeEnd = lineEnd;
+        bool inQuote = false;
+        for (size_t i = lineStart; i < lineEnd; ++i) {
+            char c = fgdContent[i];
+            if (inQuote) {
+                if (c == '\\' && i + 1 < lineEnd) {
+                    ++i;
+                    continue;
+                }
+                if (c == '"') {
+                    inQuote = false;
+                }
+            } else {
+                if (c == '"') {
+                    inQuote = true;
+                } else if (c == '/' && i + 1 < lineEnd && fgdContent[i + 1] == '/') {
+                    codeEnd = i;
+                    break;
+                }
+            }
+        }
+
+        size_t pos = lineStart;
+        while (pos < codeEnd && (fgdContent[pos] == ' ' || fgdContent[pos] == '\t' || fgdContent[pos] == '\r')) {
+            ++pos;
+        }
+
+        size_t kwLen = 0;
+        if (pos + 5 < codeEnd &&
+            std::tolower(static_cast<unsigned char>(fgdContent[pos])) == 'i' &&
+            std::tolower(static_cast<unsigned char>(fgdContent[pos + 1])) == 'n' &&
+            std::tolower(static_cast<unsigned char>(fgdContent[pos + 2])) == 'p' &&
+            std::tolower(static_cast<unsigned char>(fgdContent[pos + 3])) == 'u' &&
+            std::tolower(static_cast<unsigned char>(fgdContent[pos + 4])) == 't' &&
+            (fgdContent[pos + 5] == ' ' || fgdContent[pos + 5] == '\t')) {
+            kwLen = 5;
+        } else if (pos + 6 < codeEnd &&
+                   std::tolower(static_cast<unsigned char>(fgdContent[pos])) == 'o' &&
+                   std::tolower(static_cast<unsigned char>(fgdContent[pos + 1])) == 'u' &&
+                   std::tolower(static_cast<unsigned char>(fgdContent[pos + 2])) == 't' &&
+                   std::tolower(static_cast<unsigned char>(fgdContent[pos + 3])) == 'p' &&
+                   std::tolower(static_cast<unsigned char>(fgdContent[pos + 4])) == 'u' &&
+                   std::tolower(static_cast<unsigned char>(fgdContent[pos + 5])) == 't' &&
+                   (fgdContent[pos + 6] == ' ' || fgdContent[pos + 6] == '\t')) {
+            kwLen = 6;
+        }
+
+        if (kwLen > 0) {
+            pos += kwLen;
+            while (pos < codeEnd && (fgdContent[pos] == ' ' || fgdContent[pos] == '\t')) {
+                ++pos;
+            }
+            size_t nameStart = pos;
+            while (pos < codeEnd && (std::isalnum(static_cast<unsigned char>(fgdContent[pos])) || fgdContent[pos] == '_')) {
+                ++pos;
+            }
+            if (pos > nameStart) {
+                size_t checkParen = pos;
+                while (checkParen < codeEnd && (fgdContent[checkParen] == ' ' || fgdContent[checkParen] == '\t')) {
+                    ++checkParen;
+                }
+                if (checkParen < codeEnd && fgdContent[checkParen] == '(') {
+                    extracted.emplace_back(fgdContent.substr(nameStart, pos - nameStart));
+                }
+            }
+        }
+
+        lineStart = (lineEnd < n) ? (lineEnd + 1) : n;
+    }
+
+    if (!extracted.empty()) {
+        RegisterProtectedFgdIoNames(extracted);
+    }
+}
+
+bool IsProtectedFgdIoName(const std::string& s) {
+    std::string norm = NormalizeProtectedIoCandidate(s);
+    if (norm.empty()) return false;
+    std::lock_guard<std::mutex> lock(g_ProtectedFgdIoMutex);
+    return g_ProtectedFgdIoNames.find(norm) != g_ProtectedFgdIoNames.end();
+}
+
 bool FindTranslationScoped(void* callerAddr, const char* text, std::string& outResult, TranslationSource source) {
     if (!text || text[0] == '\0') return false;
     if (!g_bTranslationEnabled.load(std::memory_order_relaxed)) return false;
@@ -839,6 +992,10 @@ bool FindTranslationScoped(void* callerAddr, const char* text, std::string& outR
 
     bool isFileOrPath = IsFilePathOrIdentifier(textStr);
     if (isFileOrPath && source != TranslationSource::StaticUI) {
+        return false;
+    }
+
+    if (source != TranslationSource::StaticUI && IsProtectedFgdIoName(textStr)) {
         return false;
     }
 
