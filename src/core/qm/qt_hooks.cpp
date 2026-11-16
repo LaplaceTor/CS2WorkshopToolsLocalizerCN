@@ -54,6 +54,8 @@ typedef void* (__fastcall *fnQTableWidgetItem_ctor)(void* pItem, const void* pQS
 typedef void (__fastcall *fnQTableWidgetItem_setText)(void* pItem, const void* pQString);
 typedef void* (__fastcall *fnQListWidgetItem_ctor)(void* pItem, const void* pQString, void* pListWidget, int type);
 typedef void (__fastcall *fnQListWidgetItem_setText)(void* pItem, const void* pQString);
+// QFlags<Qt::ItemFlag> flags() const 在 MSVC x64 ABI 下通过 RDX 隐藏 sret 指针返回 int 值
+typedef int* (__fastcall *fnItem_flags)(const void* pItem, int* pOutFlags);
 
 typedef void (__fastcall *fnQComboBox_addItem)(void* pBox, const void* pQString, const void* pUserData);
 typedef void (__fastcall *fnQComboBox_addItem_icon)(void* pBox, const void* pIcon, const void* pQString, const void* pUserData);
@@ -105,6 +107,9 @@ fnQTableWidgetItem_ctor g_o_QTableWidgetItem_ctor = nullptr;
 fnQTableWidgetItem_setText g_o_QTableWidgetItem_setText = nullptr;
 fnQListWidgetItem_ctor g_o_QListWidgetItem_ctor = nullptr;
 fnQListWidgetItem_setText g_o_QListWidgetItem_setText = nullptr;
+fnItem_flags g_pfn_QTreeWidgetItem_flags = nullptr;
+fnItem_flags g_pfn_QTableWidgetItem_flags = nullptr;
+fnItem_flags g_pfn_QListWidgetItem_flags = nullptr;
 
 fnQComboBox_addItem g_o_QComboBox_addItem = nullptr;
 fnQComboBox_addItem_icon g_o_QComboBox_addItem_icon = nullptr;
@@ -521,7 +526,23 @@ void __fastcall hk_QAction_activate(void* pAction, int event) {
     }
 }
 
+inline bool SafeIsItemEditable(fnItem_flags pfn, const void* pItem) {
+    if (!pfn || !pItem || (uintptr_t)pItem < 0x10000) return false;
+    __try {
+        int flags = 0;
+        pfn(pItem, &flags);
+        // Qt::ItemIsEditable == 0x2
+        return (flags & 0x2) != 0;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+}
+
 void __fastcall hk_QTreeWidgetItem_setText(void* pItem, int column, const void* pQString) {
+    if (SafeIsItemEditable(g_pfn_QTreeWidgetItem_flags, pItem)) {
+        if (g_o_QTreeWidgetItem_setText) g_o_QTreeWidgetItem_setText(pItem, column, pQString);
+        return;
+    }
     void* caller = _ReturnAddress();
     ForwardTranslatedQString(caller, pQString, TranslationSource::ItemWidget, [&](const void* text) {
         if (g_o_QTreeWidgetItem_setText) g_o_QTreeWidgetItem_setText(pItem, column, text);
@@ -536,6 +557,10 @@ void __fastcall hk_QTreeWidget_setHeaderLabel(void* pTree, const void* pQString)
 }
 
 void __fastcall hk_QTableWidgetItem_setText(void* pItem, const void* pQString) {
+    if (SafeIsItemEditable(g_pfn_QTableWidgetItem_flags, pItem)) {
+        if (g_o_QTableWidgetItem_setText) g_o_QTableWidgetItem_setText(pItem, pQString);
+        return;
+    }
     void* caller = _ReturnAddress();
     ForwardTranslatedQString(caller, pQString, TranslationSource::ItemWidget, [&](const void* text) {
         if (g_o_QTableWidgetItem_setText) g_o_QTableWidgetItem_setText(pItem, text);
@@ -543,6 +568,10 @@ void __fastcall hk_QTableWidgetItem_setText(void* pItem, const void* pQString) {
 }
 
 void __fastcall hk_QListWidgetItem_setText(void* pItem, const void* pQString) {
+    if (SafeIsItemEditable(g_pfn_QListWidgetItem_flags, pItem)) {
+        if (g_o_QListWidgetItem_setText) g_o_QListWidgetItem_setText(pItem, pQString);
+        return;
+    }
     void* caller = _ReturnAddress();
     ForwardTranslatedQString(caller, pQString, TranslationSource::ItemWidget, [&](const void* text) {
         if (g_o_QListWidgetItem_setText) g_o_QListWidgetItem_setText(pItem, text);
@@ -783,6 +812,15 @@ bool TryHookQtToolsModules() {
             }
             if (!g_pfn_QComboBox_isEditable) {
                 g_pfn_QComboBox_isEditable = (fnQComboBox_isEditable)GetProcAddress(hQtWidgets, "?isEditable@QComboBox@@QEBA_NXZ");
+            }
+            if (!g_pfn_QTreeWidgetItem_flags) {
+                g_pfn_QTreeWidgetItem_flags = (fnItem_flags)GetProcAddress(hQtWidgets, "?flags@QTreeWidgetItem@@QEBA?AV?$QFlags@W4ItemFlag@Qt@@@@XZ");
+            }
+            if (!g_pfn_QTableWidgetItem_flags) {
+                g_pfn_QTableWidgetItem_flags = (fnItem_flags)GetProcAddress(hQtWidgets, "?flags@QTableWidgetItem@@QEBA?AV?$QFlags@W4ItemFlag@Qt@@@@XZ");
+            }
+            if (!g_pfn_QListWidgetItem_flags) {
+                g_pfn_QListWidgetItem_flags = (fnItem_flags)GetProcAddress(hQtWidgets, "?flags@QListWidgetItem@@QEBA?AV?$QFlags@W4ItemFlag@Qt@@@@XZ");
             }
             if (!g_pfn_QTextEdit_isReadOnly) {
                 g_pfn_QTextEdit_isReadOnly = (fnQTextEdit_isReadOnly)GetProcAddress(hQtWidgets, "?isReadOnly@QTextEdit@@QEBA_NXZ");
