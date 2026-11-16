@@ -91,14 +91,9 @@ jobs:
           Remove-Item -Force "package\opengl32sw.dll" -ErrorAction SilentlyContinue
           Remove-Item -Force "package\vc_redist.x64.exe" -ErrorAction SilentlyContinue
 
-      - name: Create ZIP Package
-        run: |
-          $zipName = "CS2WorkshopToolsLocalizerCN-${{ env.APP_VER }}.zip"
-          Compress-Archive -Path "package\*" -DestinationPath $zipName -Force
-
       - name: Upload Build Artifact
         uses: actions/upload-artifact@v4
         with:
           name: CS2WorkshopToolsLocalizerCN-${{ env.APP_VER }}
-          path: CS2WorkshopToolsLocalizerCN-${{ env.APP_VER }}.zip
+          path: package/
           retention-days: 14
