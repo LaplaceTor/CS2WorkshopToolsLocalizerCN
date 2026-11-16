@@ -33,6 +33,12 @@ struct ModuleRangeSnapshot {
 // 获取 CS2 根二进制目录 (game/bin/win64/)
 std::wstring GetBinDirectory();
 
+// 从 binDir/localizer_appdir.txt 读取启动器工作目录与机翻开关
+bool ReadAppDirPointer(const std::wstring& binDir,
+                       std::wstring& outAppDir,
+                       bool& outUseMachineTrans,
+                       std::wstring* outPointerPath = nullptr);
+
 // 模块地址与快照查询管理
 bool GetCallerModuleName(void* callerAddr, wchar_t* outStem, size_t stemMaxLen);
 bool ResolveCallerModuleName(void* directCallerAddr, wchar_t* outStem, size_t stemMaxLen);

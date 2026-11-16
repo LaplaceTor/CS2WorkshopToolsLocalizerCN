@@ -494,10 +494,11 @@ void LocalizationService::WriteAppDirPointer(const std::wstring& cs2Root,
     const fs::path pointerFile = cs2Bin / L"localizer_appdir.txt";
 
     try {
-        std::wofstream ofs(pointerFile, std::ios::trunc);
+        std::ofstream ofs(pointerFile, std::ios::binary | std::ios::trunc);
         if (ofs.is_open()) {
-            ofs << workingDir << L"\n";
-            ofs << L"use_machine_trans=" << (useMachineTrans ? 1 : 0) << L"\n";
+            const QByteArray utf8Dir = QString::fromStdWString(workingDir).toUtf8();
+            ofs.write(utf8Dir.constData(), utf8Dir.size());
+            ofs << "\nuse_machine_trans=" << (useMachineTrans ? 1 : 0) << "\n";
         }
     } catch (...) {}
 }

@@ -649,44 +649,61 @@ void ScanKnownToolModules() {
     }
 }
 
+bool ReadAppDirPointer(const std::wstring& binDir,
+                       std::wstring& outAppDir,
+                       bool& outUseMachineTrans,
+                       std::wstring* outPointerPath) {
+    outAppDir.clear();
+    outUseMachineTrans = true;
+
+    const std::wstring pointerPath = binDir + L"localizer_appdir.txt";
+    if (outPointerPath) {
+        *outPointerPath = pointerPath;
+    }
+
+    FILE* fpPointer = _wfopen(pointerPath.c_str(), L"r, ccs=UTF-8");
+    if (!fpPointer) {
+        fpPointer = _wfopen(pointerPath.c_str(), L"r");
+    }
+    if (!fpPointer) {
+        return false;
+    }
+
+    constexpr size_t kLineBufSize = 1024;
+    wchar_t lineBuf[kLineBufSize] = {0};
+    if (fgetws(lineBuf, static_cast<int>(kLineBufSize), fpPointer)) {
+        size_t len = wcslen(lineBuf);
+        while (len > 0 && (lineBuf[len - 1] == L'\r' || lineBuf[len - 1] == L'\n' || lineBuf[len - 1] == L' ' || lineBuf[len - 1] == L'\t')) {
+            lineBuf[--len] = L'\0';
+        }
+        if (len > 0 && (lineBuf[len - 1] == L'\\' || lineBuf[len - 1] == L'/')) {
+            lineBuf[--len] = L'\0';
+        }
+        if (len > 0) {
+            outAppDir = lineBuf;
+        }
+    }
+    while (fgetws(lineBuf, static_cast<int>(kLineBufSize), fpPointer)) {
+        std::wstring opt = lineBuf;
+        if (opt.find(L"use_machine_trans=0") != std::wstring::npos) {
+            outUseMachineTrans = false;
+        } else if (opt.find(L"use_machine_trans=1") != std::wstring::npos) {
+            outUseMachineTrans = true;
+        }
+    }
+    fclose(fpPointer);
+    return !outAppDir.empty();
+}
+
 void LoadMasterTranslations() {
     std::wstring binDir = GetBinDirectory();
     std::wstring jsoncPath = L"";
     std::wstring fallbackPath = L"";
+    std::wstring appDir;
+    std::wstring appDirPointerPath;
     bool useMachineTrans = true;
 
-    std::wstring appDirPointerPath = binDir + L"localizer_appdir.txt";
-    FILE* fpPointer = _wfopen(appDirPointerPath.c_str(), L"r, ccs=UTF-8");
-    if (!fpPointer) {
-        fpPointer = _wfopen(appDirPointerPath.c_str(), L"r");
-    }
-    std::wstring appDir = L"";
-    if (fpPointer) {
-        wchar_t lineBuf[MAX_PATH] = {0};
-        if (fgetws(lineBuf, MAX_PATH, fpPointer)) {
-            size_t len = wcslen(lineBuf);
-            while (len > 0 && (lineBuf[len - 1] == L'\r' || lineBuf[len - 1] == L'\n' || lineBuf[len - 1] == L' ' || lineBuf[len - 1] == L'\t')) {
-                lineBuf[--len] = L'\0';
-            }
-            if (len > 0 && (lineBuf[len - 1] == L'\\' || lineBuf[len - 1] == L'/')) {
-                lineBuf[--len] = L'\0';
-            }
-            if (len > 0) {
-                appDir = lineBuf;
-            }
-        }
-        while (fgetws(lineBuf, MAX_PATH, fpPointer)) {
-            std::wstring opt = lineBuf;
-            if (opt.find(L"use_machine_trans=0") != std::wstring::npos) {
-                useMachineTrans = false;
-            } else if (opt.find(L"use_machine_trans=1") != std::wstring::npos) {
-                useMachineTrans = true;
-            }
-        }
-        fclose(fpPointer);
-    }
-
-    if (appDir.empty()) {
+    if (!ReadAppDirPointer(binDir, appDir, useMachineTrans, &appDirPointerPath)) {
         shared_log::LogHook("[DICT] Error: Cannot find launcher appDir pointer from %ls", appDirPointerPath.c_str());
         return;
     }
