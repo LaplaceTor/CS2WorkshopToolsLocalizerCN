@@ -73,6 +73,7 @@ add_executable(CS2WorkshopToolsLocalizerCN WIN32
     src/service/dictionary_service.cpp
     src/service/hammer_service.cpp
     src/service/dictionary_editor_service.cpp
+    src/service/update_service.cpp
 
     src/core/cs2_detector.cpp
     src/core/process_guard.cpp
