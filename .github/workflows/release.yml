@@ -4,6 +4,11 @@ permissions:
   contents: write
 
 on:
+  push:
+    branches:
+      - main
+    paths:
+      - 'src/**'
   workflow_dispatch:
     inputs:
       version:
@@ -21,6 +26,25 @@ jobs:
         uses: actions/checkout@v4
         with:
           submodules: recursive
+          fetch-depth: 0
+
+      - name: Resolve Release Version
+        run: |
+          if ("${{ github.event_name }}" -eq "workflow_dispatch") {
+            $ver = "${{ inputs.version }}".Trim()
+          } else {
+            git fetch --tags --force
+            $latestTag = git tag -l "v*" --sort=-v:refname | Select-Object -First 1
+            if ($latestTag -match '^v(\d+)\.(\d+)\.(\d+)$') {
+              $major = [int]$Matches[1]
+              $minor = [int]$Matches[2] + 1
+              $ver = "v$major.$minor.0"
+            } else {
+              $ver = "v1.0.0"
+            }
+          }
+          Write-Host "Resolved release version: $ver"
+          "RELEASE_VERSION=$ver" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
 
       - name: Install Qt 6.8 LTS (Latest Patch)
         uses: jurplel/install-qt-action@v4
@@ -40,7 +64,7 @@ jobs:
         run: |
           mkdir build
           cd build
-          cmake -G Ninja -DCMAKE_BUILD_TYPE=Release -DAPP_VERSION="${{ inputs.version }}" -DCMAKE_PREFIX_PATH="$env:Qt6_DIR" ..
+          cmake -G Ninja -DCMAKE_BUILD_TYPE=Release -DAPP_VERSION="${{ env.RELEASE_VERSION }}" -DCMAKE_PREFIX_PATH="$env:Qt6_DIR" ..
 
       - name: Build
         run: cmake --build build --config Release
@@ -83,16 +107,16 @@ jobs:
 
       - name: Create ZIP Package
         run: |
-          $zipName = "CS2WorkshopToolsLocalizerCN-${{ inputs.version }}.zip"
+          $zipName = "CS2WorkshopToolsLocalizerCN-${{ env.RELEASE_VERSION }}.zip"
           Compress-Archive -Path "package\*" -DestinationPath $zipName -Force
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ inputs.version }}
-          name: CS2WorkshopToolsLocalizerCN ${{ inputs.version }}
+          tag_name: ${{ env.RELEASE_VERSION }}
+          name: CS2WorkshopToolsLocalizerCN ${{ env.RELEASE_VERSION }}
           draft: false
           prerelease: false
-          files: CS2WorkshopToolsLocalizerCN-${{ inputs.version }}.zip
+          files: CS2WorkshopToolsLocalizerCN-${{ env.RELEASE_VERSION }}.zip
           generate_release_notes: true
 

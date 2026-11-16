@@ -32,6 +32,8 @@
 #include <QApplication>
 #include <QThread>
 #include <QTimer>
+#include <QDesktopServices>
+#include <QUrl>
 #include <QFileInfo>
 #include <QDir>
 #include <QFile>
@@ -58,6 +60,7 @@ MainWindow::MainWindow(const std::wstring& cs2Root, QWidget *parent)
     , m_hotReloadDebounceTimer(nullptr)
     , m_dictionaryService(new DictionaryService(this))
     , m_hammerService(new HammerService(this))
+    , m_updateService(new UpdateService(this))
 {
     // 获取程序所在目录作为工作目录
     QString appDir = QApplication::applicationDirPath();
@@ -199,7 +202,8 @@ MainWindow::MainWindow(const std::wstring& cs2Root, QWidget *parent)
     );
 
     appendLog(
-        " CS2 Workshop Tools Localizer CN 汉化启动器已就绪",
+        QString(" CS2 Workshop Tools Localizer CN 汉化启动器已就绪 (版本: %1)")
+            .arg(QStringLiteral(APP_VERSION)),
         "#a6e22e"
     );
 
@@ -233,6 +237,9 @@ MainWindow::MainWindow(const std::wstring& cs2Root, QWidget *parent)
 
     // 根据恢复后的实际状态刷新按钮
     updateActionButtonState();
+
+    // 启动后异步检查一次程序版本与在线词典更新（不阻塞界面展示）
+    QTimer::singleShot(300, this, &MainWindow::startStartupUpdateCheck);
 }
 
 MainWindow::~MainWindow() = default;
@@ -1272,6 +1279,14 @@ void MainWindow::onUpdateTranslationsClicked() {
         return;
     }
 
+    startDictionaryUpdate();
+}
+
+void MainWindow::startDictionaryUpdate() {
+    if (m_hammerService->isRunning() || m_workerBusy) {
+        return;
+    }
+
     setUiBusy(true);
 
     m_statusLabel->setText(
@@ -1288,6 +1303,78 @@ void MainWindow::onUpdateTranslationsClicked() {
         [this](const QString& msg, const QString& color) { appendLog(msg, color); },
         [this](const DictionaryService::UpdateResult& result) { onDictionariesUpdated(result); }
     );
+}
+
+void MainWindow::startStartupUpdateCheck() {
+    appendLog("[*] 正在检查程序版本与在线词典更新...", "#66d9ef");
+    m_updateService->checkStartupUpdates(
+        m_workingDir,
+        [this](const UpdateService::StartupCheckResult& result) {
+            onStartupUpdateChecked(result);
+        }
+    );
+}
+
+void MainWindow::onStartupUpdateChecked(const UpdateService::StartupCheckResult& result) {
+    if (!result.app.checkOk) {
+        appendLog("[i] 自动检查程序版本失败（网络不可达或超时），跳过本次检查。", "#8b949e");
+    } else if (result.app.hasUpdate) {
+        appendLog(
+            QString("[!] 发现启动器新版本: %1（当前: %2），请前往 GitHub Releases 下载更新。")
+                .arg(result.app.latestVersion, result.app.currentVersion),
+            "#fd971f"
+        );
+    } else if (result.app.isDevBuild) {
+        appendLog(
+            QString("[i] 当前为开发/测试构建 (%1)，远端最新版本: %2")
+                .arg(result.app.currentVersion, result.app.latestVersion),
+            "#66d9ef"
+        );
+    } else {
+        appendLog(
+            QString("[+] 启动器已是最新版本 (%1)").arg(result.app.currentVersion),
+            "#a6e22e"
+        );
+    }
+
+    if (!result.dict.outdatedDicts.isEmpty()) {
+        appendLog(
+            QString("[!] 检测到在线词典有更新: %1").arg(result.dict.outdatedDicts.join(", ")),
+            "#fd971f"
+        );
+    } else if (!result.dict.checkOk) {
+        appendLog("[i] 自动检查在线词典更新失败（网络不可达或超时），跳过本次检查。", "#8b949e");
+    } else {
+        appendLog("[+] 在线汉化词典已是最新版本。", "#a6e22e");
+    }
+
+    if (result.app.hasUpdate) {
+        const auto ret = QMessageBox::question(
+            this,
+            "发现新版本",
+            QString("检测到启动器新版本 %1（当前版本: %2）。\n\n是否立即前往 GitHub Releases 页面下载更新？")
+                .arg(result.app.latestVersion, result.app.currentVersion),
+            QMessageBox::Yes | QMessageBox::No,
+            QMessageBox::Yes
+        );
+        if (ret == QMessageBox::Yes) {
+            QDesktopServices::openUrl(QUrl(result.app.releaseUrl));
+        }
+    }
+
+    if (!result.dict.outdatedDicts.isEmpty() && !m_hammerService->isRunning() && !m_workerBusy) {
+        const auto ret = QMessageBox::question(
+            this,
+            "发现在线词典更新",
+            QString("检测到以下在线词典与远端存在更新：\n- %1\n\n是否立即下载并更新本地词典？\n（若您曾手动修改本地词典，更新将覆盖对应文件）")
+                .arg(result.dict.outdatedDicts.join("\n- ")),
+            QMessageBox::Yes | QMessageBox::No,
+            QMessageBox::Yes
+        );
+        if (ret == QMessageBox::Yes) {
+            startDictionaryUpdate();
+        }
+    }
 }
 
 void MainWindow::onDictionariesUpdated(const DictionaryService::UpdateResult& result) {

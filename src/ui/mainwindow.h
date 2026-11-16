@@ -5,6 +5,7 @@
 
 #include "service/dictionary_service.h"
 #include "service/hammer_service.h"
+#include "service/update_service.h"
 
 class QComboBox;
 class QLineEdit;
@@ -87,6 +88,11 @@ private:
     // 在线词典更新的统一收尾：按 Service 返回的失败原因记日志 + 弹窗 + 恢复 UI
     void onDictionariesUpdated(const DictionaryService::UpdateResult& result);
 
+    // 启动时自动检查程序版本与在线词典更新
+    void startStartupUpdateCheck();
+    void onStartupUpdateChecked(const UpdateService::StartupCheckResult& result);
+    void startDictionaryUpdate();
+
     std::wstring m_cs2Root;
     std::wstring m_workingDir;
 
@@ -123,6 +129,7 @@ private:
     // Service 层：业务流程编排，MainWindow 只负责传参与展示结果
     DictionaryService* m_dictionaryService;
     HammerService*     m_hammerService;
+    UpdateService*     m_updateService;
 
     // 后台任务互斥标志
     bool m_workerBusy = false;
