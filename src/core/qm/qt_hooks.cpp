@@ -57,6 +57,7 @@ typedef void (__fastcall *fnQComboBox_addItem_icon)(void* pBox, const void* pIco
 typedef void (__fastcall *fnQComboBox_setItemText)(void* pBox, int index, const void* pQString);
 typedef void (__fastcall *fnQComboBox_insertItem)(void* pBox, int index, const void* pQString, const void* pUserData);
 typedef void (__fastcall *fnQComboBox_insertItem_icon)(void* pBox, int index, const void* pIcon, const void* pQString, const void* pUserData);
+typedef bool (__fastcall *fnQComboBox_isEditable)(const void* pBox);
 
 typedef void (__fastcall *fnQPainter_drawText_Rect)(void* pPainter, const void* pRect, int flags, const void* pQString, void* pBoundingRect);
 typedef void (__fastcall *fnQPainter_drawText_RectF)(void* pPainter, const void* pRectF, int flags, const void* pQString, void* pBoundingRect);
@@ -104,6 +105,7 @@ fnQComboBox_addItem_icon g_o_QComboBox_addItem_icon = nullptr;
 fnQComboBox_setItemText g_o_QComboBox_setItemText = nullptr;
 fnQComboBox_insertItem g_o_QComboBox_insertItem = nullptr;
 fnQComboBox_insertItem_icon g_o_QComboBox_insertItem_icon = nullptr;
+fnQComboBox_isEditable g_pfn_QComboBox_isEditable = nullptr;
 
 fnQPainter_drawText_Rect g_o_QPainter_drawText_Rect = nullptr;
 fnQPainter_drawText_RectF g_o_QPainter_drawText_RectF = nullptr;
@@ -492,7 +494,7 @@ void __fastcall hk_QTreeWidgetItem_setText(void* pItem, int column, const void* 
 
 void __fastcall hk_QTreeWidget_setHeaderLabel(void* pTree, const void* pQString) {
     void* caller = _ReturnAddress();
-    ForwardTranslatedQString(caller, pQString, TranslationSource::ItemWidget, [&](const void* text) {
+    ForwardTranslatedQString(caller, pQString, TranslationSource::StaticUI, [&](const void* text) {
         if (g_o_QTreeWidget_setHeaderLabel) g_o_QTreeWidget_setHeaderLabel(pTree, text);
     });
 }
@@ -511,7 +513,20 @@ void __fastcall hk_QListWidgetItem_setText(void* pItem, const void* pQString) {
     });
 }
 
+inline bool SafeIsComboBoxEditable(const void* pBox) {
+    if (!g_pfn_QComboBox_isEditable || !pBox || (uintptr_t)pBox < 0x10000) return false;
+    __try {
+        return g_pfn_QComboBox_isEditable(pBox);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+}
+
 void __fastcall hk_QComboBox_addItem(void* pBox, const void* pQString, const void* pUserData) {
+    if (SafeIsComboBoxEditable(pBox)) {
+        if (g_o_QComboBox_addItem) g_o_QComboBox_addItem(pBox, pQString, pUserData);
+        return;
+    }
     void* caller = _ReturnAddress();
     ForwardTranslatedQString(caller, pQString, TranslationSource::ItemWidget, [&](const void* text) {
         if (g_o_QComboBox_addItem) g_o_QComboBox_addItem(pBox, text, pUserData);
@@ -519,6 +534,10 @@ void __fastcall hk_QComboBox_addItem(void* pBox, const void* pQString, const voi
 }
 
 void __fastcall hk_QComboBox_addItem_icon(void* pBox, const void* pIcon, const void* pQString, const void* pUserData) {
+    if (SafeIsComboBoxEditable(pBox)) {
+        if (g_o_QComboBox_addItem_icon) g_o_QComboBox_addItem_icon(pBox, pIcon, pQString, pUserData);
+        return;
+    }
     void* caller = _ReturnAddress();
     ForwardTranslatedQString(caller, pQString, TranslationSource::ItemWidget, [&](const void* text) {
         if (g_o_QComboBox_addItem_icon) g_o_QComboBox_addItem_icon(pBox, pIcon, text, pUserData);
@@ -526,6 +545,10 @@ void __fastcall hk_QComboBox_addItem_icon(void* pBox, const void* pIcon, const v
 }
 
 void __fastcall hk_QComboBox_setItemText(void* pBox, int index, const void* pQString) {
+    if (SafeIsComboBoxEditable(pBox)) {
+        if (g_o_QComboBox_setItemText) g_o_QComboBox_setItemText(pBox, index, pQString);
+        return;
+    }
     void* caller = _ReturnAddress();
     ForwardTranslatedQString(caller, pQString, TranslationSource::ItemWidget, [&](const void* text) {
         if (g_o_QComboBox_setItemText) g_o_QComboBox_setItemText(pBox, index, text);
@@ -533,6 +556,10 @@ void __fastcall hk_QComboBox_setItemText(void* pBox, int index, const void* pQSt
 }
 
 void __fastcall hk_QComboBox_insertItem(void* pBox, int index, const void* pQString, const void* pUserData) {
+    if (SafeIsComboBoxEditable(pBox)) {
+        if (g_o_QComboBox_insertItem) g_o_QComboBox_insertItem(pBox, index, pQString, pUserData);
+        return;
+    }
     void* caller = _ReturnAddress();
     ForwardTranslatedQString(caller, pQString, TranslationSource::ItemWidget, [&](const void* text) {
         if (g_o_QComboBox_insertItem) g_o_QComboBox_insertItem(pBox, index, text, pUserData);
@@ -540,6 +567,10 @@ void __fastcall hk_QComboBox_insertItem(void* pBox, int index, const void* pQStr
 }
 
 void __fastcall hk_QComboBox_insertItem_icon(void* pBox, int index, const void* pIcon, const void* pQString, const void* pUserData) {
+    if (SafeIsComboBoxEditable(pBox)) {
+        if (g_o_QComboBox_insertItem_icon) g_o_QComboBox_insertItem_icon(pBox, index, pIcon, pQString, pUserData);
+        return;
+    }
     void* caller = _ReturnAddress();
     ForwardTranslatedQString(caller, pQString, TranslationSource::ItemWidget, [&](const void* text) {
         if (g_o_QComboBox_insertItem_icon) g_o_QComboBox_insertItem_icon(pBox, index, pIcon, text, pUserData);
@@ -712,6 +743,9 @@ bool TryHookQtToolsModules() {
             }
             if (!g_pfn_QAction_setIcon) {
                 g_pfn_QAction_setIcon = (fnQAction_setIcon)GetProcAddress(hQtWidgets, "?setIcon@QAction@@QEAAXAEBVQIcon@@@Z");
+            }
+            if (!g_pfn_QComboBox_isEditable) {
+                g_pfn_QComboBox_isEditable = (fnQComboBox_isEditable)GetProcAddress(hQtWidgets, "?isEditable@QComboBox@@QEBA_NXZ");
             }
 
             void* pTreeSetText     = (void*)GetProcAddress(hQtWidgets, "?setText@QTreeWidgetItem@@QEAAXHAEBVQString@@@Z");
