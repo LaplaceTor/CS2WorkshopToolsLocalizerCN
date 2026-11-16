@@ -41,6 +41,9 @@ typedef void (__fastcall *fnQToolButton_setDefaultAction)(void* pButton, void* p
 typedef void* (__fastcall *fnQToolButton_defaultAction)(const void* pButton);
 typedef void (__fastcall *fnQAction_setIcon)(void* pAction, const void* pIcon);
 typedef bool (__fastcall *fnQObject_inherits)(const void* pObject, const char* classname);
+typedef void* (__fastcall *fnQObject_parent)(const void* pObject);
+typedef bool (__fastcall *fnQTextEdit_isReadOnly)(const void* pEdit);
+typedef bool (__fastcall *fnQPlainTextEdit_isReadOnly)(const void* pEdit);
 typedef void (__fastcall *fnQLabel_setText)(void* pLabel, const void* pQString);
 typedef void (__fastcall *fnQWidget_setWindowTitle)(void* pWidget, const void* pQString);
 typedef void (__fastcall *fnQGroupBox_setTitle)(void* pBox, const void* pQString);
@@ -87,6 +90,9 @@ fnQToolButton_setDefaultAction g_o_QToolButton_setDefaultAction = nullptr;
 fnQToolButton_defaultAction g_pfn_QToolButton_defaultAction = nullptr;
 fnQAction_setIcon g_pfn_QAction_setIcon = nullptr;
 fnQObject_inherits g_pfn_QObject_inherits = nullptr;
+fnQObject_parent g_pfn_QObject_parent = nullptr;
+fnQTextEdit_isReadOnly g_pfn_QTextEdit_isReadOnly = nullptr;
+fnQPlainTextEdit_isReadOnly g_pfn_QPlainTextEdit_isReadOnly = nullptr;
 
 fnQAbstractButton_setText g_o_QAbstractButton_setText = nullptr;
 fnQLabel_setText g_o_QLabel_setText = nullptr;
@@ -280,7 +286,33 @@ void __fastcall hk_QPainter_drawText_xy(void* pPainter, int x, int y, const void
     });
 }
 
+inline bool SafeIsEditableTextDocument(const void* pDoc) {
+    if (!pDoc || (uintptr_t)pDoc < 0x10000 || !g_pfn_QObject_parent || !g_pfn_QObject_inherits) {
+        return false;
+    }
+    __try {
+        const void* curr = pDoc;
+        for (int depth = 0; depth < 4 && curr && (uintptr_t)curr >= 0x10000; ++depth) {
+            curr = g_pfn_QObject_parent(curr);
+            if (!curr || (uintptr_t)curr < 0x10000) break;
+            if (g_pfn_QTextEdit_isReadOnly && g_pfn_QObject_inherits(curr, "QTextEdit")) {
+                return !g_pfn_QTextEdit_isReadOnly(curr);
+            }
+            if (g_pfn_QPlainTextEdit_isReadOnly && g_pfn_QObject_inherits(curr, "QPlainTextEdit")) {
+                return !g_pfn_QPlainTextEdit_isReadOnly(curr);
+            }
+        }
+        return false;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+}
+
 void __fastcall hk_QTextDocument_setPlainText(void* pDoc, const void* pQString) {
+    if (SafeIsEditableTextDocument(pDoc)) {
+        if (g_o_QTextDocument_setPlainText) g_o_QTextDocument_setPlainText(pDoc, pQString);
+        return;
+    }
     void* caller = _ReturnAddress();
     ForwardTranslatedQString(caller, pQString, TranslationSource::StaticUI, [&](const void* text) {
         if (g_o_QTextDocument_setPlainText) g_o_QTextDocument_setPlainText(pDoc, text);
@@ -288,6 +320,10 @@ void __fastcall hk_QTextDocument_setPlainText(void* pDoc, const void* pQString) 
 }
 
 void __fastcall hk_QTextDocument_setHtml(void* pDoc, const void* pQString) {
+    if (SafeIsEditableTextDocument(pDoc)) {
+        if (g_o_QTextDocument_setHtml) g_o_QTextDocument_setHtml(pDoc, pQString);
+        return;
+    }
     void* caller = _ReturnAddress();
     ForwardTranslatedQString(caller, pQString, TranslationSource::StaticUI, [&](const void* text) {
         if (g_o_QTextDocument_setHtml) g_o_QTextDocument_setHtml(pDoc, text);
@@ -704,6 +740,7 @@ bool InitializeQtCoreHooks() {
     g_pfn_utf16 = (fnQString_utf16)GetProcAddress(hQtCore, "?utf16@QString@@QEBAPEBGXZ");
     g_pfn_QString_dtor = (fnQString_dtor)GetProcAddress(hQtCore, "??1QString@@QEAA@XZ");
     g_pfn_QObject_inherits = (fnQObject_inherits)GetProcAddress(hQtCore, "?inherits@QObject@@QEBA_NPEBD@Z");
+    g_pfn_QObject_parent = (fnQObject_parent)GetProcAddress(hQtCore, "?parent@QObject@@QEBAPEAV1@XZ");
 
     PatchInfo patchInfo;
     if (PePatcher::GetPatchInfoFromMemory(hQtCore, patchInfo) && patchInfo.origTrRva != 0) {
@@ -746,6 +783,12 @@ bool TryHookQtToolsModules() {
             }
             if (!g_pfn_QComboBox_isEditable) {
                 g_pfn_QComboBox_isEditable = (fnQComboBox_isEditable)GetProcAddress(hQtWidgets, "?isEditable@QComboBox@@QEBA_NXZ");
+            }
+            if (!g_pfn_QTextEdit_isReadOnly) {
+                g_pfn_QTextEdit_isReadOnly = (fnQTextEdit_isReadOnly)GetProcAddress(hQtWidgets, "?isReadOnly@QTextEdit@@QEBA_NXZ");
+            }
+            if (!g_pfn_QPlainTextEdit_isReadOnly) {
+                g_pfn_QPlainTextEdit_isReadOnly = (fnQPlainTextEdit_isReadOnly)GetProcAddress(hQtWidgets, "?isReadOnly@QPlainTextEdit@@QEBA_NXZ");
             }
 
             void* pTreeSetText     = (void*)GetProcAddress(hQtWidgets, "?setText@QTreeWidgetItem@@QEAAXHAEBVQString@@@Z");
