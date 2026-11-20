@@ -22,13 +22,11 @@ bool HookManager::InitializeLocked(PVECTORED_EXCEPTION_HANDLER pVehHandler) {
         return true;
     }
 
-    // 1. 初始化 MinHook
     MH_STATUS status = MH_Initialize();
     if (status != MH_OK && status != MH_ERROR_ALREADY_INITIALIZED) {
         return false;
     }
 
-    // 2. 统一注册并管理 VEH 异常守卫
     if (pVehHandler != nullptr && m_pVehHandle == nullptr) {
         m_pVehHandle = AddVectoredExceptionHandler(1, pVehHandler);
     }
@@ -42,29 +40,22 @@ bool HookManager::InstallHook(void* pTarget, void* pDetour, void** ppOriginal, c
         return false;
     }
 
-    // 整个安装过程（含首次初始化）都在同一把锁内完成。
-    // 旧实现是「锁外读标志位 -> 锁外 Initialize -> 再上锁」，
-    // 并发调用时可能两个线程同时走到 MH_Initialize。
     std::lock_guard<std::mutex> lock(m_mutex);
     if (!m_bInitialized.load() && !InitializeLocked(nullptr)) {
         return false;
     }
 
-    // 1. 检查是否已有同目标 Hook
     auto it = std::find_if(m_hooks.begin(), m_hooks.end(), [pTarget](const HookEntry& h) {
         return h.target == pTarget;
     });
 
-    // 2. 处理 MH_CreateHook 及 ALREADY_CREATED
     MH_STATUS createStatus = MH_CreateHook(pTarget, pDetour, ppOriginal);
     if (createStatus != MH_OK && createStatus != MH_ERROR_ALREADY_CREATED) {
         return false;
     }
 
-    // 3. 处理 MH_EnableHook 及 ALREADY_ENABLED
     MH_STATUS enableStatus = MH_EnableHook(pTarget);
     if (enableStatus != MH_OK && enableStatus != MH_ERROR_ENABLED) {
-        // 启用失败时尝试回滚已创建的 Hook
         MH_RemoveHook(pTarget);
         if (ppOriginal) {
             *ppOriginal = nullptr;
@@ -75,7 +66,6 @@ bool HookManager::InstallHook(void* pTarget, void* pDetour, void** ppOriginal, c
         return false;
     }
 
-    // 4. 明确所有权维护
     if (it != m_hooks.end()) {
         it->detour = pDetour;
         it->original = ppOriginal;
@@ -97,11 +87,9 @@ bool HookManager::UninstallHook(void* pTarget) {
     if (!pTarget) return false;
     std::lock_guard<std::mutex> lock(m_mutex);
 
-    // 处理 disable 状态
     MH_STATUS disStatus = MH_DisableHook(pTarget);
-    (void)disStatus; // MH_OK, MH_ERROR_DISABLED, MH_ERROR_NOT_CREATED
+    (void)disStatus;
 
-    // 处理 remove 状态
     MH_STATUS remStatus = MH_RemoveHook(pTarget);
     if (remStatus == MH_ERROR_ENABLED) {
         MH_DisableHook(pTarget);
@@ -205,11 +193,8 @@ void HookManager::Shutdown() {
         return;
     }
 
-    // 1. 注销 DLL 加载通知回调 (Unregister callback)
-    //    与 UnregisterDllNotification() 共用同一份实现，此前这里是逐行复制的副本
     UnregisterDllNotificationLocked();
 
-    // 2. 禁用所有 Hook (Disable Hook)
     for (auto& hook : m_hooks) {
         if (hook.enabled && hook.target) {
             MH_DisableHook(hook.target);
@@ -218,7 +203,6 @@ void HookManager::Shutdown() {
     }
     MH_DisableHook(MH_ALL_HOOKS);
 
-    // 3. 移除所有 Hook (Remove Hook)
     for (auto& hook : m_hooks) {
         if (hook.target) {
             MH_RemoveHook(hook.target);
@@ -226,10 +210,8 @@ void HookManager::Shutdown() {
     }
     m_hooks.clear();
 
-    // 4. 注销全局 VEH 异常过滤器
     UnregisterVehLocked();
 
-    // 5. 卸载 MinHook 并释放所有蹦床（trampoline）内存空间 (MinHook Uninitialize)
     MH_Uninitialize();
 
     m_bInitialized.store(false);
@@ -245,12 +227,8 @@ size_t HookManager::GetHookCount() const {
 }
 
 void HookManager::EmergencyDisableAllHooks() {
-    // 1. 全局原子禁用所有 Hook（MinHook 内部自带原子临界区保护，完全不依赖 m_hooks）
     MH_DisableHook(MH_ALL_HOOKS);
 
-    // 2. 尝试获取互斥锁；若抢不到则绝对不访问 m_hooks 容器以避免数据竞争。
-    //    用 unique_lock + try_to_lock 由 RAII 负责释放，
-    //    旧实现手写 try_lock/unlock，中间一旦抛异常就会永久持锁。
     std::unique_lock<std::mutex> lock(m_mutex, std::try_to_lock);
     if (!lock.owns_lock()) {
         return;
@@ -273,6 +251,4 @@ bool HookManager::IsHookAddress(void* addr) {
     }
     return false;
 }
-
-
 

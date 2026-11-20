@@ -26,7 +26,6 @@ bool ProcessGuard::HasToolsArgument(const wchar_t* cmdLine) {
 
     const wchar_t* p = cmdLine;
     while (*p) {
-        // 跳过前导空白字符
         while (*p && iswspace(*p)) {
             ++p;
         }
@@ -34,7 +33,6 @@ bool ProcessGuard::HasToolsArgument(const wchar_t* cmdLine) {
             break;
         }
 
-        // 解析单个参数 Token
         std::wstring token;
         bool inQuotes = false;
 
@@ -50,7 +48,6 @@ bool ProcessGuard::HasToolsArgument(const wchar_t* cmdLine) {
             }
         }
 
-        // 判定 Token 是否为 -tools 或 /tools（不区分大小写）
         if (_wcsicmp(token.c_str(), L"-tools") == 0 || _wcsicmp(token.c_str(), L"/tools") == 0) {
             return true;
         }

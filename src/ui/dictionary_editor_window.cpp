@@ -43,23 +43,15 @@ void DictionaryEditorWindow::setupUi() {
     rootLayout->setContentsMargins(12, 12, 12, 12);
     rootLayout->setSpacing(8);
 
-    // =========================================================================
-    // 主体左右分栏 (QSplitter)
-    // =========================================================================
     QSplitter* splitter = new QSplitter(Qt::Horizontal, this);
 
-    // -------------------------------------------------------------------------
-    // 左侧：双 Tab 容器
-    // -------------------------------------------------------------------------
     m_tabWidget = new QTabWidget(splitter);
 
-    // Tab 1: 📚 已收录词典库
     QWidget* tab1Widget = new QWidget(m_tabWidget);
     QVBoxLayout* tab1Layout = new QVBoxLayout(tab1Widget);
     tab1Layout->setContentsMargins(6, 6, 6, 6);
     tab1Layout->setSpacing(6);
 
-    // Tab 1 专属检索工具栏（与捕获池筛选栏保持对齐一致）
     QHBoxLayout* searchCtrlLayout = new QHBoxLayout();
     searchCtrlLayout->setSpacing(6);
 
@@ -100,7 +92,6 @@ void DictionaryEditorWindow::setupUi() {
 
     m_tabWidget->addTab(tab1Widget, "📚 已收录词典库 (Search)");
 
-    // Tab 2: 🎯 运行时捕获池
     QWidget* tab2Widget = new QWidget(m_tabWidget);
     QVBoxLayout* tab2Layout = new QVBoxLayout(tab2Widget);
     tab2Layout->setContentsMargins(6, 6, 6, 6);
@@ -145,9 +136,6 @@ void DictionaryEditorWindow::setupUi() {
 
     splitter->addWidget(m_tabWidget);
 
-    // -------------------------------------------------------------------------
-    // 右侧：条目详情与编辑操作卡片
-    // -------------------------------------------------------------------------
     QGroupBox* rightGroup = new QGroupBox("【条目详情与编辑】", splitter);
     QVBoxLayout* rightLayout = new QVBoxLayout(rightGroup);
     rightLayout->setContentsMargins(12, 12, 12, 12);
@@ -183,7 +171,6 @@ void DictionaryEditorWindow::setupUi() {
 
     rightLayout->addLayout(formLayout);
 
-    // 操作按钮
     QHBoxLayout* btnRow = new QHBoxLayout();
     btnRow->setSpacing(8);
 
@@ -209,14 +196,10 @@ void DictionaryEditorWindow::setupUi() {
 
     rootLayout->addWidget(splitter, 1);
 
-    // =========================================================================
-    // 3. 底部状态反馈栏
-    // =========================================================================
     m_statusLabel = new QLabel("就绪 - 输入关键字以检索词典，或切换到捕获池查看 Hammer 实时未收录文本", this);
     m_statusLabel->setStyleSheet("color: #8b949e; padding: 4px 6px; background-color: #161b22; border-radius: 4px;");
     rootLayout->addWidget(m_statusLabel);
 
-    // 信号槽连接
     connect(m_dictTypeCombo, QOverload<int>::of(&QComboBox::currentIndexChanged), this, &DictionaryEditorWindow::onDictTypeChanged);
     connect(m_searchBtn, &QPushButton::clicked, this, &DictionaryEditorWindow::onSearchClicked);
     connect(m_searchEdit, &QLineEdit::returnPressed, this, &DictionaryEditorWindow::onSearchReturnPressed);
@@ -249,14 +232,12 @@ void DictionaryEditorWindow::populateModuleCombos() {
 void DictionaryEditorWindow::onDictTypeChanged(int index) {
     auto dictType = static_cast<DictType>(m_dictTypeCombo->itemData(index).toInt());
     if (dictType == DictType::FGD) {
-        // FGD 模式：根据设计共识，隔离并禁用 Tab 2 捕获池，锁定目标 DLL 为全局
         m_tabWidget->setTabEnabled(1, false);
         m_tabWidget->setCurrentIndex(0);
         m_moduleFilterCombo->setEnabled(false);
         m_targetModuleCombo->setEnabled(false);
         m_targetModuleCombo->setCurrentText("[全局 (无DLL分组)]");
     } else {
-        // Qt 界面词典模式：开放 Tab 2 与模块作用域
         m_tabWidget->setTabEnabled(1, true);
         m_moduleFilterCombo->setEnabled(true);
         m_targetModuleCombo->setEnabled(true);
@@ -372,7 +353,6 @@ void DictionaryEditorWindow::onRefreshCaptureClicked() {
         }
     }
 
-    // 默认按最后触发时间降序排列（最新在上）
     std::sort(m_currentCaptureResults.begin(), m_currentCaptureResults.end(), [](const auto& a, const auto& b) {
         return a.lastTimestamp > b.lastTimestamp;
     });
@@ -390,7 +370,6 @@ void DictionaryEditorWindow::onRefreshCaptureClicked() {
         auto* hitItem = new QTableWidgetItem(QString::number(item.hitCount));
         hitItem->setTextAlignment(Qt::AlignCenter);
 
-        // 时间戳格式化
         QString timeStr = QString("%1 ms 前").arg(GetTickCount64() - item.lastTimestamp);
         auto* timeItem = new QTableWidgetItem(timeStr);
         timeItem->setTextAlignment(Qt::AlignCenter);
@@ -430,7 +409,6 @@ void DictionaryEditorWindow::onSaveClicked() {
     rec.value = val.toStdString();
     rec.module = mod;
 
-    // 判断来源是否是检索出的 Fallback
     if (m_selectedSearchRow >= 0 && m_selectedSearchRow < static_cast<int>(m_currentSearchResults.size())) {
         rec.source = m_currentSearchResults[m_selectedSearchRow].source;
     } else {
@@ -442,7 +420,6 @@ void DictionaryEditorWindow::onSaveClicked() {
 
     if (res.success) {
         setStatus(res.message, "#7ee787");
-        // 刷新检索列表显示最新结果
         if (!m_searchEdit->text().trimmed().isEmpty()) {
             onSearchClicked();
         }

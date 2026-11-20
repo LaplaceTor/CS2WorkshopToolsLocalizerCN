@@ -11,18 +11,17 @@
 namespace shared_log {
 
 constexpr const wchar_t* kSharedLogMemName = L"Local\\CS2_Hammer_Localizer_SharedLog";
-constexpr size_t kSharedLogCapacity = 128 * 1024; // 128 KB 环形缓冲区
+constexpr size_t kSharedLogCapacity = 128 * 1024;
 
 #pragma pack(push, 4)
 struct SharedLogHeader {
-    uint32_t magic;         // 0x5A4C434C ('LCLZ')
-    uint32_t writeSeq;      // 单调递增写入总字节数
-    uint32_t writeOffset;   // 当前写入环形偏移
+    uint32_t magic;
+    uint32_t writeSeq;
+    uint32_t writeOffset;
     char buffer[kSharedLogCapacity];
 };
 #pragma pack(pop)
 
-// 注入端写入函数实现与状态管理
 class SharedLogWriter {
 public:
     static SharedLogWriter& Instance() {
@@ -49,7 +48,6 @@ public:
             m_pHeader->writeOffset = (offset + 1) % static_cast<uint32_t>(kSharedLogCapacity);
         }
 
-        // 内存屏障保证内容先于 sequence 更新对其它核可见
         MemoryBarrier();
         m_pHeader->writeSeq += static_cast<uint32_t>(len);
     }
@@ -112,4 +110,4 @@ inline void ShutdownSharedLog() {
     SharedLogWriter::Instance().Shutdown();
 }
 
-} // namespace shared_log
+}

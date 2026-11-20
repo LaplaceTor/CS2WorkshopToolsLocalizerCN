@@ -17,9 +17,6 @@ namespace qm {
 
 namespace {
 
-// ==============================================================================
-// 1. 全局配置与状态
-// ==============================================================================
 std::atomic<bool> g_bTranslationEnabled{true};
 
 std::unordered_map<std::string, std::string> g_CommonDict;
@@ -83,9 +80,6 @@ std::string NormalizeProtectedIoCandidate(const std::string& s) {
 
 capture::UntranslatedCaptureWriter g_UntranslatedCapture;
 
-// ==============================================================================
-// 2. 模块快照双缓冲实现
-// ==============================================================================
 struct MasterModuleItem {
     uintptr_t base;
     uintptr_t end;
@@ -96,7 +90,7 @@ ModuleRangeSnapshot g_SnapshotBuffers[2];
 std::atomic<size_t> g_ActiveSnapshotIndex{0};
 std::atomic<const ModuleRangeSnapshot*> g_pActiveSnapshot{nullptr};
 
-std::mutex g_ModuleWriterMutex; // 仅写者加锁，读者 100% 纯无锁
+std::mutex g_ModuleWriterMutex;
 std::vector<MasterModuleItem> g_MasterModules;
 
 std::wstring ExtractStem(const std::wstring& path) {
@@ -125,9 +119,6 @@ void PublishNewSnapshotLocked() {
     g_ActiveSnapshotIndex.store(nextIdx, std::memory_order_release);
 }
 
-// ==============================================================================
-// 3. 递归智能拆分辅助函数
-// ==============================================================================
 inline bool TryDirectMatch(const std::unordered_map<std::string, std::string>& dict, 
                            const std::string& text, std::string& outResult) {
     if (text.empty()) return false;
@@ -168,10 +159,8 @@ bool MatchAndTranslateInternal(const std::unordered_map<std::string, std::string
                                const std::string& text, std::string& outResult, int depth = 0) {
     if (text.empty() || depth > 4) return false;
 
-    // 1. 直接全匹配
     if (TryDirectMatch(dict, text, outResult)) return true;
 
-    // 1.1 尝试大小写归一化匹配
     std::string titleCase = ToTitleCase(text);
     if (titleCase != text) {
         if (TryDirectMatch(dict, titleCase, outResult)) return true;
@@ -181,7 +170,6 @@ bool MatchAndTranslateInternal(const std::unordered_map<std::string, std::string
         if (TryDirectMatch(dict, sentenceCase, outResult)) return true;
     }
 
-    // 2. 去除快捷键加速符 '&'
     if (text.find('&') != std::string::npos) {
         std::string stripped;
         stripped.reserve(text.length());
@@ -191,7 +179,6 @@ bool MatchAndTranslateInternal(const std::unordered_map<std::string, std::string
         if (MatchAndTranslateInternal(dict, stripped, outResult, depth + 1)) return true;
     }
 
-    // 3. 去除前后空白字符（保留原始前后空格填充）
     size_t first = text.find_first_not_of(" \t\r\n");
     if (first != std::string::npos) {
         size_t last = text.find_last_not_of(" \t\r\n");
@@ -205,7 +192,6 @@ bool MatchAndTranslateInternal(const std::unordered_map<std::string, std::string
         }
     }
 
-    // 4. 智能匹配动态数字前缀
     if (isdigit((unsigned char)text[0]) || (text[0] == '+' && text.length() > 1 && isdigit((unsigned char)text[1]))) {
         size_t i = 0;
         while (i < text.length() && (isdigit((unsigned char)text[i]) || text[i] == '/' || text[i] == '.' || 
@@ -236,7 +222,6 @@ bool MatchAndTranslateInternal(const std::unordered_map<std::string, std::string
         }
     }
 
-    // 5. 智能匹配由 " + " 或 " - " 连接的复合词
     size_t plusPos = text.find(" + ");
     if (plusPos != std::string::npos && plusPos > 0) {
         std::string partA = text.substr(0, plusPos);
@@ -250,7 +235,6 @@ bool MatchAndTranslateInternal(const std::unordered_map<std::string, std::string
         }
     }
 
-    // 6. 智能匹配中括号快捷键后缀：例如 "Clipping Tool [Shift+X]" -> "剪切工具 [Shift+X]"
     if (text.back() == ']') {
         size_t openBracket = text.rfind('[');
         if (openBracket != std::string::npos && openBracket > 0) {
@@ -267,7 +251,6 @@ bool MatchAndTranslateInternal(const std::unordered_map<std::string, std::string
         }
     }
 
-    // 7. 智能匹配圆括号快捷键后缀：例如 "Undo (Ctrl+Z)" -> "撤销 (Ctrl+Z)"
     if (text.back() == ')') {
         size_t openParen = text.rfind('(');
         if (openParen != std::string::npos && openParen > 0) {
@@ -284,7 +267,6 @@ bool MatchAndTranslateInternal(const std::unordered_map<std::string, std::string
         }
     }
 
-    // 8. 智能匹配制表符快捷键后缀：例如 "Save\tCtrl+S" -> "保存\tCtrl+S"
     size_t tabPos = text.find('\t');
     if (tabPos != std::string::npos && tabPos > 0) {
         std::string base = text.substr(0, tabPos);
@@ -295,7 +277,6 @@ bool MatchAndTranslateInternal(const std::unordered_map<std::string, std::string
         }
     }
 
-    // 9. 智能匹配省略号后缀：例如 "Save As..." -> "另存为..."
     if (text.length() > 3 && text.substr(text.length() - 3) == "...") {
         std::string base = text.substr(0, text.length() - 3);
         size_t baseLast = base.find_last_not_of(" \t");
@@ -307,7 +288,7 @@ bool MatchAndTranslateInternal(const std::unordered_map<std::string, std::string
                 return true;
             }
         }
-    } else if (text.length() >= 3 && text.substr(text.length() - 3) == "\xe2\x80\xa6") { // UTF-8 "…"
+    } else if (text.length() >= 3 && text.substr(text.length() - 3) == "\xe2\x80\xa6") {
         std::string base = text.substr(0, text.length() - 3);
         size_t baseLast = base.find_last_not_of(" \t");
         if (baseLast != std::string::npos) {
@@ -320,7 +301,6 @@ bool MatchAndTranslateInternal(const std::unordered_map<std::string, std::string
         }
     }
 
-    // 10. 智能匹配带冒号的前缀与复合结构
     size_t colonPos = text.find(':');
     if (colonPos != std::string::npos && colonPos > 0) {
         bool isScope = (colonPos + 1 < text.length() && text[colonPos + 1] == ':') || (colonPos > 0 && text[colonPos - 1] == ':');
@@ -385,7 +365,6 @@ bool MatchAndTranslateInternal(const std::unordered_map<std::string, std::string
     return false;
 }
 
-// 判断模块是否为 Qt / UI 基础框架透传层（回溯调用栈时应跳过，以定位上层业务工具模块）
 inline bool IsQtFrameworkModule(const wchar_t* stem) {
     if (!stem || stem[0] == L'\0') return false;
     return (_wcsicmp(stem, L"qt5widgets") == 0 ||
@@ -396,7 +375,6 @@ inline bool IsQtFrameworkModule(const wchar_t* stem) {
             _wcsicmp(stem, L"qtcore_qm") == 0);
 }
 
-// 计算反向还原候选英文词的 UI 规范度权重（分值越高越优先作为中文 -> 英文反向还原结果）
 int ComputeReverseCandidateScore(const std::string& en) {
     if (en.empty()) return -100;
 
@@ -419,29 +397,23 @@ int ComputeReverseCandidateScore(const std::string& en) {
     }
 
     if (startsUpper && hasLower) {
-        // 标准 TitleCase / SentenceCase（如 "Tool", "Selection Tool"）—— 标准 UI 首选形态
         score += 30;
     } else if (startsUpper && !hasLower) {
-        // 全大写专有名词或缩写（如 "OK", "FOV", "UV"）—— 次优 UI 形态
         score += 20;
     } else if (!startsLower && hasUpper) {
-        // 非字母开头但包含大写字母（如 "[Shift+X] Tool"）
         score += 10;
     } else if (startsLower && hasUpper) {
-        // camelCase 内部标识符（如 "toolName"）
         score += 5;
     } else {
-        // 全小写词（如 "tool", "type"）—— 多为底层 Schema 属性名，反向还原优先级最低
         score += 0;
     }
 
-    if (hasUnderscore) score -= 15; // snake_case 标识符（如 "base_item"）
-    if (hasAmpersand)  score -= 5;  // 含 '&' 加速符的变体优先让位给纯净词条
+    if (hasUnderscore) score -= 15;
+    if (hasAmpersand)  score -= 5;
 
     return score;
 }
 
-// 按 UI 规范度权重插入反向字典，消除多对一映射下的全小写覆盖退化与哈希遍历顺序不确定性
 void InsertReverseEntryWithPriority(std::unordered_map<std::string, std::string>& revDict,
                                     const std::string& en,
                                     const std::string& cn) {
@@ -457,12 +429,11 @@ void InsertReverseEntryWithPriority(std::unordered_map<std::string, std::string>
     if (newScore > oldScore) {
         it->second = en;
     } else if (newScore == oldScore && en < it->second) {
-        // 分值相同时按字典序稳定裁决，保证跨平台/跨桶序 100% 确定性
         it->second = en;
     }
 }
 
-} // namespace
+}
 
 std::wstring GetBinDirectory() {
     wchar_t szPath[MAX_PATH] = {0};
@@ -499,13 +470,11 @@ bool ResolveCallerModuleName(void* directCallerAddr, wchar_t* outBuf, size_t max
     if (!outBuf || maxLen == 0) return false;
     outBuf[0] = L'\0';
 
-    // 1. 极速路径 (Fast Path)：直接检查一层返回地址，若已命中非 Qt 框架层模块则直接返回（0 栈回溯开销）
     bool hasDirect = (directCallerAddr != nullptr && GetCallerModuleName(directCallerAddr, outBuf, maxLen));
     if (hasDirect && !IsQtFrameworkModule(outBuf)) {
         return true;
     }
 
-    // 2. 栈回溯路径 (Stack Walk)：当直接调用者位于 Qt5Widgets/Qt5Gui 等框架内部时，向上回溯定位真实业务工具模块
     void* stack[10] = {0};
     WORD frames = RtlCaptureStackBackTrace(1, 10, stack, nullptr);
     wchar_t frameStem[64] = {0};
@@ -541,7 +510,7 @@ bool AddModuleRange(HMODULE hMod, const std::wstring& overrideStem) {
     std::lock_guard<std::mutex> lock(g_ModuleWriterMutex);
     for (const auto& item : g_MasterModules) {
         if (item.base == base) {
-            return true; // 已存在
+            return true;
         }
     }
 
@@ -724,9 +693,6 @@ void LoadMasterTranslations() {
         }
     }
 
-    // 分层解析兜底字典与主字典，保证：
-    // 1. 正向字典：主字典覆盖兜底字典；
-    // 2. 反向字典：主字典条目绝对优先于兜底字典，同层级内部按 UI 规范度权重（TitleCase > 全小写）稳定裁决。
     std::unordered_map<std::string, std::string> fbCommon;
     std::unordered_map<std::wstring, std::unordered_map<std::string, std::string>> fbScoped;
     if (!fallbackPath.empty()) {
@@ -760,7 +726,6 @@ void LoadMasterTranslations() {
         shared_log::LogHook("[DICT] Failed to load JSONC dictionary from %ls: %ls", jsoncPath.c_str(), err.c_str());
     }
 
-    // 构建公共反向字典：先对兜底词条做规范度优选，再由主字典优选词条高优先级覆盖
     std::unordered_map<std::string, std::string> newCommonReverseDict;
     for (const auto& kv : fbCommon) {
         InsertReverseEntryWithPriority(newCommonReverseDict, kv.first, kv.second);
@@ -773,7 +738,6 @@ void LoadMasterTranslations() {
         newCommonReverseDict[kv.first] = kv.second;
     }
 
-    // 构建模块作用域反向字典
     std::unordered_map<std::wstring, std::unordered_map<std::string, std::string>> newScopedReverseDicts;
     for (const auto& sec : fbScoped) {
         auto& revMap = newScopedReverseDicts[sec.first];
@@ -839,17 +803,14 @@ void SetTranslationEnabled(bool enabled) {
 bool IsFilePathOrIdentifier(const std::string& s) {
     if (s.empty()) return false;
 
-    // 1. URL 协议检测
     if (s.rfind("http://", 0) == 0 || s.rfind("https://", 0) == 0 || s.rfind("file://", 0) == 0) {
         return true;
     }
 
-    // 2. Windows 反斜杠路径
     if (s.find('\\') != std::string::npos) {
         return true;
     }
 
-    // 3. 正斜杠路径检测（排除纯数字比率）
     size_t slash = s.find('/');
     while (slash != std::string::npos) {
         bool isFraction = (slash > 0 && slash + 1 < s.length() && 
@@ -861,7 +822,6 @@ bool IsFilePathOrIdentifier(const std::string& s) {
         slash = s.find('/', slash + 1);
     }
 
-    // 4. 文件扩展名检测
     size_t dot = s.rfind('.');
     if (dot != std::string::npos && dot > 0 && dot + 1 < s.length()) {
         if (s[dot - 1] != '.' && (dot + 1 >= s.length() || s[dot + 1] != '.')) {
@@ -912,7 +872,6 @@ void ExtractAndRegisterFgdIoNames(const std::string& fgdContent) {
             lineEnd = n;
         }
 
-        // 剥离引号外的 // 单行注释
         size_t codeEnd = lineEnd;
         bool inQuote = false;
         for (size_t i = lineStart; i < lineEnd; ++i) {
@@ -1000,7 +959,6 @@ bool FindTranslationScoped(void* callerAddr, const char* text, std::string& outR
     if (!g_bTranslationEnabled.load(std::memory_order_relaxed)) return false;
     if (!g_bDictLoaded.load(std::memory_order_acquire)) return false;
 
-    // 绘制热路径短路：已包含中文字符的文本无需再次执行正向查表与栈回溯
     if (source == TranslationSource::Painter && capture::ContainsChinese(text)) {
         return false;
     }
@@ -1130,7 +1088,6 @@ bool FindTranslationScoped(void* callerAddr, const char* text, std::string& outR
             }
         }
 
-        // 资产浏览器 (assetbrowser.dll) 包含大量动态用户资源项，未命中其专属字典时非静态 UI 严禁回退至通用词典
         if (source != TranslationSource::StaticUI && callerStem == L"assetbrowser") {
             return false;
         }
@@ -1284,9 +1241,9 @@ bool FindReverseTranslationScoped(void* callerAddr, const char* text, std::strin
                 }
             }
 
-            static const std::string kCnEllipsis = "\xe2\x80\xa6"; // …
+            static const std::string kCnEllipsis = "\xe2\x80\xa6";
             static const std::string kEnEllipsis = "...";
-            static const std::string kCnColon = "\xef\xbc\x9a"; // ：
+            static const std::string kCnColon = "\xef\xbc\x9a";
             static const std::string kEnColon = ":";
 
             auto tryReplaceAndFind = [&](const std::string& from, const std::string& to) -> bool {
@@ -1341,7 +1298,6 @@ bool FindReverseTranslationScoped(void* callerAddr, const char* text, std::strin
         }
     }
 
-    // 兜底：若由 Qt 底层异步重绘触发（栈上仅有 Qt 框架模块）且未在 common/hammer 命中，遍历其余工具作用域反向字典
     if (!hasCaller || IsQtFrameworkModule(callerStemBuf)) {
         for (const auto& sec : g_ScopedReverseDicts) {
             if (sec.first == L"hammer") continue;
@@ -1378,4 +1334,4 @@ bool FindReverseTranslationScopedW(void* callerAddr, const wchar_t* wstr, std::s
     return false;
 }
 
-} // namespace qm
+}

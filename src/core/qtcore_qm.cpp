@@ -26,23 +26,19 @@ HANDLE g_hToolsHookThread = NULL;
 HANDLE g_hWakeHookEvent = NULL;
 std::atomic<bool> g_bStopHookThread{false};
 
-// VEH 空写跳过守卫计数（100% 原子操作，保持 VEH 内 0 锁 0 IO）
 std::atomic<uint32_t> g_NullGuardSkipCount{0};
 std::atomic<uint32_t> g_NullGuardWindowCount{0};
 std::atomic<ULONGLONG> g_NullGuardWindowStart{0};
 std::atomic<bool> g_NullGuardTripped{false};
 
-// 切换语言：广播重绘所有 CS2/Hammer 窗口
 void ToggleLanguage() {
     bool current = qm::IsTranslationEnabled();
     bool next = !current;
     qm::SetTranslationEnabled(next);
     shared_log::LogHook("[LANG] Translation toggled: %s", next ? "ENABLED (Chinese)" : "DISABLED (English)");
 
-    // 自动触发 Hammer 原生 'Reload .FGD Files'，重读实体定义（中英双向即刻生效）
     qm::TriggerReloadFgdAction();
 
-    // 异步广播重绘所有 CS2/Hammer 窗口（RDW_INVALIDATE 避免后台线程同步挂起 GUI 线程）
     EnumWindows([](HWND hwnd, LPARAM) -> BOOL {
         DWORD pid = 0;
         GetWindowThreadProcessId(hwnd, &pid);
@@ -53,22 +49,17 @@ void ToggleLanguage() {
     }, 0);
 }
 
-// 磁盘热重载：重新载入词典并刷新预编译 FGD
 void ReloadTranslations() {
     shared_log::LogHook("[RELOAD] Reloading translations from disk...");
     qm::ClearAllTranslations();
     qm::LoadMasterTranslations();
 
-    // 强制从磁盘重新解析 FGD 词典与覆盖词典
     qm::LoadFgdDictionariesFromDisk(true);
 
-    // 重新预编译所有 FGD 内存缓存
     qm::PrecompileFgdBuffers();
 
-    // 自动触发 Hammer 原生 'Reload .FGD Files'
     qm::TriggerReloadFgdAction();
 
-    // 广播异步重绘所有 CS2/Hammer 窗口
     EnumWindows([](HWND hwnd, LPARAM) -> BOOL {
         DWORD pid = 0;
         GetWindowThreadProcessId(hwnd, &pid);
@@ -99,7 +90,6 @@ LRESULT CALLBACK LocalizerIpcWndProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM
 DWORD WINAPI ToolsHookThread(LPVOID lpParam) {
     shared_log::LogHook("[THREAD] ToolsHookThread started");
 
-    // 注册并创建隐藏 IPC 消息窗口（供启动器远程发送控制指令）
     WNDCLASSEXW ipcWc = { sizeof(WNDCLASSEXW) };
     ipcWc.lpfnWndProc = LocalizerIpcWndProc;
     ipcWc.hInstance = g_hModule;
@@ -109,11 +99,9 @@ DWORD WINAPI ToolsHookThread(LPVOID lpParam) {
     HWND hIpcWnd = CreateWindowExW(0, HammerIpc::kWindowClass, HammerIpc::kWindowTitle, 0, 0, 0, 0, 0, HWND_MESSAGE, NULL, g_hModule, NULL);
     shared_log::LogHook("[IPC] Message window created: %p", hIpcWnd);
 
-    // 在后台独立线程中预加载字典与扫描工具模块
     qm::EnsureDictionaryLoaded();
     qm::ScanKnownToolModules();
 
-    // 预编译内存中的 FGD 翻译缓存并挂钩文件系统
     qm::PrecompileFgdBuffers();
     qm::TryHookFileSystem();
 
@@ -130,7 +118,6 @@ DWORD WINAPI ToolsHookThread(LPVOID lpParam) {
         qm::TryHookFileSystem();
         qm::ScanKnownToolModules();
 
-        // 汇总记录 VEH 空写守卫跳过情况
         {
             static uint32_t s_lastReported = 0;
             static bool s_trippedLogged = false;
@@ -219,7 +206,7 @@ LONG WINAPI DiagnosticCrashLoggerVEH(PEXCEPTION_POINTERS pExceptionInfo) {
     return EXCEPTION_CONTINUE_SEARCH;
 }
 
-} // namespace
+}
 
 extern "C" __declspec(dllexport) bool InitializeTranslator() {
     if (g_bTranslatorInitialized.load(std::memory_order_acquire)) {
@@ -251,7 +238,6 @@ extern "C" __declspec(dllexport) bool InitializeTranslator() {
         return false;
     }
 
-    // 立即挂钩 VFileSystem017::ReadFileToBuffer
     qm::TryHookFileSystem();
 
     if (!g_hWakeHookEvent) {

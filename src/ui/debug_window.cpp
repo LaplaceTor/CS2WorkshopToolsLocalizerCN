@@ -32,9 +32,8 @@ DebugWindow::DebugWindow(const std::wstring& cs2Root, QWidget* parent)
     setupUi();
 
     connect(m_pollTimer, &QTimer::timeout, this, &DebugWindow::onRefreshTimer);
-    m_pollTimer->start(300); // 300ms 刷新周期
+    m_pollTimer->start(300);
 
-    // 立即执行一次初始状态检测
     onRefreshTimer();
     queryLoadedModules();
 }
@@ -53,7 +52,6 @@ DebugWindow::~DebugWindow() {
     }
 }
 
-// 顶部状态看板里大量使用的同款小号状态标签
 namespace {
 
 QLabel* MakeStatusLabel(const QString& text, const QString& color = "#c9d1d9") {
@@ -62,7 +60,7 @@ QLabel* MakeStatusLabel(const QString& text, const QString& color = "#c9d1d9") {
     return lbl;
 }
 
-}  // namespace
+}
 
 QWidget* DebugWindow::createStatusDashboard() {
     QGroupBox* grpStatus = new QGroupBox("📊 目标进程与汉化运行状态", this);
@@ -156,10 +154,8 @@ void DebugWindow::setupUi() {
     mainLayout->setContentsMargins(10, 10, 10, 10);
     mainLayout->setSpacing(8);
 
-    // 1. 顶部状态监控仪表盘
     mainLayout->addWidget(createStatusDashboard());
 
-    // 2. Tab 视窗
     m_tabWidget = new QTabWidget(this);
     m_tabWidget->setStyleSheet(
         "QTabWidget::pane { border: 1px solid #30363d; border-radius: 4px; background-color: #0d1117; }"
@@ -188,7 +184,6 @@ void DebugWindow::updateProcessDashboard() {
         m_lblHammerStatus->setStyleSheet("font-size: 12px; color: #3fb950; font-weight: bold;");
         m_lblHammerPid->setText(QString("%1 (0x%2)").arg(pid).arg(pid, 0, 16).toUpper());
 
-        // 查询进程内存
         HANDLE hProcess = OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, FALSE, pid);
         if (hProcess) {
             PROCESS_MEMORY_COUNTERS pmc = { sizeof(pmc) };
@@ -265,7 +260,6 @@ void DebugWindow::pollHookRuntimeLog() {
     uint32_t currentSeq = pHeader->writeSeq;
     if (currentSeq == m_lastReadSeq) return;
 
-    // 若写入跨度超出缓冲区大小，对齐至最新有效窗口
     if (currentSeq < m_lastReadSeq || (currentSeq - m_lastReadSeq) > shared_log::kSharedLogCapacity) {
         m_lastReadSeq = (currentSeq > shared_log::kSharedLogCapacity) ? (currentSeq - shared_log::kSharedLogCapacity) : 0;
     }
@@ -339,7 +333,6 @@ void DebugWindow::queryLoadedModules() {
             QString name = QString::fromWCharArray(me.szModule);
             QString path = QString::fromWCharArray(me.szExePath);
 
-            // 仅突出显示 Workshop Tools 与 Qt 相关重要核心模块
             QString lower = name.toLower();
             bool isCore = (lower.contains("cs2") || lower.contains("hammer") || lower.contains("property") ||
                            lower.contains("qtcore_qm") || lower.contains("qt5") || lower.contains("tier0") ||

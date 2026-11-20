@@ -1,5 +1,4 @@
 #include "core/dictionary_compiler.h"
-// 引入 UTF-8/UTF-16 转换工具（内部已带 NOMINMAX 与 windows.h，供 MoveFileExW 等使用）
 #include "core/encoding_util.h"
 #include <fstream>
 #include <algorithm>
@@ -48,7 +47,6 @@ std::string DictionaryCompiler::StripJsonComments(const char* p, size_t length) 
         }
     }
 
-    // 移除尾随逗号 (trailing commas before } or ])，使 JSONC 兼容 QJsonDocument
     std::string result;
     result.reserve(out.size());
     inQuote = false;
@@ -70,7 +68,7 @@ std::string DictionaryCompiler::StripJsonComments(const char* p, size_t length) 
                     j++;
                 }
                 if (j < out.size() && (out[j] == '}' || out[j] == ']')) {
-                    continue; // 跳过尾随逗号
+                    continue;
                 }
                 result.push_back(c);
             } else {
@@ -95,7 +93,7 @@ public:
             outError = L"JSON 根节点必须为对象 '{'";
             return false;
         }
-        m_idx++; // skip '{'
+        m_idx++;
 
         while (true) {
             SkipWhitespace();
@@ -118,12 +116,11 @@ public:
                 outError = L"JSON 缺少冒号 ':' 分隔符";
                 return false;
             }
-            m_idx++; // skip ':'
+            m_idx++;
             SkipWhitespace();
 
             if (m_idx < m_len && m_str[m_idx] == '{') {
-                // 嵌套作用域对象 (如 "hammer": { ... })
-                m_idx++; // skip '{'
+                m_idx++;
                 std::wstring secName = NormalizeSectionName(key);
                 auto& secDict = (secName == L"common" || secName == L"general") ? outCommon : outScoped[secName];
 
@@ -162,7 +159,6 @@ public:
                     }
                 }
             } else if (m_idx < m_len && m_str[m_idx] == '"') {
-                // 扁平顶级字符串键值对 (归入 common)
                 std::string val;
                 if (!ParseString(val, outError)) return false;
                 if (!key.empty() && !val.empty()) {
@@ -195,7 +191,7 @@ private:
             outError = L"期望字符串起始双引号 '\"'";
             return false;
         }
-        m_idx++; // skip '"'
+        m_idx++;
 
         outStr.clear();
         while (m_idx < m_len) {
@@ -236,7 +232,6 @@ private:
                             }
                         }
 
-                        // 高代理：尝试与紧随的 \uXXXX 低代理组合为完整码点（UTF-16 代理对）
                         if (codePoint >= 0xD800 && codePoint <= 0xDBFF) {
                             if (m_idx + 6 <= m_len && m_str[m_idx] == '\\' && m_str[m_idx + 1] == 'u') {
                                 size_t lowIdx = m_idx + 2;
@@ -260,7 +255,6 @@ private:
                             }
                         }
 
-                        // Encode codePoint to UTF-8；非法孤立代理替换为 U+FFFD，避免产出非法 UTF-8
                         if (codePoint >= 0xD800 && codePoint <= 0xDFFF) {
                             outStr.push_back(static_cast<char>(0xEF));
                             outStr.push_back(static_cast<char>(0xBF));
@@ -305,7 +299,7 @@ public:
             outError = L"JSON 根节点必须为对象 '{'";
             return false;
         }
-        m_idx++; // skip '{'
+        m_idx++;
 
         while (true) {
             SkipWhitespace();
@@ -330,7 +324,7 @@ public:
             SkipWhitespace();
 
             if (key == "properties" && m_idx < m_len && m_str[m_idx] == '{') {
-                m_idx++; // skip '{'
+                m_idx++;
                 while (true) {
                     SkipWhitespace();
                     if (m_idx >= m_len) { outError = L"properties 缺少 '}'"; return false; }
@@ -349,7 +343,7 @@ public:
                         if (!ParseString(desc, outError)) return false;
                         prop.description = desc;
                     } else if (m_idx < m_len && m_str[m_idx] == '{') {
-                        m_idx++; // skip '{'
+                        m_idx++;
                         while (true) {
                             SkipWhitespace();
                             if (m_idx >= m_len) { outError = L"缺少 '}'"; return false; }
@@ -379,7 +373,7 @@ public:
                     if (m_idx < m_len && m_str[m_idx] == ',') m_idx++;
                 }
             } else if (key == "io" && m_idx < m_len && m_str[m_idx] == '{') {
-                m_idx++; // skip '{'
+                m_idx++;
                 while (true) {
                     SkipWhitespace();
                     if (m_idx >= m_len) { outError = L"io 缺少 '}'"; return false; }
@@ -421,7 +415,7 @@ public:
                     if (m_idx < m_len && m_str[m_idx] == ',') m_idx++;
                 }
             } else if (key == "classes" && m_idx < m_len && m_str[m_idx] == '{') {
-                m_idx++; // skip '{'
+                m_idx++;
                 while (true) {
                     SkipWhitespace();
                     if (m_idx >= m_len) { outError = L"classes 缺少 '}'"; return false; }
@@ -439,7 +433,7 @@ public:
                         if (!ParseString(cDesc, outError)) return false;
                         if (!cDesc.empty()) outOverride.classDescriptions[clsName] = cDesc;
                     } else if (m_idx < m_len && m_str[m_idx] == '{') {
-                        m_idx++; // skip '{'
+                        m_idx++;
                         while (true) {
                             SkipWhitespace();
                             if (m_idx >= m_len) { outError = L"缺少 '}'"; return false; }
@@ -457,7 +451,7 @@ public:
                                 if (!ParseString(cDesc, outError)) return false;
                                 if (!cDesc.empty()) outOverride.classDescriptions[clsName] = cDesc;
                             } else if (fName == "properties" && m_idx < m_len && m_str[m_idx] == '{') {
-                                m_idx++; // skip '{'
+                                m_idx++;
                                 while (true) {
                                     SkipWhitespace();
                                     if (m_idx >= m_len) return false;
@@ -510,7 +504,6 @@ public:
                     if (m_idx < m_len && m_str[m_idx] == ',') m_idx++;
                 }
             } else if (!key.empty() && key[0] != '_') {
-                // 顶层简写
                 if (m_idx < m_len && m_str[m_idx] == '"') {
                     std::string desc;
                     if (!ParseString(desc, outError)) return false;
@@ -567,7 +560,7 @@ static bool ReadFileToString(const std::wstring& path, std::string& outContent, 
     return true;
 }
 
-} // namespace
+}
 
 bool DictionaryCompiler::ParseJsoncStringToMaps(
     const std::string& jsonContent,
@@ -633,7 +626,6 @@ bool DictionaryCompiler::ParseJsoncFileToMaps(
     outCommon.clear();
     outScoped.clear();
 
-    // 1. 若提供了 fallback 字典，先加载 fallback 作为兜底层
     if (!fallbackJsonPath.empty() && fs::exists(fallbackJsonPath)) {
         std::string fbStr;
         std::wstring fbErr;
@@ -644,7 +636,6 @@ bool DictionaryCompiler::ParseJsoncFileToMaps(
         }
     }
 
-    // 2. 加载主字典覆盖/补充
     std::string jsonStr;
     if (!ReadFileToString(jsonPath, jsonStr, outError)) {
         return (!outCommon.empty() || !outScoped.empty());

@@ -4,12 +4,12 @@
 #include <tlhelp32.h>
 #include <filesystem>
 #include <algorithm>
+#include <system_error>
 #include <QSettings>
 #include <QDir>
 #include <QFileInfo>
 #include <QFileInfoList>
 #include <QFile>
-#include <QRegularExpression>
 #include <QString>
 #include <QStringList>
 
@@ -55,10 +55,57 @@ bool Cs2Detector::IsCs2ProcessRunning() {
 
 bool Cs2Detector::IsValidCs2Root(const std::wstring& rootPath) {
     if (rootPath.empty()) return false;
+    std::error_code ec;
     const fs::path bin = paths::Win64Bin(rootPath);
-    return fs::exists(bin / paths::kCs2Exe)
-        || fs::exists(bin / paths::kQt5CoreDll)
-        || fs::exists(bin);
+    return fs::is_regular_file(bin / paths::kCs2Exe, ec)
+        && fs::is_regular_file(bin / paths::kQt5CoreDll, ec);
+}
+
+std::wstring Cs2Detector::NormalizeCs2RootCandidate(const std::wstring& selectedPath) {
+    if (selectedPath.empty()) return L"";
+
+    std::error_code ec;
+    fs::path p = fs::path(selectedPath).lexically_normal();
+    while (p.has_filename() && p.filename().empty() && p.has_parent_path()) {
+        p = p.parent_path();
+    }
+
+    fs::path cur = p;
+    for (int up = 0; up < 4; ++up) {
+        if (IsValidCs2Root(cur.wstring())) {
+            return cur.wstring();
+        }
+        if (!cur.has_parent_path() || cur.parent_path() == cur) {
+            break;
+        }
+        cur = cur.parent_path();
+    }
+    return selectedPath;
+}
+
+bool Cs2Detector::CheckRunningProcess(std::wstring& outPath) {
+    const unsigned long pid = FindCs2ProcessId();
+    if (pid == 0) return false;
+
+    HANDLE hProcess = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, static_cast<DWORD>(pid));
+    if (hProcess == NULL) {
+        return false;
+    }
+
+    wchar_t exePath[MAX_PATH * 4] = {0};
+    DWORD size = static_cast<DWORD>(sizeof(exePath) / sizeof(exePath[0]));
+    const BOOL ok = QueryFullProcessImageNameW(hProcess, 0, exePath, &size);
+    CloseHandle(hProcess);
+    if (!ok || size == 0) {
+        return false;
+    }
+
+    fs::path root = fs::path(exePath).parent_path().parent_path().parent_path().parent_path();
+    if (IsValidCs2Root(root.wstring())) {
+        outPath = root.wstring();
+        return true;
+    }
+    return false;
 }
 
 std::wstring Cs2Detector::GetWin64BinDir(const std::wstring& cs2Root) {
@@ -126,26 +173,95 @@ bool Cs2Detector::CheckRegistryUninstall(std::wstring& outPath) {
     return false;
 }
 
-bool Cs2Detector::ParseSteamLibraryFolders(const std::wstring& vdfPath, std::vector<std::wstring>& outLibraries) {
-    // Steam VDF 为 UTF-8 文本
+bool Cs2Detector::ParseSteamLibraryFolders(const std::wstring& vdfPath, std::vector<SteamLibraryFolder>& outLibraries) {
     QFile file(QString::fromStdWString(vdfPath));
     if (!file.open(QIODevice::ReadOnly)) return false;
-    QString content = QString::fromUtf8(file.readAll());
+    const QString content = QString::fromUtf8(file.readAll());
     file.close();
 
-    // 匹配 "path" "..."
-    static const QRegularExpression pathRegex(
-        QStringLiteral("\"path\"\\s+\"([^\"]+)\""));
-    QRegularExpressionMatchIterator it = pathRegex.globalMatch(content);
-    while (it.hasNext()) {
-        // VDF 中路径分隔符写作转义的双反斜杠
-        QString p = it.next().captured(1).replace(
-            QStringLiteral("\\\\"),
-            QStringLiteral("\\"));
-        if (!p.isEmpty()) {
-            outLibraries.push_back(p.toStdWString());
+    int depth = 0;
+    bool inLibBlock = false;
+    bool inAppsBlock = false;
+    SteamLibraryFolder currentLib;
+    QString pendingKey;
+    QString lastAtom;
+
+    const int n = content.size();
+    int i = 0;
+    while (i < n) {
+        const QChar ch = content[i];
+        if (ch.isSpace()) {
+            ++i;
+            continue;
         }
+        if (ch == '/' && i + 1 < n && content[i + 1] == '/') {
+            while (i < n && content[i] != '\n') ++i;
+            continue;
+        }
+        if (ch == '{') {
+            if (depth == 1) {
+                inLibBlock = true;
+                currentLib = SteamLibraryFolder{};
+            } else if (depth == 2 && inLibBlock && lastAtom.compare(QStringLiteral("apps"), Qt::CaseInsensitive) == 0) {
+                inAppsBlock = true;
+            }
+            pendingKey.clear();
+            lastAtom.clear();
+            ++depth;
+            ++i;
+            continue;
+        }
+        if (ch == '}') {
+            if (depth == 3 && inAppsBlock) {
+                inAppsBlock = false;
+            } else if (depth == 2 && inLibBlock) {
+                if (!currentLib.path.empty()) {
+                    outLibraries.push_back(currentLib);
+                }
+                inLibBlock = false;
+            }
+            pendingKey.clear();
+            lastAtom.clear();
+            if (depth > 0) --depth;
+            ++i;
+            continue;
+        }
+        if (ch == '"') {
+            ++i;
+            QString token;
+            while (i < n) {
+                const QChar c = content[i];
+                if (c == '\\' && i + 1 < n) {
+                    token.append(content[i + 1]);
+                    i += 2;
+                    continue;
+                }
+                if (c == '"') {
+                    ++i;
+                    break;
+                }
+                token.append(c);
+                ++i;
+            }
+
+            if (pendingKey.isEmpty()) {
+                pendingKey = token;
+                lastAtom = token;
+            } else {
+                if (depth == 2 && inLibBlock
+                    && pendingKey.compare(QStringLiteral("path"), Qt::CaseInsensitive) == 0) {
+                    currentLib.path = token.trimmed().toStdWString();
+                } else if (depth == 3 && inAppsBlock && pendingKey == QStringLiteral("730")) {
+                    currentLib.hasCs2App = true;
+                }
+                pendingKey.clear();
+                lastAtom.clear();
+            }
+            continue;
+        }
+        ++i;
     }
+
     return !outLibraries.empty();
 }
 
@@ -171,28 +287,42 @@ bool Cs2Detector::CheckRegistrySteam(std::wstring& outPath) {
 
     if (steamPath.isEmpty()) return false;
 
-    std::wstring wSteamPath = steamPath.toStdWString();
-    fs::path vdfPath = fs::path(wSteamPath) / paths::kSteamAppsDir / paths::kLibraryFoldersVdf;
-    std::vector<std::wstring> libraries;
-    libraries.push_back(wSteamPath);
+    const std::wstring wSteamPath = steamPath.toStdWString();
+    const fs::path vdfPath = fs::path(wSteamPath) / paths::kSteamAppsDir / paths::kLibraryFoldersVdf;
+    std::vector<SteamLibraryFolder> libraries;
 
     if (fs::exists(vdfPath)) {
         ParseSteamLibraryFolders(vdfPath.wstring(), libraries);
     }
 
-    for (const auto& lib : libraries) {
-        fs::path cand = fs::path(lib) / paths::kSteamAppsDir / paths::kCommonDir / paths::kCs2InstallDir;
+    auto tryLibrary = [&outPath](const std::wstring& libPath) -> bool {
+        const fs::path cand = fs::path(libPath) / paths::kSteamAppsDir / paths::kCommonDir / paths::kCs2InstallDir;
         if (IsValidCs2Root(cand.wstring())) {
             outPath = cand.wstring();
             return true;
         }
+        return false;
+    };
+
+    for (const auto& lib : libraries) {
+        if (lib.hasCs2App && tryLibrary(lib.path)) {
+            return true;
+        }
+    }
+
+    for (const auto& lib : libraries) {
+        if (!lib.hasCs2App && tryLibrary(lib.path)) {
+            return true;
+        }
+    }
+    if (tryLibrary(wSteamPath)) {
+        return true;
     }
 
     return false;
 }
 
 bool Cs2Detector::CheckCommonDrivePaths(std::wstring& outPath) {
-    // 盘符根目录下的 Steam 常见安装位置，统一拼上 steamapps/common/<CS2 安装目录名>
     const wchar_t* steamRoots[] = {
         L"SteamLibrary",
         L"Program Files (x86)\\Steam",
@@ -201,7 +331,6 @@ bool Cs2Detector::CheckCommonDrivePaths(std::wstring& outPath) {
         L"Games\\SteamLibrary"
     };
 
-    // 枚举系统全部盘符，替代硬编码的 C:~H:
     const QFileInfoList drives = QDir::drives();
     for (const QFileInfo& drive : drives) {
         QString drivePath = drive.absoluteFilePath();
@@ -221,6 +350,7 @@ bool Cs2Detector::CheckCommonDrivePaths(std::wstring& outPath) {
 }
 
 bool Cs2Detector::DetectCs2(std::wstring& outCs2Root) {
+    if (CheckRunningProcess(outCs2Root)) return true;
     if (CheckRegistryUninstall(outCs2Root)) return true;
     if (CheckRegistrySteam(outCs2Root)) return true;
     if (CheckCommonDrivePaths(outCs2Root)) return true;

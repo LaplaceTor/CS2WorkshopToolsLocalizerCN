@@ -136,7 +136,6 @@ bool __fastcall hk_ReadFileToBuffer(
         }
     }
 
-    // JIT 即时兜底：如果缓存还未就绪，现场翻译
     if (!found) {
         EnsureFgdDictLoaded();
         char* pRawData = nullptr;
@@ -208,7 +207,7 @@ int __fastcall hk_V_stricmp_fast(const char* s1, const char* s2) {
     return res;
 }
 
-} // namespace
+}
 
 bool MatchFgdStringPair(const char* s1, const char* s2) {
     if (!s1 || !s2) return false;
@@ -480,4 +479,4 @@ bool TryHookFileSystem() {
     return ok;
 }
 
-} // namespace qm
+}

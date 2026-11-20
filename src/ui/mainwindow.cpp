@@ -1,9 +1,6 @@
 #include "ui/mainwindow.h"
 
-// MainWindow 只依赖 Service 层与少量「无业务逻辑」的 core 设施：
-//   - path_constants.h：纯路径常量（文件监视列表等）
-//   - launcher_config.h：启动器自身设置的读写入口
-// 进程探测、备份状态、词典模板等一律经由 Service，不再直接触碰 core。
+#include "core/cs2_detector.h"
 #include "core/launcher_config.h"
 #include "core/path_constants.h"
 #include "service/dictionary_service.h"
@@ -27,6 +24,7 @@
 #include <QTextEdit>
 #include <QStatusBar>
 #include <QMessageBox>
+#include <QFileDialog>
 #include <QDateTime>
 #include <QCloseEvent>
 #include <QApplication>
@@ -46,10 +44,7 @@
 
 namespace fs = std::filesystem;
 
-
 MainWindow::MainWindow(const std::wstring& cs2Root, QWidget *parent)
-    // 注意：初始化顺序必须与 mainwindow.h 中的声明顺序一致，
-    // 否则 MSVC 会报 C5038（-Wreorder）。调整成员声明位置时请同步改这里。
     : QMainWindow(parent)
     , m_cs2Root(cs2Root)
     , m_useMachineTransCheck(nullptr)
@@ -62,7 +57,6 @@ MainWindow::MainWindow(const std::wstring& cs2Root, QWidget *parent)
     , m_hammerService(new HammerService(this))
     , m_updateService(new UpdateService(this))
 {
-    // 获取程序所在目录作为工作目录
     QString appDir = QApplication::applicationDirPath();
 
     if (!appDir.isEmpty()) {
@@ -80,6 +74,11 @@ MainWindow::MainWindow(const std::wstring& cs2Root, QWidget *parent)
     setupUi();
     populateAddons();
     loadSettings();
+
+    if (m_changePathBtn) {
+        connect(m_changePathBtn, &QPushButton::clicked,
+                this, &MainWindow::onChangeCs2PathClicked);
+    }
 
     connect(m_injectBtn, &QPushButton::clicked,
             this, &MainWindow::onInjectClicked);
@@ -218,15 +217,12 @@ MainWindow::MainWindow(const std::wstring& cs2Root, QWidget *parent)
         "#f8f8f2"
     );
 
-    // 词典缺失时自动生成带范例的模板
     for (const QString& notice : DictionaryService::ensureTemplates(m_workingDir)) {
         appendLog("[i] " + notice, "#66d9ef");
     }
 
-    // 检查上一次是否异常退出并执行安全恢复
     checkAndRecoverAbnormalExit();
 
-    // 写入程序目录指针供注入模块直读，并挂载词典文件自动热重载监听
     LocalizationService::WriteAppDirPointer(
         m_cs2Root,
         m_workingDir,
@@ -235,10 +231,8 @@ MainWindow::MainWindow(const std::wstring& cs2Root, QWidget *parent)
 
     setupFileWatcher();
 
-    // 根据恢复后的实际状态刷新按钮
     updateActionButtonState();
 
-    // 启动后异步检查一次程序版本与在线词典更新（不阻塞界面展示）
     QTimer::singleShot(300, this, &MainWindow::startStartupUpdateCheck);
 }
 
@@ -261,7 +255,6 @@ void MainWindow::setupUi() {
     mainLayout->setContentsMargins(12, 12, 12, 12);
     mainLayout->setSpacing(8);
 
-    // 1. 顶部 CS2 路径信息卡片
     QGroupBox* pathGroup =
         new QGroupBox("CS2 路径信息", centralWidget);
 
@@ -286,11 +279,15 @@ void MainWindow::setupUi() {
         Qt::TextSelectableByMouse
     );
 
-    pathLayout->addWidget(m_cs2PathLabel);
+    m_changePathBtn = new QPushButton("更改...", pathGroup);
+    m_changePathBtn->setToolTip("手动指定并锁定 Counter-Strike 2 根目录");
+    m_changePathBtn->setFixedWidth(64);
+
+    pathLayout->addWidget(m_cs2PathLabel, 1);
+    pathLayout->addWidget(m_changePathBtn);
 
     mainLayout->addWidget(pathGroup);
 
-    // 2. 参数与 Addon 选择卡片
     QGroupBox* configGroup =
         new QGroupBox("启动配置", centralWidget);
 
@@ -406,13 +403,11 @@ void MainWindow::setupUi() {
 
     mainLayout->addWidget(configGroup);
 
-    // 3. 操作按钮栏
     QVBoxLayout* btnLayout =
         new QVBoxLayout();
 
     btnLayout->setSpacing(6);
 
-    // 操作网格（第一行：仅注入 / 启动 HAMMER / 还原；第二行：在线更新 / 字典指南 / 调试监控）
     QGridLayout* actionGridLayout =
         new QGridLayout();
 
@@ -421,7 +416,6 @@ void MainWindow::setupUi() {
     actionGridLayout->setColumnStretch(1, 1);
     actionGridLayout->setColumnStretch(2, 1);
 
-    // 仅注入
     m_injectBtn =
         new QPushButton(
             "仅注入",
@@ -446,19 +440,16 @@ void MainWindow::setupUi() {
 
     m_injectBtn->setStyleSheet(MakeButtonStyle("#8957e5", "#a371f7", "#6e40b8", 5));
 
-    // 启动 HAMMER
     m_launchBtn = new QPushButton("启动 HAMMER 汉化版", centralWidget);
     m_launchBtn->setMinimumHeight(36);
     m_launchBtn->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Preferred);
     m_launchBtn->setStyleSheet(MakeButtonStyle("#2ea043", "#3fb950", "#238636", 5));
 
-    // 还原
     m_restoreBtn = new QPushButton("还原", centralWidget);
     m_restoreBtn->setMinimumHeight(36);
     m_restoreBtn->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Preferred);
     m_restoreBtn->setStyleSheet(MakeButtonStyle("#444c56", "#545d68", "#373e47", 5, "#adbac7"));
 
-    // 第二行：在线更新 / 字典指南 / 调试监控
     m_updateBtn = new QPushButton("🌐 更新在线翻译", centralWidget);
     m_updateBtn->setMinimumHeight(28);
     m_updateBtn->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Preferred);
@@ -479,19 +470,16 @@ void MainWindow::setupUi() {
         "QPushButton:pressed { background-color: #161b22; }"
     );
 
-    // 第一行添加至网格
     actionGridLayout->addWidget(m_injectBtn, 0, 0);
     actionGridLayout->addWidget(m_launchBtn, 0, 1);
     actionGridLayout->addWidget(m_restoreBtn, 0, 2);
 
-    // 第二行添加至网格
     actionGridLayout->addWidget(m_updateBtn, 1, 0);
     actionGridLayout->addWidget(m_helpBtn, 1, 1);
     actionGridLayout->addWidget(m_debugBtn, 1, 2);
 
     btnLayout->addLayout(actionGridLayout);
 
-    // 第三行：运行中实时联动控制与词典编辑器 (对齐 3x3 网格)
     m_toggleLangBtn = new QPushButton("🔀 切换原文 / 翻译", centralWidget);
     m_toggleLangBtn->setMinimumHeight(28);
     m_toggleLangBtn->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Preferred);
@@ -520,7 +508,6 @@ void MainWindow::setupUi() {
 
     mainLayout->addLayout(btnLayout);
 
-    // 4. 实时日志视窗
     QGroupBox* logGroup =
         new QGroupBox(
             "执行日志与状态",
@@ -560,7 +547,6 @@ void MainWindow::setupUi() {
         1
     );
 
-    // 5. 底部状态栏
     m_statusLabel =
         new QLabel(
             "状态: 就绪",
@@ -601,19 +587,16 @@ void MainWindow::populateAddons() {
 void MainWindow::loadSettings() {
     const LauncherSettings saved = LauncherConfig::Load(m_workingDir);
 
-    // 恢复附加启动参数（若为空则使用默认值 -gpuraytracing）
     if (saved.launchArgs.trimmed().isEmpty()) {
         m_argsEdit->setText("-gpuraytracing");
     } else {
         m_argsEdit->setText(saved.launchArgs);
     }
 
-    // 恢复使用机翻设置
     if (m_useMachineTransCheck) {
         m_useMachineTransCheck->setChecked(saved.useMachineTrans);
     }
 
-    // 恢复选择的目标 Addon：先精确匹配，再退化为「名称 + 空格」前缀匹配
     int index = -1;
     if (!saved.selectedAddon.isEmpty() && !HammerService::isExcludedAddon(saved.selectedAddon)) {
         index = m_addonCombo->findText(saved.selectedAddon);
@@ -640,11 +623,66 @@ void MainWindow::loadSettings() {
 
 void MainWindow::saveSettings() {
     LauncherSettings settings;
+    settings.cs2Root         = QString::fromStdWString(m_cs2Root);
     settings.selectedAddon   = hasValidSelectedAddon() ? LauncherConfig::NormalizeAddonName(m_addonCombo->currentText()) : QString();
     settings.launchArgs      = m_argsEdit->text();
     settings.useMachineTrans = machineTranslationEnabled();
 
     LauncherConfig::Save(m_workingDir, settings);
+}
+
+void MainWindow::onChangeCs2PathClicked() {
+    if (m_workerBusy || m_hammerService->isRunning()) {
+        return;
+    }
+
+    const QString initialDir = QString::fromStdWString(m_cs2Root);
+    const QString picked = QFileDialog::getExistingDirectory(
+        this,
+        "选择 Counter-Strike Global Offensive 安装目录",
+        initialDir
+    );
+    if (picked.isEmpty()) {
+        return;
+    }
+
+    const std::wstring normalized = Cs2Detector::NormalizeCs2RootCandidate(picked.toStdWString());
+    if (!Cs2Detector::IsValidCs2Root(normalized)) {
+        QMessageBox::warning(
+            this,
+            "目录无效",
+            "所选目录中未找到有效的 game/bin/win64/cs2.exe 与 Qt5Core.dll，请重新选择。"
+        );
+        return;
+    }
+
+    if (normalized == m_cs2Root) {
+        return;
+    }
+
+    m_cs2Root = normalized;
+    if (m_cs2PathLabel) {
+        m_cs2PathLabel->setText(QString::fromStdWString(m_cs2Root));
+    }
+
+    m_lastValidationMs = 0;
+    m_cachedValidationValid = false;
+
+    saveSettings();
+    populateAddons();
+    loadSettings();
+    checkAndRecoverAbnormalExit();
+    LocalizationService::WriteAppDirPointer(
+        m_cs2Root,
+        m_workingDir,
+        machineTranslationEnabled()
+    );
+    updateActionButtonState();
+
+    appendLog(
+        QString("[i] 已切换并锁定 CS2 安装目录: %1").arg(QString::fromStdWString(m_cs2Root)),
+        "#66d9ef"
+    );
 }
 
 bool MainWindow::hasValidSelectedAddon() const {
@@ -663,7 +701,6 @@ void MainWindow::appendLog(
     const QString& color
 ) {
     if (QThread::currentThread() != this->thread()) {
-        // worker 线程调用：封送至 UI 线程执行（若窗口已销毁则自动丢弃）
         QMetaObject::invokeMethod(
             this,
             [this, msg, color]() {
@@ -703,8 +740,6 @@ bool MainWindow::runHeavyInWorker(const std::function<bool()>& task) {
 
     m_workerBusy = true;
 
-    // QtConcurrent + QFutureWatcher + QEventLoop：
-    // 任务在全局线程池执行，UI 线程事件循环保持响应，完成后再取回结果
     QFutureWatcher<bool> watcher;
     QEventLoop loop;
     QObject::connect(
@@ -725,6 +760,9 @@ bool MainWindow::runHeavyInWorker(const std::function<bool()>& task) {
 void MainWindow::setUiBusy(bool busy) {
     m_updateBtn->setEnabled(!busy);
     m_addonCombo->setEnabled(!busy);
+    if (m_changePathBtn) {
+        m_changePathBtn->setEnabled(!busy && !m_hammerService->isRunning());
+    }
     if (m_newAddonBtn) {
         m_newAddonBtn->setEnabled(!busy && !m_hammerService->isRunning());
     }
@@ -745,18 +783,10 @@ void MainWindow::setUiBusy(bool busy) {
 bool MainWindow::isPatchDeployedAndValid() {
     const LocalizationService::Context ctx{m_cs2Root, m_workingDir};
 
-    // 轻量判断：备份是否存在 + 补丁文件 / 会话标记二选一（不涉及校验和）。
-    // "当前是否已注入"的判定规则归 LocalizationService 所有，UI 只取结论。
     if (!LocalizationService::IsPatchDeployed(ctx)) {
         return false;
     }
 
-    /*
-     * 备份一致性校验内含 4 次全文件 SHA256（cs2.exe / Qt5Core / 备份 Qt5Core），
-     * 属于重 IO：这里只做上面那次轻量判断，重量级校验放后台异步执行并缓存结果
-     * （15 秒有效期），校验完成后再刷新一次按钮状态。
-     * 校验未到达期间沿用缓存值（初始为 false，保守视为未注入）。
-     */
     const qint64 nowMs = QDateTime::currentMSecsSinceEpoch();
     if (!m_validationPending &&
         (m_lastValidationMs == 0 || nowMs - m_lastValidationMs > 15000)) {
@@ -774,12 +804,10 @@ bool MainWindow::isPatchDeployedAndValid() {
                 m_lastValidationMs = QDateTime::currentMSecsSinceEpoch();
                 watcher->deleteLater();
 
-                // 校验结果到达后刷新按钮状态
                 updateActionButtonState();
             }
         );
 
-        // ctx 按值捕获：worker 线程不得引用 UI 侧的任何状态
         watcher->setFuture(
             QtConcurrent::run([ctx]() -> bool {
                 return LocalizationService::IsBackupMatching(ctx);
@@ -792,6 +820,10 @@ bool MainWindow::isPatchDeployedAndValid() {
 
 void MainWindow::updateActionButtonState() {
     const bool hammerRunning = m_hammerService->isRunning();
+
+    if (m_changePathBtn) {
+        m_changePathBtn->setEnabled(!m_workerBusy && !hammerRunning);
+    }
 
     if (m_toggleLangBtn) {
         m_toggleLangBtn->setEnabled(hammerRunning);
@@ -807,7 +839,6 @@ void MainWindow::updateActionButtonState() {
     }
 
     if (hammerRunning) {
-        // HAMMER 运行中：三个核心按钮全部禁用
         m_injectBtn->setEnabled(false);
         m_launchBtn->setEnabled(false);
         m_restoreBtn->setEnabled(false);
@@ -830,7 +861,6 @@ void MainWindow::updateActionButtonState() {
     bool injected =
         isPatchDeployedAndValid();
 
-    // 已注入 -> 禁止再次注入
     m_injectBtn->setEnabled(!injected);
 
     if (injected) {
@@ -843,7 +873,6 @@ void MainWindow::updateActionButtonState() {
         );
     }
 
-    // 检查是否存在可用且合法的 Addon 项目
     const bool validAddon = hasValidSelectedAddon();
 
     if (m_newAddonBtn) {
@@ -856,7 +885,6 @@ void MainWindow::updateActionButtonState() {
             "当前无可用 Addon 项目可移除");
     }
 
-    // 启动 HAMMER：
     if (!validAddon) {
         m_launchBtn->setEnabled(false);
         m_launchBtn->setToolTip(
@@ -875,7 +903,6 @@ void MainWindow::updateActionButtonState() {
         }
     }
 
-    // 未注入 -> 禁止还原
     m_restoreBtn->setEnabled(injected);
 
     if (injected) {
@@ -894,7 +921,6 @@ bool MainWindow::machineTranslationEnabled() const {
 }
 
 bool MainWindow::injectLocalization() {
-    // 在 UI 线程读取控件状态，随后转入后台线程执行核心流程（核心流程禁止访问任何 UI 控件）
     const bool useMachineTrans = machineTranslationEnabled();
 
     return runHeavyInWorker([this, useMachineTrans]() {
@@ -939,7 +965,6 @@ void MainWindow::onInjectClicked() {
         return;
     }
 
-    // 二次状态校验，避免状态变化后重复注入
     if (isPatchDeployedAndValid()) {
         QMessageBox::information(
             this,
@@ -1084,7 +1109,6 @@ void MainWindow::onLaunchClicked() {
         "状态: 正在启动 HAMMER..."
     );
 
-    // 读取 UI 上的 Addon 与附加参数后交给 Service 执行启动
     HammerService::LaunchParams params;
     params.cs2Root    = m_cs2Root;
     params.workingDir = m_workingDir;
@@ -1120,6 +1144,9 @@ void MainWindow::onLaunchClicked() {
     m_launchBtn->setEnabled(false);
     m_restoreBtn->setEnabled(false);
     m_updateBtn->setEnabled(false);
+    if (m_changePathBtn) {
+        m_changePathBtn->setEnabled(false);
+    }
 }
 
 void MainWindow::onHammerStarted(qint64 pid) {
@@ -1486,7 +1513,6 @@ void MainWindow::onRestoreClicked() {
         return;
     }
 
-    // 必须处于有效的“已注入”状态
     if (!isPatchDeployedAndValid()) {
         QMessageBox::information(
             this,
@@ -1519,8 +1545,6 @@ void MainWindow::onRestoreClicked() {
         "状态: 正在还原原版文件..."
     );
 
-    // 版本校验（含多次全文件 SHA256）与还原一并放入后台线程，避免 UI 冻结；
-    // 校验结论与拒绝原因由 LocalizationService 回传
     const LocalizationService::Context ctx{m_cs2Root, m_workingDir};
 
     QString rejectReason;
@@ -1560,7 +1584,6 @@ void MainWindow::onRestoreClicked() {
     }
 
     if (!restoreOk && decision == RestoreCheck::RejectedOther && !rejectReason.isEmpty()) {
-        // 备份状态不允许安全还原（无清单/读取失败等）
         QMessageBox::warning(
             this,
             "无法还原",
@@ -1632,7 +1655,6 @@ void MainWindow::checkAndRecoverAbnormalExit() {
         "#fd971f"
     );
 
-    // 检查 CS2 是否仍在运行
     while (
         LocalizationService::IsCs2Running()
     ) {
@@ -1837,7 +1859,6 @@ void MainWindow::closeEvent(
     }
 
     if (m_workerBusy) {
-        // 后台正在执行备份/还原/注入等 IO 操作，此时销毁窗口会导致任务中断
         QMessageBox::warning(
             this,
             "请稍候",
@@ -1849,31 +1870,10 @@ void MainWindow::closeEvent(
         return;
     }
 
-    // 保存当前用户配置
     saveSettings();
 
-    /*
-     * 注意：
-     *
-     * 现在“仅注入”是一个独立操作。
-     *
-     * 因此关闭启动器时，不自动还原。
-     *
-     * 只有：
-     *
-     * 1. 手动点击“还原”
-     * 2. HAMMER 正常退出后的自动还原
-     * 3. 下次启动时的异常退出恢复
-     *
-     * 才会执行 RestoreAll。
-     *
-     * 这样用户可以：
-     *
-     * 仅注入 -> 关闭启动器 -> 保持补丁处于已注入状态。
-     */
     event->accept();
 }
-
 
 void MainWindow::onToggleLangClicked() {
     if (m_hammerService->sendToggleLanguage()) {
@@ -2039,7 +2039,6 @@ void MainWindow::onNewAddonClicked() {
     dlg.exec();
 }
 
-
 void MainWindow::onRemoveAddonClicked() {
     if (m_hammerService->isRunning()) {
         QMessageBox::warning(this, "警告", "Hammer 正在运行中，无法移除项目！");
@@ -2124,7 +2123,7 @@ void MainWindow::setupFileWatcher() {
     m_fileWatcher = new QFileSystemWatcher(this);
     m_hotReloadDebounceTimer = new QTimer(this);
     m_hotReloadDebounceTimer->setSingleShot(true);
-    m_hotReloadDebounceTimer->setInterval(300); // 300ms 防抖
+    m_hotReloadDebounceTimer->setInterval(300);
 
     connect(m_fileWatcher, &QFileSystemWatcher::fileChanged,
             this, &MainWindow::onWatchedFileChanged);
@@ -2153,12 +2152,11 @@ void MainWindow::setupFileWatcher() {
 }
 
 void MainWindow::onWatchedFileChanged(const QString& path) {
-    // 编辑器（如 VSCode/Notepad++）保存时可能采用原子替换机制，重新挂载监视路径
     if (m_fileWatcher && !m_fileWatcher->files().contains(path) && QFile::exists(path)) {
         m_fileWatcher->addPath(path);
     }
     if (m_hotReloadDebounceTimer) {
-        m_hotReloadDebounceTimer->start(); // 重启 300ms 防抖计时
+        m_hotReloadDebounceTimer->start();
     }
 }
 
@@ -2166,10 +2164,8 @@ void MainWindow::onDebouncedHotReload() {
     fs::path transDir = fs::path(m_workingDir) / paths::kTranslationsDir;
     fs::path parentTransDir = fs::path(m_workingDir) / L".." / paths::kTranslationsDir;
 
-    // 若在源码/开发目录中编辑了上层 translations，自动同步至当前程序运行目录
     LocalizationService::SyncDictionariesFromParent(m_workingDir);
 
-    // 重新挂载可能因原子写入丢失的监视路径
     QStringList filesToWatch;
     auto addDictFiles = [&](const fs::path& dir) {
         for (const wchar_t* fn : paths::kAllDictFiles) {
@@ -2192,7 +2188,6 @@ void MainWindow::onDebouncedHotReload() {
         return;
     }
 
-    // 防抖与编辑器操作节流：若 1000ms 内刚刚完成过编辑器的主动热重载，避免重复打扰
     qint64 now = QDateTime::currentMSecsSinceEpoch();
     if (now - m_lastEditorReloadTick < 1000) {
         return;
@@ -2205,10 +2200,8 @@ void MainWindow::onDebouncedHotReload() {
 bool MainWindow::performHotReload(bool silent) {
     const bool useMachineTrans = machineTranslationEnabled();
 
-    // 1. 刷新路径指针（同步机翻兜底标志）
     LocalizationService::WriteAppDirPointer(m_cs2Root, m_workingDir, useMachineTrans);
 
-    // 2. 镜像同步 Qt 词典、通过 IPC 通知运行中的 Hammer 刷新（纯内存预编译 FGD 与界面重绘）
     const HammerService::ReloadResult result =
         m_hammerService->reloadDictionaries(m_cs2Root, m_workingDir, useMachineTrans);
 
@@ -2253,7 +2246,7 @@ void MainWindow::onDictEditorClicked() {
         m_dictEditorWindow = new DictionaryEditorWindow(
             m_dictEditorService,
             [this]() { return machineTranslationEnabled(); },
-            nullptr // 独立非模态窗口
+            nullptr
         );
     }
     m_dictEditorWindow->show();

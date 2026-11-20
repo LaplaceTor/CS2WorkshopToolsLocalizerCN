@@ -11,16 +11,15 @@
 namespace qm {
 
 enum class TranslationSource {
-    StaticUI,       // QMetaObject::tr, QAction, QAbstractButton, QLabel, QWidget::setWindowTitle, QGroupBox::setTitle
-    ItemWidget,     // QTableWidgetItem, QListWidgetItem, QTreeWidgetItem, QComboBox
-    Painter         // QPainter::drawText
+    StaticUI,
+    ItemWidget,
+    Painter
 };
 
-// 预扫描调用者模块地址区间快照（100% 纯无锁 Lock-Free Snapshot，VEH / Hook 绝对安全）
 struct ModuleRangeEntry {
     uintptr_t base;
     uintptr_t end;
-    wchar_t stem[32]; // 固定长度 POD，无堆分配，支持安全并发复制
+    wchar_t stem[32];
 };
 
 constexpr size_t MAX_CACHED_MODULE_RANGES = 128;
@@ -30,16 +29,13 @@ struct ModuleRangeSnapshot {
     ModuleRangeEntry entries[MAX_CACHED_MODULE_RANGES];
 };
 
-// 获取 CS2 根二进制目录 (game/bin/win64/)
 std::wstring GetBinDirectory();
 
-// 从 binDir/localizer_appdir.txt 读取启动器工作目录与机翻开关
 bool ReadAppDirPointer(const std::wstring& binDir,
                        std::wstring& outAppDir,
                        bool& outUseMachineTrans,
                        std::wstring* outPointerPath = nullptr);
 
-// 模块地址与快照查询管理
 bool GetCallerModuleName(void* callerAddr, wchar_t* outStem, size_t stemMaxLen);
 bool ResolveCallerModuleName(void* directCallerAddr, wchar_t* outStem, size_t stemMaxLen);
 bool AddModuleRange(HMODULE hMod, const std::wstring& overrideStem = L"");
@@ -47,27 +43,22 @@ bool RemoveModuleRangeByBase(uintptr_t base);
 void InvalidateUnloadedModules();
 void ScanKnownToolModules();
 
-// 词典引擎生命周期与控制
 void LoadMasterTranslations();
 void EnsureDictionaryLoaded();
 void ClearAllTranslations();
 bool IsTranslationEnabled();
 void SetTranslationEnabled(bool enabled);
 
-// 核心翻译查询接口
 bool FindTranslationScoped(void* callerAddr, const char* text, std::string& outResult, TranslationSource source = TranslationSource::StaticUI);
 bool FindTranslationScopedW(void* callerAddr, const wchar_t* wstr, std::string& outResult, TranslationSource source = TranslationSource::StaticUI);
 
-// 反向翻译（还原英文）
 bool FindReverseTranslationScoped(void* callerAddr, const char* text, std::string& outResult);
 bool FindReverseTranslationScopedW(void* callerAddr, const wchar_t* wstr, std::string& outResult);
 
-// 文件路径与文件名保护检测
 bool IsFilePathOrIdentifier(const std::string& s);
 
-// FGD 输入/输出 (I/O) 标识符保护（防止在列表/下拉框/绘制中被误译为中文导致实体找不到目标输入）
 void RegisterProtectedFgdIoNames(const std::vector<std::string>& names);
 void ExtractAndRegisterFgdIoNames(const std::string& fgdContent);
 bool IsProtectedFgdIoName(const std::string& s);
 
-} // namespace qm
+}

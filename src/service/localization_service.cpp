@@ -74,9 +74,6 @@ bool LocalizationService::Inject(const Context& ctx, bool useMachineTrans, const
         );
     }
 
-    // ==========================================
-    // STEP 1: 原版备份
-    // ==========================================
     log(
         "[1/3] 正在校验游戏版本并准备原版备份...",
         "#e6db74"
@@ -105,8 +102,6 @@ bool LocalizationService::Inject(const Context& ctx, bool useMachineTrans, const
             "#fd971f"
         );
 
-        // 二次哈希确认：Steam 更新进行中时文件哈希会不稳定，
-        // 避免把半更新状态的游戏文件定格为"纯净原版备份"（此时运行于 worker 线程，可安全等待）
         log(
             "[*] 疑似游戏更新，2 秒后进行二次哈希确认...",
             "#66d9ef"
@@ -177,9 +172,6 @@ bool LocalizationService::Inject(const Context& ctx, bool useMachineTrans, const
         "#a6e22e"
     );
 
-    // ==========================================
-    // STEP 2: FGD 汉化引擎准备 (纯内存模式)
-    // ==========================================
     log(
         "[2/3] 正在准备 FGD 纯内存汉化引擎...",
         "#e6db74"
@@ -192,10 +184,8 @@ bool LocalizationService::Inject(const Context& ctx, bool useMachineTrans, const
         );
     }
 
-    // 写入应用程序目录与机翻状态指针文件，供注入模块读取词典
     WriteAppDirPointer(ctx.cs2Root, ctx.workingDir, useMachineTrans);
 
-    // 检查并恢复可能存在的旧版本残留磁盘翻译 FGD 文件，确保 CS2 磁盘目录 100% 保持官方原版纯净
     size_t restoredOldFgd = 0;
     try {
         if (fs::exists(backupDir)) {
@@ -226,9 +216,6 @@ bool LocalizationService::Inject(const Context& ctx, bool useMachineTrans, const
         "#a6e22e"
     );
 
-    // ==========================================
-    // STEP 3: Qt Patch
-    // ==========================================
     log(
         "[3/3] 正在部署 Qt 汉化模块并修补 Qt5Core.dll...",
         "#e6db74"
@@ -268,7 +255,6 @@ bool LocalizationService::Inject(const Context& ctx, bool useMachineTrans, const
             return false;
         }
 
-        // 修补 Qt5Core.dll
         fs::path backupQtCore = paths::Qt5Core(backupDir);
 
         fs::path targetQtCore =
@@ -312,12 +298,6 @@ bool LocalizationService::Inject(const Context& ctx, bool useMachineTrans, const
         return false;
     }
 
-    /*
-     * 注入成功后记录 session_state。
-     *
-     * 这样即使用户之后直接关闭启动器，
-     * 下次启动依然可以知道当前目录没有被还原。
-     */
     if (!BackupManager::SaveSessionState(
             ctx.workingDir,
             true
@@ -335,8 +315,6 @@ bool LocalizationService::Inject(const Context& ctx, bool useMachineTrans, const
 
     return true;
 }
-
-// ---------------------------------------------------------------------------
 
 bool LocalizationService::Restore(const Context& ctx, bool showLog, const LogSink& log) {
     fs::path workPath(ctx.workingDir);
@@ -389,8 +367,6 @@ bool LocalizationService::Restore(const Context& ctx, bool showLog, const LogSin
     return true;
 }
 
-// ---------------------------------------------------------------------------
-
 RestoreCheck LocalizationService::CheckRestore(const Context& ctx, QString* reason) {
     const auto validation = BackupManager::BackupMatchesCurrentGame(
         ctx.cs2Root,
@@ -431,15 +407,12 @@ bool LocalizationService::HasBackup(const Context& ctx) {
 }
 
 bool LocalizationService::IsPatchDeployed(const Context& ctx) {
-    // 没有备份，不认为当前处于有效的已注入状态
     if (!HasBackup(ctx)) {
         return false;
     }
 
-    // session_state 是否标记为已注入
     const bool sessionPatched = BackupManager::HasUnrestoredSession(ctx.workingDir);
 
-    // CS2 目录中是否存在实际补丁文件
     const bool patchFilesPresent = BackupManager::IsPatchDeployed(ctx.cs2Root);
 
     return sessionPatched || patchFilesPresent;

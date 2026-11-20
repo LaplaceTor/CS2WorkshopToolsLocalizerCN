@@ -99,7 +99,6 @@ FileLines ReadLines(const std::wstring& filePath, std::string& err) {
 
 #include <windows.h>
 
-// 检查索引 idx 处的双引号是否被转义（考虑前面连续反斜杠奇偶性）
 bool IsQuoteEscaped(const std::string& s, size_t idx) {
     if (idx == 0 || s[idx] != '\"') return false;
     size_t slashCount = 0;
@@ -111,7 +110,6 @@ bool IsQuoteEscaped(const std::string& s, size_t idx) {
     return (slashCount % 2) != 0;
 }
 
-// 在字符串中查找不在双引号内的 // 注释起始位置
 size_t FindCommentOutsideStrings(const std::string& line) {
     bool inString = false;
     for (size_t i = 0; i < line.size(); ++i) {
@@ -162,7 +160,6 @@ bool WriteLines(const std::wstring& filePath, const FileLines& fl, std::string& 
     return true;
 }
 
-// 查找模块作用域的行范围 [startLine, endLine]
 bool FindModuleBounds(const std::vector<std::string>& lines, const std::string& module, size_t& outStart, size_t& outEnd) {
     std::string targetMod = "\"" + module + "\"";
     for (size_t i = 0; i < lines.size(); ++i) {
@@ -173,7 +170,6 @@ bool FindModuleBounds(const std::vector<std::string>& lines, const std::string& 
             if (colon != std::string::npos) {
                 size_t brace = line.find('{', colon);
                 if (brace != std::string::npos) {
-                    // 找到起始行，开始括号深度匹配
                     outStart = i;
                     int depth = 0;
                     for (size_t j = i; j < lines.size(); ++j) {
@@ -184,7 +180,7 @@ bool FindModuleBounds(const std::vector<std::string>& lines, const std::string& 
                                 inString = !inString;
                             } else if (!inString) {
                                 if (c == '/' && k + 1 < lines[j].size() && lines[j][k + 1] == '/') {
-                                    break; // 行注释忽略
+                                    break;
                                 }
                                 if (c == '{') depth++;
                                 else if (c == '}') {
@@ -204,7 +200,6 @@ bool FindModuleBounds(const std::vector<std::string>& lines, const std::string& 
     return false;
 }
 
-// 检查行是否是纯注释或空行
 bool IsEmptyOrCommentLine(const std::string& line) {
     size_t i = 0;
     while (i < line.size() && (line[i] == ' ' || line[i] == '\t')) i++;
@@ -213,19 +208,16 @@ bool IsEmptyOrCommentLine(const std::string& line) {
     return false;
 }
 
-// 在指定行范围内查找包含 key 的键值对行
 bool FindKeyLine(const std::vector<std::string>& lines, size_t startLine, size_t endLine, const std::string& escapedKey, size_t& outLine) {
     std::string targetKey = "\"" + escapedKey + "\"";
     for (size_t i = startLine; i <= endLine && i < lines.size(); ++i) {
         const auto& line = lines[i];
         size_t keyPos = line.find(targetKey);
         if (keyPos != std::string::npos) {
-            // 确保不是注释内部
             size_t commentPos = FindCommentOutsideStrings(line);
             if (commentPos != std::string::npos && commentPos < keyPos) {
                 continue;
             }
-            // 确保后面紧跟冒号
             size_t colonPos = line.find(':', keyPos + targetKey.size());
             if (colonPos != std::string::npos) {
                 outLine = i;
@@ -236,13 +228,11 @@ bool FindKeyLine(const std::vector<std::string>& lines, size_t startLine, size_t
     return false;
 }
 
-// 移除行尾有效字符处的逗号（保留行末注释与空白）
 void RemoveTrailingComma(std::string& line) {
     size_t commentPos = FindCommentOutsideStrings(line);
     std::string commentPart = (commentPos != std::string::npos) ? line.substr(commentPos) : "";
     std::string codePart = (commentPos != std::string::npos) ? line.substr(0, commentPos) : line;
 
-    // 从后往前找 codePart 的最后一个非空白字符
     int lastIdx = static_cast<int>(codePart.size()) - 1;
     while (lastIdx >= 0 && (codePart[lastIdx] == ' ' || codePart[lastIdx] == '\t')) {
         lastIdx--;
@@ -254,7 +244,6 @@ void RemoveTrailingComma(std::string& line) {
     line = codePart + commentPart;
 }
 
-// 确保行尾有效字符处带有逗号（保留行末注释与空白）
 void EnsureTrailingComma(std::string& line) {
     size_t commentPos = FindCommentOutsideStrings(line);
     std::string commentPart = (commentPos != std::string::npos) ? line.substr(commentPos) : "";
@@ -270,7 +259,7 @@ void EnsureTrailingComma(std::string& line) {
     line = codePart + commentPart;
 }
 
-} // namespace
+}
 
 UpdateResult UpdateEntry(
     const std::wstring& filePath,
@@ -299,7 +288,6 @@ UpdateResult UpdateEntry(
         return {false, "未在词典中找到键: \"" + key + "\""};
     }
 
-    // 就地仅替换 value 双引号内的内容
     std::string& line = fl.lines[keyLine];
     std::string targetKey = "\"" + escapedKey + "\"";
     size_t keyPos = line.find(targetKey);
@@ -313,7 +301,6 @@ UpdateResult UpdateEntry(
         return {false, "解析键值对行值引号失败: " + line};
     }
 
-    // 寻找匹配的闭合引号（跳过转义 \"，考虑双反斜杠）
     size_t valQuoteEnd = std::string::npos;
     for (size_t i = valQuoteStart + 1; i < line.size(); ++i) {
         if (line[i] == '\"' && !IsQuoteEscaped(line, i)) {
@@ -349,19 +336,15 @@ UpdateResult AddEntry(
     std::string escapedKey = EscapeJsonString(key);
     std::string escapedVal = EscapeJsonString(value);
 
-    // 1. 若指定了模块分组
     if (!module.empty()) {
         size_t modStart = 0;
         size_t modEnd = 0;
         if (FindModuleBounds(fl.lines, module, modStart, modEnd)) {
-            // 模块已存在，检查是否已存在同名 key
             size_t existLine = 0;
             if (FindKeyLine(fl.lines, modStart, modEnd, escapedKey, existLine)) {
-                // 已存在则转为更新
                 return UpdateEntry(filePath, module, key, value);
             }
 
-            // 在 modEnd 闭合括号前找最后一个有效非空行
             int lastValidLine = -1;
             for (int i = static_cast<int>(modEnd) - 1; i >= static_cast<int>(modStart); --i) {
                 if (!IsEmptyOrCommentLine(fl.lines[i])) {
@@ -374,7 +357,6 @@ UpdateResult AddEntry(
                 EnsureTrailingComma(fl.lines[lastValidLine]);
             }
 
-            // 获取前一行的缩进
             std::string indent = "    ";
             if (lastValidLine >= 0) {
                 const auto& prev = fl.lines[lastValidLine];
@@ -386,7 +368,6 @@ UpdateResult AddEntry(
             std::string newEntryLine = indent + "\"" + escapedKey + "\": \"" + escapedVal + "\"";
             fl.lines.insert(fl.lines.begin() + modEnd, newEntryLine);
         } else {
-            // 模块不存在：在根闭合 } 前追加新模块块
             int rootCloseLine = -1;
             for (int i = static_cast<int>(fl.lines.size()) - 1; i >= 0; --i) {
                 if (fl.lines[i].find('}') != std::string::npos) {
@@ -398,7 +379,6 @@ UpdateResult AddEntry(
                 return {false, "未找到 JSON 根对象闭合括号 '}'"};
             }
 
-            // 前一个有效非空行补逗号
             int lastValid = -1;
             for (int i = rootCloseLine - 1; i >= 0; --i) {
                 if (!IsEmptyOrCommentLine(fl.lines[i])) {
@@ -418,7 +398,6 @@ UpdateResult AddEntry(
             fl.lines.insert(fl.lines.begin() + rootCloseLine, modBlock.begin(), modBlock.end());
         }
     } else {
-        // 全局对象（如 FGD 或全局 Fallback）
         int rootCloseLine = -1;
         for (int i = static_cast<int>(fl.lines.size()) - 1; i >= 0; --i) {
             if (fl.lines[i].find('}') != std::string::npos) {
@@ -430,7 +409,6 @@ UpdateResult AddEntry(
             return {false, "未找到 JSON 根对象闭合括号 '}'"};
         }
 
-        // 检查是否已有该 key
         size_t existLine = 0;
         if (FindKeyLine(fl.lines, 0, rootCloseLine, escapedKey, existLine)) {
             return UpdateEntry(filePath, "", key, value);
@@ -483,7 +461,6 @@ UpdateResult DeleteEntry(
         return {false, "未在词典中找到欲删除的键: \"" + key + "\""};
     }
 
-    // 检查此行是否带有尾随逗号
     bool deletedLineHadComma = false;
     {
         size_t cPos = FindCommentOutsideStrings(fl.lines[keyLine]);
@@ -495,11 +472,8 @@ UpdateResult DeleteEntry(
         }
     }
 
-    // 删除键值对行
     fl.lines.erase(fl.lines.begin() + keyLine);
 
-    // 如果被删除的行原本没有逗号（说明它是块内最后一个条目），
-    // 那么现在处于它前面的最后一个有效条目不应该带有逗号！
     if (!deletedLineHadComma && keyLine > 0) {
         int prevValid = -1;
         for (int i = static_cast<int>(keyLine) - 1; i >= static_cast<int>(start); --i) {
@@ -520,4 +494,4 @@ UpdateResult DeleteEntry(
     return {true, ""};
 }
 
-} // namespace dict_updater
+}

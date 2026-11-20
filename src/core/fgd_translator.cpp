@@ -18,10 +18,6 @@
 
 namespace fs = std::filesystem;
 
-// ==============================================================================
-// 字典加载与解析（使用 Qt 原生 QJsonDocument 解析）
-// ==============================================================================
-
 bool FgdTranslator::LoadDictionary(const std::wstring& jsonPath, std::unordered_map<std::string, std::string>& outDict, const std::wstring& fallbackJsonPath) {
     outDict.clear();
 
@@ -51,12 +47,10 @@ bool FgdTranslator::LoadDictionary(const std::wstring& jsonPath, std::unordered_
         return true;
     };
 
-    // 1. 若提供了 fallback 字典，先载入作为兜底
     if (!fallbackJsonPath.empty() && fs::exists(fallbackJsonPath)) {
         loadSingleJson(fallbackJsonPath);
     }
 
-    // 2. 载入主字典，覆盖/补充 fallback
     loadSingleJson(jsonPath);
 
     return !outDict.empty();
@@ -182,12 +176,6 @@ std::string FgdTranslator::TranslateLine(
     return FgdCore::TranslateLine(line, dict, overrideData, state);
 }
 
-
-
-// ==============================================================================
-// 确保字典文件存在 (模板自动生成)
-// ==============================================================================
-
 bool FgdTranslator::EnsureFgdDictionaryExists(const std::wstring& jsonPath, const std::wstring& fallbackCachePath, std::wstring& outNotice) {
     fs::path p(jsonPath);
     if (fs::exists(p)) {
@@ -204,7 +192,6 @@ bool FgdTranslator::EnsureFgdDictionaryExists(const std::wstring& jsonPath, cons
         fs::create_directories(p.parent_path(), ec);
     }
 
-    // 数据体由 QJsonDocument 组装输出，转义交给 Qt 处理
     QJsonObject entries;
     if (loaded.empty()) {
         entries["Omnidirectional point light"] = "全向点光源";
@@ -227,7 +214,6 @@ bool FgdTranslator::EnsureFgdDictionaryExists(const std::wstring& jsonPath, cons
         return false;
     }
 
-    // 注释版使用指南作为字面量直接写出（QJsonDocument 仅负责数据体）
     static const char kGuideHeader[] = R"(// ==============================================================================
 // CS2 Hammer FGD 实体定义翻译字典 (JSONC 格式)
 // ==============================================================================
@@ -277,7 +263,6 @@ bool FgdTranslator::EnsureFgdOverrideDictionaryExists(const std::wstring& jsonPa
         fs::create_directories(p.parent_path(), ec);
     }
 
-    // 示例数据由 QJsonDocument 组装输出
     QJsonObject properties;
     properties["bodygroups"] = "设置模型的子部件与可选身体部件网格组合。";
     properties["vscripts"] = "实体生成后自动加载并执行的 VScript 脚本文件列表。";
@@ -322,7 +307,6 @@ bool FgdTranslator::EnsureFgdOverrideDictionaryExists(const std::wstring& jsonPa
         return false;
     }
 
-    // 注释版使用指南作为字面量直接写出（QJsonDocument 仅负责数据体）
     static const char kGuideHeader[] = R"(// ==============================================================================
 // CS2 FGD 实体键值描述补充与覆盖字典 (JSONC 格式)
 // ==============================================================================
@@ -370,7 +354,6 @@ bool FgdTranslator::EnsureQtDictionaryExists(const std::wstring& jsonPath, const
         fs::create_directories(p.parent_path(), ec);
     }
 
-    // 数据体由 QJsonDocument 组装输出，转义交给 Qt 处理
     QJsonObject entries;
     if (loaded.empty()) {
         entries["File"] = "文件";
@@ -402,7 +385,6 @@ bool FgdTranslator::EnsureQtDictionaryExists(const std::wstring& jsonPath, const
         return false;
     }
 
-    // 注释版使用指南作为字面量直接写出（QJsonDocument 仅负责数据体）
     static const char kGuideHeader[] = R"(// ==============================================================================
 // CS2 Hammer 界面与菜单核心翻译字典 (JSONC 格式)
 // ==============================================================================

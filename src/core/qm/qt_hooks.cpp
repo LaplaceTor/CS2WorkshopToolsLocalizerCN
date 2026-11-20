@@ -15,9 +15,6 @@ extern "C" __declspec(dllexport) bool InitializeTranslator();
 
 namespace {
 
-// ==============================================================================
-// 1. Qt 核心函数指针定义 (MSVC x64 C++ ABI)
-// ==============================================================================
 typedef void* (__fastcall *fnQMetaObject_tr)(const void* pMetaObject, void* pOutQString, const char* sourceText, const char* disambiguation, int n);
 typedef void* (__fastcall *fnQString_fromUtf8)(void* pOutQString, const char* utf8, int size);
 typedef const wchar_t* (__fastcall *fnQString_utf16)(const void* pQString);
@@ -54,7 +51,6 @@ typedef void* (__fastcall *fnQTableWidgetItem_ctor)(void* pItem, const void* pQS
 typedef void (__fastcall *fnQTableWidgetItem_setText)(void* pItem, const void* pQString);
 typedef void* (__fastcall *fnQListWidgetItem_ctor)(void* pItem, const void* pQString, void* pListWidget, int type);
 typedef void (__fastcall *fnQListWidgetItem_setText)(void* pItem, const void* pQString);
-// QFlags<Qt::ItemFlag> flags() const 在 MSVC x64 ABI 下通过 RDX 隐藏 sret 指针返回 int 值
 typedef int* (__fastcall *fnItem_flags)(const void* pItem, int* pOutFlags);
 
 typedef void (__fastcall *fnQComboBox_addItem)(void* pBox, const void* pQString, const void* pUserData);
@@ -74,7 +70,6 @@ typedef void (__fastcall *fnQPainter_drawText_xy)(void* pPainter, int x, int y, 
 typedef void (__fastcall *fnQTextDocument_setPlainText)(void* pDoc, const void* pQString);
 typedef void (__fastcall *fnQTextDocument_setHtml)(void* pDoc, const void* pQString);
 
-// 原函数指针存储
 fnQMetaObject_tr g_o_QMetaObject_tr = nullptr;
 fnQAction_ctor g_o_QAction_ctor = nullptr;
 fnQAction_ctor_icon g_o_QAction_ctor_icon = nullptr;
@@ -246,9 +241,6 @@ __forceinline void ForwardTranslatedQString(void* caller, const void* pQString,
     forward(pQString);
 }
 
-// -----------------------------------------------------------------------------
-// 钩子转发函数
-// -----------------------------------------------------------------------------
 void __fastcall hk_QPainter_drawText_Rect(void* pPainter, const void* pRect, int flags, const void* pQString, void* pBoundingRect) {
     void* caller = _ReturnAddress();
     ForwardTranslatedQString(caller, pQString, TranslationSource::Painter, [&](const void* text) {
@@ -531,7 +523,6 @@ inline bool SafeIsItemEditable(fnItem_flags pfn, const void* pItem) {
     __try {
         int flags = 0;
         pfn(pItem, &flags);
-        // Qt::ItemIsEditable == 0x2
         return (flags & 0x2) != 0;
     } __except (EXCEPTION_EXECUTE_HANDLER) {
         return false;
@@ -759,7 +750,7 @@ void ScanWindowTreeForReloadAction() {
     }, 0);
 }
 
-} // namespace
+}
 
 bool InitializeQtCoreHooks() {
     HMODULE hQtCore = GetModuleHandleW(L"Qt5Core.dll");
@@ -977,4 +968,4 @@ extern "C" __declspec(dllexport) void* __fastcall tr(const void* pMetaObject, vo
     return hk_QMetaObject_tr(pMetaObject, pOutQString, sourceText, disambiguation, n);
 }
 
-} // namespace qm
+}
