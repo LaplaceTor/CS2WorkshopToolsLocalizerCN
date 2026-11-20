@@ -12,12 +12,10 @@
 namespace fs = std::filesystem;
 
 int main(int argc, char *argv[]) {
-    // 启用高 DPI 缩放支持
     QApplication app(argc, argv);
     app.setApplicationName("CS2WorkshopToolsLocalizerCN");
     app.setOrganizationName("CS2TranslationTools");
 
-    // 显式指定全局默认字体链：优先现代中文字体，紧接着挂载 Emoji 字体保证跨环境 Emoji 与中文渲染统一
     QFont globalFont;
     globalFont.setFamilies({
         "Microsoft YaHei UI",
@@ -29,10 +27,9 @@ int main(int argc, char *argv[]) {
     globalFont.setPointSize(9);
     app.setFont(globalFont);
 
-    // 设置全局现代暗色调样式
     app.setStyle(QStyleFactory::create("Fusion"));
 
-    // 1. 确定工作目录并优先读取已保存的 CS2 根目录（防止重启后扫描漂移）
+    // 优先使用 config.ini 中已锁定的 CS2 路径，避免重启后扫描漂移
     std::wstring workingDir;
     const QString appDir = QApplication::applicationDirPath();
     if (!appDir.isEmpty()) {
@@ -57,12 +54,10 @@ int main(int argc, char *argv[]) {
         }
     }
 
-    // 未保存或保存路径已失效时，执行自动探测
     if (!detected) {
         detected = Cs2Detector::DetectCs2(cs2Root);
     }
 
-    // 自动探测仍失败时，允许用户手动指定 CS2 安装目录
     while (!detected || cs2Root.empty()) {
         QMessageBox msgBox;
         msgBox.setIcon(QMessageBox::Critical);
@@ -77,7 +72,7 @@ int main(int argc, char *argv[]) {
         msgBox.exec();
 
         if (msgBox.clickedButton() != pickBtn || msgBox.clickedButton() == exitBtn) {
-            return 1; // 终止程序；失败路径必须返回非零，否则脚本/CI 会误判为成功
+            return 1;
         }
 
         const QString picked = QFileDialog::getExistingDirectory(
@@ -100,14 +95,12 @@ int main(int argc, char *argv[]) {
         }
     }
 
-    // 将确认后的有效路径持久化到 config.ini，避免下次启动重新漂移
     const QString resolvedCs2Root = QString::fromStdWString(cs2Root);
     if (!workingDir.empty() && savedSettings.cs2Root != resolvedCs2Root) {
         savedSettings.cs2Root = resolvedCs2Root;
         LauncherConfig::Save(workingDir, savedSettings);
     }
 
-    // 2. 检测到 CS2，加载主窗口
     MainWindow mainWindow(cs2Root);
     mainWindow.show();
 

@@ -67,7 +67,6 @@ std::wstring Cs2Detector::NormalizeCs2RootCandidate(const std::wstring& selected
 
     std::error_code ec;
     fs::path p = fs::path(selectedPath).lexically_normal();
-    // 去掉末尾分隔符，避免 parent_path() 返回空或自身
     while (p.has_filename() && p.filename().empty() && p.has_parent_path()) {
         p = p.parent_path();
     }
@@ -178,13 +177,12 @@ bool Cs2Detector::CheckRegistryUninstall(std::wstring& outPath) {
 }
 
 bool Cs2Detector::ParseSteamLibraryFolders(const std::wstring& vdfPath, std::vector<SteamLibraryFolder>& outLibraries) {
-    // Steam VDF 为 UTF-8 文本
     QFile file(QString::fromStdWString(vdfPath));
     if (!file.open(QIODevice::ReadOnly)) return false;
     const QString content = QString::fromUtf8(file.readAll());
     file.close();
 
-    // 轻量 VDF 词法扫描：按大括号层级识别每个库块中的 "path" 与 "apps" -> "730"
+    // 按大括号层级解析每个库块的 "path" 与 "apps" -> "730"
     int depth = 0;
     bool inLibBlock = false;
     bool inAppsBlock = false;
@@ -200,7 +198,6 @@ bool Cs2Detector::ParseSteamLibraryFolders(const std::wstring& vdfPath, std::vec
             ++i;
             continue;
         }
-        // 跳过 // 注释
         if (ch == '/' && i + 1 < n && content[i + 1] == '/') {
             while (i < n && content[i] != '\n') ++i;
             continue;
@@ -255,7 +252,6 @@ bool Cs2Detector::ParseSteamLibraryFolders(const std::wstring& vdfPath, std::vec
                 pendingKey = token;
                 lastAtom = token;
             } else {
-                // 已凑成一组 key -> value
                 if (depth == 2 && inLibBlock
                     && pendingKey.compare(QStringLiteral("path"), Qt::CaseInsensitive) == 0) {
                     currentLib.path = token.trimmed().toStdWString();
