@@ -7,8 +7,6 @@
 #include <algorithm>
 #include <initializer_list>
 
-
-
 std::optional<size_t> PePatcher::RvaToFileOffset(
     const IMAGE_NT_HEADERS64* nt,
     DWORD rva,
@@ -40,7 +38,6 @@ std::optional<size_t> PePatcher::RvaToFileOffset(
 
         if (rva64 >= secBegin && rva64 < secEnd) {
             uint64_t offsetInSec = rva64 - secBegin;
-            // 确保请求的偏移与长度完整落在文件的物理 raw data 范围内
             if (offsetInSec >= secRawSize) {
                 return std::nullopt;
             }
@@ -60,27 +57,18 @@ std::optional<size_t> PePatcher::RvaToFileOffset(
 
 namespace {
 
-// ===========================================================================
-// PE 补丁相关常量
-// 此前这些值以裸数字与魔法字符串形式散落在 PatchQtCore 与各探测函数里，
-// 现在集中定义，改 PE 布局时只需动这一处。
-// ===========================================================================
-constexpr WORD        kMaxSections          = 96;      // NumberOfSections 合理上限（PE 规范上限）
-constexpr uint64_t    kCaveAlignment        = 16;      // Code Cave 起始地址对齐粒度
+constexpr WORD        kMaxSections          = 96;
+constexpr uint64_t    kCaveAlignment        = 16;
 constexpr uint64_t    kMaxRva32             = 0xFFFFFFFFULL;
-constexpr int         kMaxImportThunks      = 4096;    // 单个导入描述符最多扫描的 thunk 数
+constexpr int         kMaxImportThunks      = 4096;
 constexpr size_t      kMaxImportDllNameLen  = 128;
 constexpr size_t      kMaxImportFuncNameLen = 64;
 constexpr size_t      kMaxExportSymNameLen  = 128;
-constexpr char        kLclzMagic[5]         = "LCLZ";  // 补丁元数据魔数
-constexpr uint32_t    kPatchVersion         = 3;       // v3: 无状态纯 EAT 重定向，零 .data 污染，无 EntryPoint 劫持
+constexpr char        kLclzMagic[5]         = "LCLZ";
+constexpr uint32_t    kPatchVersion         = 3;
 constexpr const char* kTrExportSymbol       = "?tr@QMetaObject@@QEBA?AVQString@@PEBD0H@Z";
 constexpr const char* kInjectDllName        = "qtcore_qm.dll";
 constexpr const char* kInjectEntryName      = "tr";
-
-// ---------------------------------------------------------------------------
-// 基础小工具
-// ---------------------------------------------------------------------------
 
 bool HasLclzMagic(const PatchHeader* header) {
     return header != nullptr && std::memcmp(header->magic, kLclzMagic, 4) == 0;
@@ -98,7 +86,6 @@ const IMAGE_SECTION_HEADER* FindSection(
     return nullptr;
 }
 
-// Code Cave 起始 RVA：节区虚拟末尾向上对齐到 kCaveAlignment
 uint64_t CaveRvaOf(const IMAGE_SECTION_HEADER* sec) {
     const uint64_t endRva = static_cast<uint64_t>(sec->VirtualAddress)
                           + static_cast<uint64_t>(sec->Misc.VirtualSize);
@@ -132,9 +119,6 @@ void EmitDisp32(std::vector<uint8_t>& code, int32_t disp) {
     code.insert(code.end(), p, p + sizeof(disp));
 }
 
-// 追加一条「opcode + rel32 位移」指令。
-// instrTotalLen 为该指令总长度（含 4 字节位移字段），用于推算下一条指令起始 RVA。
-// 此前这段样板在 PatchQtCore 里被复制了 13 次，每处都在手算 RVA 并做指针强转。
 bool EmitRel32(std::vector<uint8_t>& code, DWORD codeBaseRva,
                std::initializer_list<uint8_t> opcode, size_t instrTotalLen,
                uint64_t targetRva, const wchar_t* ctx, std::wstring& outError)
@@ -149,7 +133,6 @@ bool EmitRel32(std::vector<uint8_t>& code, DWORD codeBaseRva,
     return true;
 }
 
-// 回填已发射的短跳转指令（0x74 xx）的 8 位位移，fromIdx 为 opcode 下标
 bool BackfillRel8(std::vector<uint8_t>& code, size_t fromIdx, size_t targetIdx,
                   const wchar_t* ctx, std::wstring& outError) {
     return ComputeRel8(targetIdx, fromIdx + 2, code[fromIdx + 1], ctx, outError);
@@ -180,10 +163,6 @@ bool ReadWholeFile(const std::wstring& path, const wchar_t* openFailMsg,
     return true;
 }
 
-// ---------------------------------------------------------------------------
-// 1. PE 结构解析
-// ---------------------------------------------------------------------------
-
 struct PeImage {
     const IMAGE_NT_HEADERS64* nt = nullptr;
     size_t ntOffset = 0;
@@ -193,7 +172,6 @@ struct PeImage {
     const IMAGE_SECTION_HEADER* data = nullptr;
 };
 
-// 严格校验 DOS / NT / Optional 头与节表，并定位 .text 与 .data
 bool ParsePeImage(const SafePeReader& reader, size_t fileSize, PeImage& out, std::wstring& outError) {
     const IMAGE_DOS_HEADER* dosHeader = reader.ReadStruct<IMAGE_DOS_HEADER>(0);
     if (!dosHeader || dosHeader->e_magic != IMAGE_DOS_SIGNATURE) {
@@ -259,7 +237,6 @@ bool ParsePeImage(const SafePeReader& reader, size_t fileSize, PeImage& out, std
 
     const IMAGE_SECTION_HEADER* sections = IMAGE_FIRST_SECTION(nt);
     for (WORD i = 0; i < numSections; ++i) {
-        // 校验每个 section 的物理映射范围合法性
         if (sections[i].SizeOfRawData > 0) {
             if (!reader.InBounds(sections[i].PointerToRawData, sections[i].SizeOfRawData)) {
                 outError = L"节区数据范围超出文件物理边界";
@@ -286,10 +263,6 @@ bool ParsePeImage(const SafePeReader& reader, size_t fileSize, PeImage& out, std
     return true;
 }
 
-// ---------------------------------------------------------------------------
-// 2. 恢复原始入口点与 QMetaObject::tr 的 RVA
-//    （重复打补丁时从 LCLZ v3 补丁头还原）
-// ---------------------------------------------------------------------------
 void RestoreOriginalEntryPoint(
     const SafePeReader& reader,
     const PeImage& img,
@@ -313,10 +286,6 @@ void RestoreOriginalEntryPoint(
         }
     }
 }
-
-// ---------------------------------------------------------------------------
-// 3. 导入表：定位 KERNEL32 的 LoadLibraryA / GetProcAddress 在 IAT 中的 RVA
-// ---------------------------------------------------------------------------
 
 struct ImportSlots {
     DWORD loadLibraryA = 0;
@@ -411,12 +380,8 @@ bool ResolveImportSlots(const SafePeReader& reader, const PeImage& img,
     return true;
 }
 
-// ---------------------------------------------------------------------------
-// 4. 导出表：定位 ?tr@QMetaObject 条目及其在 EAT 中的文件偏移
-// ---------------------------------------------------------------------------
-
 struct TrExportSlot {
-    size_t eatFileOffset = 0;   // EAT 中该条目所在的文件偏移，用于改写函数 RVA
+    size_t eatFileOffset = 0;
 };
 
 bool ResolveTrExport(const SafePeReader& reader, const PeImage& img,
@@ -486,13 +451,6 @@ bool ResolveTrExport(const SafePeReader& reader, const PeImage& img,
     return true;
 }
 
-// ---------------------------------------------------------------------------
-// 5. 内存布局计算
-//
-// [.text 节，严格保持只读可执行 RX，绝不改为可写，零 .data 污染]
-//   PatchHeader("LCLZ", v3) | "qtcore_qm.dll\0" | "tr\0" | trShellcode
-// ---------------------------------------------------------------------------
-
 struct CaveLayout {
     DWORD headerRva = 0;
     DWORD dllNameRva = 0;
@@ -522,13 +480,6 @@ bool PrepareCaveLayout(const PeImage& img, std::vector<uint8_t>& buffer,
     return true;
 }
 
-// ---------------------------------------------------------------------------
-// 6. 构建 QMetaObject::tr 的无状态延迟引导 Shellcode (LCLZ v3)
-//    - 脱离 Loader Lock 首次调用时动态引导注入 DLL
-//    - 纯栈保护寄存器与易失寄存器，维持 16 字节栈对齐
-//    - 零 .data 持久状态存储，完全避免对宿主模块全局内存的踩踏
-//    - 加载失败立即通过 int 3 (0xCC) 断点中断严格拦截
-// ---------------------------------------------------------------------------
 bool BuildTrShellcode(const CaveLayout& layout, const ImportSlots& imports,
                       DWORD codeStartRva, DWORD origTrRva,
                       std::vector<uint8_t>& out, std::wstring& outError)
@@ -536,84 +487,59 @@ bool BuildTrShellcode(const CaveLayout& layout, const ImportSlots& imports,
     (void)origTrRva;
     out.clear();
 
-    // 1. 保护入参寄存器与调用者易失寄存器 (push rax, rcx, rdx, r8, r9)
-    // 5 次 push = 40 字节。
-    // 进入函数时，CALL 指令压入了 8 字节 Return Address (此时 RSP 为 8 mod 16)；
-    // 5 次 push 后，RSP 相对原调用点偏移 48 字节，正好满足 16 字节对齐 (0 mod 16)。
     const uint8_t pushRegs[] = { 0x50, 0x51, 0x52, 0x41, 0x50, 0x41, 0x51 };
     out.insert(out.end(), pushRegs, pushRegs + sizeof(pushRegs));
 
-    // 2. 分配 32 字节影子空间 (Shadow Space): sub rsp, 0x20 (仍保持 16 字节对齐)
     const uint8_t subRsp[] = { 0x48, 0x83, 0xec, 0x20 };
     out.insert(out.end(), subRsp, subRsp + sizeof(subRsp));
 
-    // 3. LoadLibraryA("qtcore_qm.dll")
-    // lea rcx, [rip + dllNameDisp]
     if (!EmitRel32(out, codeStartRva, { 0x48, 0x8d, 0x0d }, 7, layout.dllNameRva,
                    L"trShellcode dllName", outError)) return false;
-    // call qword ptr [rip + loadLibIatDisp]
     if (!EmitRel32(out, codeStartRva, { 0xff, 0x15 }, 6, imports.loadLibraryA,
                    L"trShellcode iatLoadLib", outError)) return false;
 
-    // test rax, rax
     const uint8_t testRax[] = { 0x48, 0x85, 0xc0 };
     out.insert(out.end(), testRax, testRax + sizeof(testRax));
 
-    // jz fail_fast (短跳转 0x74，位移稍后回填)
     const size_t jzLoadFail = out.size();
     out.push_back(0x74);
     out.push_back(0x00);
 
-    // 4. GetProcAddress(hDll, "tr")
-    // mov rcx, rax
     const uint8_t movRcxRax[] = { 0x48, 0x89, 0xc1 };
     out.insert(out.end(), movRcxRax, movRcxRax + sizeof(movRcxRax));
 
-    // lea rdx, [rip + funcNameDisp]
     if (!EmitRel32(out, codeStartRva, { 0x48, 0x8d, 0x15 }, 7, layout.funcNameRva,
                    L"trShellcode funcName", outError)) return false;
-    // call qword ptr [rip + getProcIatDisp]
     if (!EmitRel32(out, codeStartRva, { 0xff, 0x15 }, 6, imports.getProcAddress,
                    L"trShellcode iatGetProc", outError)) return false;
 
     out.insert(out.end(), testRax, testRax + sizeof(testRax));
 
-    // jz fail_fast (短跳转 0x74，位移稍后回填)
     const size_t jzGetProcFail = out.size();
     out.push_back(0x74);
     out.push_back(0x00);
 
-    // 5. 保存目标函数指针到易失寄存器 r11 (mov r11, rax)
     const uint8_t movR11Rax[] = { 0x49, 0x89, 0xc3 };
     out.insert(out.end(), movR11Rax, movR11Rax + sizeof(movR11Rax));
 
-    // 6. 恢复栈空间与入参寄存器
     const uint8_t addRsp[] = { 0x48, 0x83, 0xc4, 0x20 };
     out.insert(out.end(), addRsp, addRsp + sizeof(addRsp));
 
-    // pop r9, r8, rdx, rcx, rax
     const uint8_t popRegs[] = { 0x41, 0x59, 0x41, 0x58, 0x5a, 0x59, 0x58 };
     out.insert(out.end(), popRegs, popRegs + sizeof(popRegs));
 
-    // 7. 跳转至目标函数: jmp r11 (41 ff e3)
-    // 此时栈顶正好是原始调用者的返回地址，且第 5 参数 [RSP+0x28] 保持原样透传
     const uint8_t jmpR11[] = { 0x41, 0xff, 0xe3 };
     out.insert(out.end(), jmpR11, jmpR11 + sizeof(jmpR11));
 
-    // 8. 严格报错熔断拦截点 (fail_fast: int 3)
     const size_t failFastIdx = out.size();
     if (!BackfillRel8(out, jzLoadFail, failFastIdx, L"trShellcode jzLoadFail", outError)) return false;
     if (!BackfillRel8(out, jzGetProcFail, failFastIdx, L"trShellcode jzGetProcFail", outError)) return false;
 
-    // int 3 (0xCC) 立即触发调试中断，坚决暴露部署环境丢失模块问题
     out.push_back(0xcc);
 
     return true;
 }
 
-// ---------------------------------------------------------------------------
-// 8. 原子落盘：先写临时文件再整体替换，避免中断产生半写损坏
-// ---------------------------------------------------------------------------
 bool CommitPatchedFile(const std::vector<uint8_t>& buffer, const std::wstring& dstPath,
                        std::wstring& outError)
 {
@@ -641,13 +567,8 @@ bool CommitPatchedFile(const std::vector<uint8_t>& buffer, const std::wstring& d
     return true;
 }
 
-} // namespace
+}
 
-// ===========================================================================
-// 主流程：读文件 → 校验 PE → 还原原始入口 → 解析 IAT/EAT → 计算布局
-//          → 生成两端 Shellcode → 写回 → 原子落盘
-// （各步骤的具体实现见上方匿名命名空间中的专职函数）
-// ===========================================================================
 bool PePatcher::PatchQtCore(const std::wstring& srcDllPath, const std::wstring& dstDllPath, std::wstring& outError) {
     std::vector<uint8_t> buffer;
     if (!ReadWholeFile(srcDllPath, L"无法打开源 Qt5Core.dll: ", buffer, outError)) {
@@ -661,7 +582,6 @@ bool PePatcher::PatchQtCore(const std::wstring& srcDllPath, const std::wstring& 
         return false;
     }
 
-    // Code Cave 起始 RVA（使用 64 位整型运算防止溢出）
     const uint64_t textEndRva = static_cast<uint64_t>(img.text->VirtualAddress)
                               + static_cast<uint64_t>(img.text->Misc.VirtualSize);
     const uint64_t caveRva64 = CaveRvaOf(img.text);
@@ -671,7 +591,6 @@ bool PePatcher::PatchQtCore(const std::wstring& srcDllPath, const std::wstring& 
     }
     const DWORD caveRva = static_cast<DWORD>(caveRva64);
 
-    // 还原真实入口点与 QMetaObject::tr RVA（支持重复打补丁与历史旧补丁）
     DWORD origEntryPointRva = img.nt->OptionalHeader.AddressOfEntryPoint;
     DWORD origTrRva = 0;
     RestoreOriginalEntryPoint(reader, img, buffer, textEndRva, caveRva, origEntryPointRva, origTrRva);
@@ -696,7 +615,6 @@ bool PePatcher::PatchQtCore(const std::wstring& srcDllPath, const std::wstring& 
         return false;
     }
 
-    // 校验 Code Cave 是否超出 .text 节大小与文件边界
     const DWORD totalCaveBytesNeeded = (layout.trCodeStartRva - caveRva) + static_cast<DWORD>(trShellcode.size());
     auto optCaveWriteOff = RvaToFileOffset(img.nt, caveRva, buffer.size(), totalCaveBytesNeeded);
     if (!optCaveWriteOff) {
@@ -725,11 +643,7 @@ bool PePatcher::PatchQtCore(const std::wstring& srcDllPath, const std::wstring& 
     std::memcpy(buffer.data() + caveOff + (layout.funcNameRva - caveRva), funcName.c_str(), funcNameLen);
     std::memcpy(buffer.data() + trCodeStartOff, trShellcode.data(), trShellcode.size());
 
-    // 注意：OptionalHeader.AddressOfEntryPoint 完全保持官方原生原样，绝对不修改！
-    // 仅更新导出表中 ?tr@QMetaObject 指向延迟引导 Shellcode
     *reinterpret_cast<DWORD*>(buffer.data() + trExport.eatFileOffset) = layout.trCodeStartRva;
-
-    // .text 保持原生 RX；.data 保持 100% 纯净零写入，彻底杜绝全局对象野指针与析构崩溃！
 
     return CommitPatchedFile(buffer, dstDllPath, outError);
 }
@@ -821,7 +735,7 @@ bool PePatcher::GetPatchInfo(const std::wstring& dllPath, PatchInfo& outInfo, st
 
 uint32_t PePatcher::GetModuleSizeOfImage(HMODULE hMod) {
     if (!hMod) return 0;
-    SafePeReader reader(reinterpret_cast<const uint8_t*>(hMod), 0x100000000ULL /* 4GB memory view limit */);
+    SafePeReader reader(reinterpret_cast<const uint8_t*>(hMod), 0x100000000ULL );
     const IMAGE_DOS_HEADER* dos = reader.ReadStruct<IMAGE_DOS_HEADER>(0);
     if (!dos || dos->e_magic != IMAGE_DOS_SIGNATURE || dos->e_lfanew < 0) {
         return 0;
@@ -871,5 +785,4 @@ bool PePatcher::GetPatchInfoFromMemory(HMODULE hMod, PatchInfo& outInfo) {
     }
     return false;
 }
-
 

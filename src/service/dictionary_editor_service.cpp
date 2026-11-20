@@ -57,7 +57,7 @@ std::wstring DictionaryEditorService::resolveFallbackPath(DictType type) const {
 std::vector<std::string> DictionaryEditorService::getAvailableModules(DictType type) {
     std::vector<std::string> modules;
     if (type == DictType::FGD) {
-        return modules; // FGD 全局无分组
+        return modules;
     }
 
     std::wstring masterPath = resolveMasterPath(type);
@@ -92,7 +92,6 @@ std::vector<DictEntryRecord> DictionaryEditorService::searchEntries(
     bool filterByModule = (type == DictType::QtUI && !moduleFilter.isEmpty() && moduleFilter != "全部");
     std::string targetModule = moduleFilter.toStdString();
 
-    // 1. 检索主词典
     std::wstring masterPath = resolveMasterPath(type);
     std::unordered_map<std::string, std::string> masterCommon;
     std::unordered_map<std::wstring, std::unordered_map<std::string, std::string>> masterScoped;
@@ -106,7 +105,6 @@ std::vector<DictEntryRecord> DictionaryEditorService::searchEntries(
     };
 
     if (type == DictType::QtUI) {
-        // common 分组
         if (!filterByModule || targetModule == "common") {
             for (const auto& kv : masterCommon) {
                 if (matchText(kv.first, kv.second)) {
@@ -114,7 +112,6 @@ std::vector<DictEntryRecord> DictionaryEditorService::searchEntries(
                 }
             }
         }
-        // scoped 分组
         for (const auto& sec : masterScoped) {
             std::string modStr = enc::WideToUtf8(sec.first);
             if (!filterByModule || targetModule == modStr) {
@@ -126,7 +123,6 @@ std::vector<DictEntryRecord> DictionaryEditorService::searchEntries(
             }
         }
     } else {
-        // FGD 主词典
         for (const auto& kv : masterCommon) {
             if (matchText(kv.first, kv.second)) {
                 results.push_back({DictSource::Master, "", kv.first, kv.second});
@@ -134,18 +130,15 @@ std::vector<DictEntryRecord> DictionaryEditorService::searchEntries(
         }
     }
 
-    // 2. 检索 Fallback 兜底词典
     std::wstring fallbackPath = resolveFallbackPath(type);
     if (fs::exists(fallbackPath)) {
         std::unordered_map<std::string, std::string> fallbackCommon;
         std::unordered_map<std::wstring, std::unordered_map<std::string, std::string>> fallbackScoped;
         DictionaryCompiler::ParseJsoncFileToMaps(fallbackPath, fallbackCommon, fallbackScoped, err);
 
-        // Fallback 全局扁平匹配
         if (!filterByModule || targetModule == "common") {
             for (const auto& kv : fallbackCommon) {
                 if (matchText(kv.first, kv.second)) {
-                    // 若主词典中已存在此 key，则忽略 Fallback 项（以主词典为准）
                     if (masterCommon.find(kv.first) == masterCommon.end()) {
                         results.push_back({DictSource::Fallback, "", kv.first, kv.second});
                     }
@@ -167,22 +160,18 @@ OperationResult DictionaryEditorService::saveEntry(
 
     dict_updater::UpdateResult res;
     if (record.source == DictSource::Fallback) {
-        // Fallback 精翻升级：落盘至主词典，并从 Fallback 中物理删除
         res = dict_updater::AddEntry(masterPath, record.module, record.key, record.value);
         if (!res.success) {
             return {false, QString::fromStdString("写入主词典失败: " + res.errorMessage), false};
         }
-        // 从 Fallback 中物理删除该旧条目
         dict_updater::DeleteEntry(fallbackPath, "", record.key);
     } else {
-        // 主词典就地修改
         res = dict_updater::UpdateEntry(masterPath, record.module, record.key, record.value);
         if (!res.success) {
             return {false, QString::fromStdString("更新词典失败: " + res.errorMessage), false};
         }
     }
 
-    // 联动热重载
     auto reloadRes = triggerReload(useMachineTrans);
     QString msg = (record.source == DictSource::Fallback)
         ? "✓ 词条已成功升级收录至主词典！"
@@ -212,7 +201,6 @@ OperationResult DictionaryEditorService::addEntry(
         return {false, QString::fromStdString("新增词条失败: " + res.errorMessage), false};
     }
 
-    // 若 Fallback 中曾存在该条目，自动清理
     dict_updater::DeleteEntry(fallbackPath, "", key);
 
     auto reloadRes = triggerReload(useMachineTrans);

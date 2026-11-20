@@ -53,22 +53,18 @@ private:
     DictionaryEditorService* m_service{nullptr};
     std::function<bool()> m_getMachineTransEnabled;
 
-    // Tab 1 检索区
     QComboBox* m_moduleFilterCombo{nullptr};
     QLineEdit* m_searchEdit{nullptr};
     QPushButton* m_searchBtn{nullptr};
 
-    // 左右分栏
     QTabWidget* m_tabWidget{nullptr};
     QTableWidget* m_masterTable{nullptr};
     QTableWidget* m_captureTable{nullptr};
 
-    // 捕获池控制
     QLineEdit* m_captureFilterEdit{nullptr};
     QPushButton* m_refreshCaptureBtn{nullptr};
     QPushButton* m_clearCaptureBtn{nullptr};
 
-    // 右侧编辑卡片
     QComboBox* m_dictTypeCombo{nullptr};
     QComboBox* m_targetModuleCombo{nullptr};
     QPlainTextEdit* m_englishKeyEdit{nullptr};
@@ -77,10 +73,8 @@ private:
     QPushButton* m_saveBtn{nullptr};
     QPushButton* m_deleteBtn{nullptr};
 
-    // 底部状态栏
     QLabel* m_statusLabel{nullptr};
 
-    // 当前检索缓存与选中状态
     std::vector<DictEntryRecord> m_currentSearchResults;
     std::vector<capture::UntranslatedCaptureReader::Item> m_currentCaptureResults;
     int m_selectedSearchRow{-1};

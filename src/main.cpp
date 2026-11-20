@@ -29,7 +29,6 @@ int main(int argc, char *argv[]) {
 
     app.setStyle(QStyleFactory::create("Fusion"));
 
-    // 优先使用 config.ini 中已锁定的 CS2 路径，避免重启后扫描漂移
     std::wstring workingDir;
     const QString appDir = QApplication::applicationDirPath();
     if (!appDir.isEmpty()) {

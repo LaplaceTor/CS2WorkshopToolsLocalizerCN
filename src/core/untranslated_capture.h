@@ -11,7 +11,7 @@
 namespace capture {
 
 constexpr const wchar_t* kSharedMemoryName = L"Local\\CS2_Hammer_Localizer_Untranslated";
-constexpr uint32_t kSharedMemoryMagic = 0x48414D54; // 'HAMT'
+constexpr uint32_t kSharedMemoryMagic = 0x48414D54;
 constexpr uint32_t kSharedMemoryVersion = 1;
 constexpr uint32_t kMaxUntranslatedEntries = 1024;
 constexpr uint32_t kMaxTextLen = 256;
@@ -22,7 +22,7 @@ struct UntranslatedEntry {
     char text[kMaxTextLen];
     wchar_t module[kMaxModuleLen];
     uint32_t hitCount;
-    uint64_t lastTimestamp; // GetTickCount64() ms
+    uint64_t lastTimestamp;
 };
 
 struct UntranslatedSharedMemoryHeader {
@@ -35,7 +35,6 @@ struct UntranslatedSharedMemoryHeader {
 };
 #pragma pack(pop)
 
-// 检查字符串是否包含中文汉字、全角标点或 CJK 字符（已汉化文本特征）
 inline bool ContainsChinese(const char* text) {
     if (!text) return false;
     for (const unsigned char* p = reinterpret_cast<const unsigned char*>(text); *p; ) {
@@ -47,12 +46,12 @@ inline bool ContainsChinese(const char* text) {
         } else if ((*p & 0xF0) == 0xE0) {
             if (!*(p + 1) || !*(p + 2)) break;
             uint32_t cp = ((*p & 0x0F) << 12) | ((*(p + 1) & 0x3F) << 6) | (*(p + 2) & 0x3F);
-            if ((cp >= 0x4E00 && cp <= 0x9FFF) ||  // CJK Unified Ideographs
-                (cp >= 0x3400 && cp <= 0x4DBF) ||  // CJK Extension A
-                (cp >= 0x2E80 && cp <= 0x2EFF) ||  // CJK Radicals
-                (cp >= 0x3000 && cp <= 0x303F) ||  // CJK 标点符号 (。 、 【 】 等)
-                (cp >= 0xFF00 && cp <= 0xFFEF) ||  // 全角形式 (（ ） ： 等)
-                (cp >= 0x2000 && cp <= 0x206F)) {  // 常用标点 (… “” 等)
+            if ((cp >= 0x4E00 && cp <= 0x9FFF) ||
+                (cp >= 0x3400 && cp <= 0x4DBF) ||
+                (cp >= 0x2E80 && cp <= 0x2EFF) ||
+                (cp >= 0x3000 && cp <= 0x303F) ||
+                (cp >= 0xFF00 && cp <= 0xFFEF) ||
+                (cp >= 0x2000 && cp <= 0x206F)) {
                 return true;
             }
             p += 3;
@@ -70,7 +69,6 @@ inline bool ContainsChinese(const char* text) {
     return false;
 }
 
-// 供 qtcore_qm.dll 调用的写入端
 class UntranslatedCaptureWriter {
 public:
     UntranslatedCaptureWriter() = default;
@@ -124,10 +122,8 @@ public:
         size_t len = std::strlen(text);
         if (len < 2 || len >= kMaxTextLen) return;
 
-        // 绝不捕获任何包含中文或全角字符的已翻译文本
         if (ContainsChinese(text)) return;
 
-        // 基础清洗：必须包含至少一个英文字母，避免纯数字/符号
         bool hasAlpha = false;
         for (size_t i = 0; i < len; ++i) {
             if ((text[i] >= 'a' && text[i] <= 'z') || (text[i] >= 'A' && text[i] <= 'Z')) {
@@ -143,7 +139,6 @@ public:
 
         std::lock_guard<std::mutex> lock(m_mutex);
 
-        // 检测启动器是否清空了捕获池（通过 generationId 递增感知）
         uint32_t curGen = m_header->generationId;
         if (curGen != m_localGenerationId) {
             m_localIndexMap.clear();
@@ -168,16 +163,13 @@ public:
             return;
         }
 
-        // 新条目：分配槽位
         uint32_t slot = 0;
         uint32_t curCount = m_header->entryCount;
         if (curCount < kMaxUntranslatedEntries) {
             slot = curCount;
             m_header->entryCount = curCount + 1;
         } else {
-            // 环形覆盖
             slot = m_header->writeIndex % kMaxUntranslatedEntries;
-            // 淘汰旧槽位的索引
             char oldModBuf[kMaxModuleLen * 3] = {0};
             WideCharToMultiByte(CP_UTF8, 0, m_header->entries[slot].module, -1, oldModBuf, sizeof(oldModBuf), nullptr, nullptr);
             std::string oldKey = std::string(oldModBuf) + "\t" + std::string(m_header->entries[slot].text);
@@ -213,7 +205,6 @@ private:
     std::mutex m_mutex;
 };
 
-// 供启动器调用的读取端
 class UntranslatedCaptureReader {
 public:
     UntranslatedCaptureReader() = default;
@@ -226,7 +217,6 @@ public:
 
         m_hMapFile = OpenFileMappingW(FILE_MAP_ALL_ACCESS, FALSE, kSharedMemoryName);
         if (!m_hMapFile) {
-            // 若 DLL 尚未运行创建，也可以由启动器主动预先创建
             m_hMapFile = CreateFileMappingW(
                 INVALID_HANDLE_VALUE,
                 nullptr,
@@ -308,4 +298,4 @@ private:
     UntranslatedSharedMemoryHeader* m_header{nullptr};
 };
 
-} // namespace capture
+}

@@ -8,7 +8,6 @@ namespace fs = std::filesystem;
 
 namespace {
 
-// config.ini 键名的唯一定义处
 constexpr const char* kKeyCs2Root         = "Launcher/Cs2Root";
 constexpr const char* kKeySelectedAddon   = "Launcher/SelectedAddon";
 constexpr const char* kKeyLaunchArgs      = "Launcher/LaunchArgs";
@@ -20,7 +19,7 @@ QString ConfigFilePath(const std::wstring& workingDir) {
     return QString::fromStdWString((fs::path(workingDir) / kConfigFileName).wstring());
 }
 
-}  // namespace
+}
 
 LauncherSettings LauncherConfig::Load(const std::wstring& workingDir) {
     QSettings settings(ConfigFilePath(workingDir), QSettings::IniFormat);

@@ -15,11 +15,11 @@ struct GameVersionSignature {
 };
 
 enum class BackupMatchStatus {
-    Matches,             // 备份与当前游戏版本完全匹配，可以安全恢复
-    NoBackup,            // 无备份
-    MissingManifest,     // 存在备份文件但缺少版本清单
-    GameUpdated,         // CS2 已更新（cs2.exe / Qt5Core 哈希或版本变化），拒绝使用旧备份直接覆盖
-    ReadError            // 读取当前游戏或备份信息失败
+    Matches,
+    NoBackup,
+    MissingManifest,
+    GameUpdated,
+    ReadError
 };
 
 struct BackupValidationResult {
@@ -31,51 +31,35 @@ struct BackupValidationResult {
 
 class BackupManager {
 public:
-    // 检查 backupDir 目录是否存在且包含有效的备份文件
     static bool HasBackup(const std::wstring& backupDir);
 
-    // 获取当前 CS2 游戏环境的版本签名信息 (cs2.exe ProductVersion, Qt5Core SHA256, Qt5Widgets SHA256)
     static bool GetCurrentGameSignature(const std::wstring& cs2Root, GameVersionSignature& outSig, std::wstring& outError);
 
-    // 读取 backupDir/backup_manifest.json 的版本签名
     static bool ReadBackupManifest(const std::wstring& backupDir, GameVersionSignature& outSig, std::wstring& outError);
 
-    // 写入/更新 backupDir/backup_manifest.json
     static bool WriteBackupManifest(const std::wstring& backupDir, const GameVersionSignature& sig, std::wstring& outError);
 
-    // 严格校验备份是否与当前 CS2 游戏版本匹配
     static BackupValidationResult BackupMatchesCurrentGame(const std::wstring& cs2Root, const std::wstring& backupDir);
 
-    // 创建或更新完整备份（包含 Qt5Core.dll 以及绑定的 backup_manifest.json，FGD 采用纯内存引擎无需磁盘备份）
     static bool CreateOrUpdateBackup(const std::wstring& cs2Root, const std::wstring& backupDir, std::vector<std::wstring>& outBackedUpFiles, std::wstring& outError, bool forceRecreate = false);
 
-    // 备份 Qt5Core.dll 到 backupDir/game/bin/win64/Qt5Core.dll
     static bool BackupQtCore(const std::wstring& cs2Root, const std::wstring& backupDir, std::wstring& outError);
 
-    // 从 backupDir 完整恢复原版 Qt5Core.dll 到 CS2 目录，并清理临时注入文件（默认带版本匹配检查）
     static bool RestoreAll(const std::wstring& cs2Root, const std::wstring& backupDir, std::wstring& outError, bool force = false);
 
-    // 检查 CS2 目录中是否存在未还原的补丁文件（如 qtcore_qm.dll）
     static bool IsPatchDeployed(const std::wstring& cs2Root);
 
-    // 检查工作目录下是否存在未正常结束的会话状态记录
     static bool HasUnrestoredSession(const std::wstring& workingDir);
 
-    // 保存运行会话状态 (isPatched = true 表示补丁已部署且未还原)，写入失败返回 false
     static bool SaveSessionState(const std::wstring& workingDir, bool isPatched);
 
-    // 清除运行会话状态记录（文件本就不存在视为成功），失败返回 false
     static bool ClearSessionState(const std::wstring& workingDir);
 
-    // 计算文件 SHA-256 哈希值
     static std::string ComputeFileSha256(const std::wstring& filePath);
 
-    // 获取文件 ProductVersion 字符串 (如 "1.40.8.2")
     static std::string GetFileProductVersion(const std::wstring& filePath);
 
-    // 带重试的文件复制/删除（目标被占用时按固定间隔重试，供部署/还原链路共用）
     static bool SafeCopyFileWithRetry(const std::filesystem::path& src, const std::filesystem::path& dst, int maxRetries = 25, int sleepMs = 150);
     static bool SafeRemoveFileWithRetry(const std::filesystem::path& path, int maxRetries = 15, int sleepMs = 100);
 };
-
 

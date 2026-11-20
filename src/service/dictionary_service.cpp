@@ -17,7 +17,6 @@ namespace fs = std::filesystem;
 
 namespace {
 
-// 在线词典的候选节点：GitHub 原始地址作为首选，jsDelivr CDN 作为国内可达性兜底
 const char* const kQtUrls[] = {
     "https://raw.githubusercontent.com/LaplaceTor/CS2WorkshopToolsLocalizerCN/main/translations/qt_translations.jsonc",
     "https://cdn.jsdelivr.net/gh/LaplaceTor/CS2WorkshopToolsLocalizerCN@main/translations/qt_translations.jsonc",
@@ -37,16 +36,12 @@ QStringList toList(const char* const (&arr)[2]) {
     return QStringList{arr[0], arr[1]};
 }
 
-// 剥离 JSONC 注释，使其可被 QJsonDocument 解析（含尾随逗号移除）
 QByteArray StripJsonc(const QByteArray& input) {
     const std::string stripped =
         DictionaryCompiler::StripJsonComments(input.constData(), static_cast<size_t>(input.size()));
     return QByteArray(stripped.data(), static_cast<qsizetype>(stripped.size()));
 }
 
-// 统计 fgd_override 词典的有效规则数：
-// properties / io / classes 三个子对象的键数之和，再加上其余非下划线开头的顶层键；
-// 三者合计为 0 时退化为顶层键总数。
 qsizetype CountOverrideRules(const QJsonObject& obj) {
     qsizetype count = 0;
 
@@ -66,14 +61,13 @@ qsizetype CountOverrideRules(const QJsonObject& obj) {
     return (count == 0) ? obj.keys().size() : count;
 }
 
-}  // namespace
+}
 
 DictionaryService::DictionaryService(QObject* parent)
     : QObject(parent)
     , m_networkManager(new QNetworkAccessManager(this)) {}
 
 QStringList DictionaryService::ensureTemplates(const std::wstring& workingDir) {
-    // 三个词典的模板生成函数签名一致，用表驱动避免三份复制粘贴
     struct TemplateSpec {
         const wchar_t* fileName;
         bool (*ensure)(const std::wstring&, const std::wstring&, std::wstring&);
@@ -101,7 +95,6 @@ void DictionaryService::updateDictionaries(const std::wstring& workingDir,
     m_log  = log;
     m_done = done;
 
-    // 依次拉取三个在线词典：任一步失败都会中止（失败收尾由 fetchOnlineDictionary 统一处理）
     fetchOnlineDictionary(
         toList(kQtUrls),
         "[1/3]",

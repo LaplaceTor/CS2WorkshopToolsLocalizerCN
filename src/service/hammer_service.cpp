@@ -27,7 +27,6 @@ namespace fs = std::filesystem;
 
 namespace {
 
-// 通过 Windows Restart Manager 探测占用指定文件的进程信息
 QString QueryLockingProcesses(const std::vector<std::wstring>& filePaths) {
     if (filePaths.empty()) {
         return QString();
@@ -80,14 +79,12 @@ QString QueryLockingProcesses(const std::vector<std::wstring>& filePaths) {
     return processNames.join(", ");
 }
 
-// 检查目录内所有文件是否存在共享冲突，并探测目录本身是否被外部程序（命令行 cd / 资源管理器）锁定
 bool CheckDirectoryInUse(const fs::path& dirPath, QString& outReason) {
     std::error_code ec;
     if (!fs::exists(dirPath, ec) || !fs::is_directory(dirPath, ec)) {
         return false;
     }
 
-    // 1. 全文件独占句柄测试
     std::vector<std::wstring> lockedFiles;
     try {
         for (const auto& entry : fs::recursive_directory_iterator(dirPath)) {
@@ -96,7 +93,7 @@ bool CheckDirectoryInUse(const fs::path& dirPath, QString& outReason) {
                 HANDLE hFile = CreateFileW(
                     filePath.c_str(),
                     GENERIC_READ | DELETE,
-                    0, // 0 = 独占共享模式
+                    0,
                     NULL,
                     OPEN_EXISTING,
                     FILE_ATTRIBUTE_NORMAL,
@@ -156,7 +153,6 @@ bool CheckDirectoryInUse(const fs::path& dirPath, QString& outReason) {
         return true;
     }
 
-    // 2. 目录级原子重命名探测（检测命令行 cd / 资源管理器当前路径驻留等目录句柄占用）
     const fs::path parentDir = dirPath.parent_path();
     const fs::path probePath = parentDir / (dirPath.filename().wstring() + L".__probe_lock__");
 
@@ -188,14 +184,12 @@ bool CheckDirectoryInUse(const fs::path& dirPath, QString& outReason) {
     return false;
 }
 
-// 调用 Windows Shell API 将目录完整移入系统回收站
 bool MoveDirectoryToRecycleBin(const fs::path& dirPath, QString& outError) {
     std::error_code ec;
     if (!fs::exists(dirPath, ec)) {
         return true;
     }
 
-    // SHFileOperation 要求 double null 结尾的绝对路径，且不能使用正斜杠
     std::wstring fullPath = fs::absolute(dirPath, ec).wstring();
     std::replace(fullPath.begin(), fullPath.end(), L'/', L'\\');
     fullPath.push_back(L'\0');
@@ -216,7 +210,7 @@ bool MoveDirectoryToRecycleBin(const fs::path& dirPath, QString& outError) {
     return true;
 }
 
-} // namespace
+}
 
 HammerService::HammerService(QObject* parent)
     : QObject(parent)
@@ -337,7 +331,6 @@ HammerService::CreateAddonResult HammerService::createAddon(const std::wstring& 
         }
 
         if (!rcSucceeded) {
-            // 兜底：C++ 递归复制并重命名
             try {
                 for (const auto& entry : fs::recursive_directory_iterator(templateDir)) {
                     const auto& p = entry.path();
@@ -368,7 +361,6 @@ HammerService::CreateAddonResult HammerService::createAddon(const std::wstring& 
     copyFromTemplate(contentTemplate, contentAddonPath);
     copyFromTemplate(gameTemplate, gameAddonPath);
 
-    // 写入干净的标准 KV3 addoninfo.txt
     const fs::path addonInfoPath = gameAddonPath / L"addoninfo.txt";
     QFile infoFile(QString::fromStdWString(addonInfoPath.wstring()));
     if (infoFile.open(QIODevice::WriteOnly | QIODevice::Truncate)) {
@@ -380,7 +372,6 @@ HammerService::CreateAddonResult HammerService::createAddon(const std::wstring& 
         infoFile.close();
     }
 
-    // 确保移除任何可能残留的只读标识与日志
     std::error_code ignoreEc;
     fs::remove(gameAddonPath / L"readonly_tools_asset_info.bin", ignoreEc);
     fs::remove(contentAddonPath / L"readonly_tools_asset_info.bin", ignoreEc);
@@ -426,7 +417,6 @@ HammerService::RemoveAddonResult HammerService::removeAddon(const std::wstring& 
         return result;
     }
 
-    // 阶段 1：全量占用检测（原子预检，任一处被占用则完全不执行任何删除）
     QString contentReason;
     if (contentExists && CheckDirectoryInUse(contentAddonPath, contentReason)) {
         result.error = QString("Content 目录占用检测未通过：\n%1").arg(contentReason);
@@ -439,7 +429,6 @@ HammerService::RemoveAddonResult HammerService::removeAddon(const std::wstring& 
         return result;
     }
 
-    // 阶段 2：安全移入 Windows 回收站
     QString recycleError;
     if (contentExists && !MoveDirectoryToRecycleBin(contentAddonPath, recycleError)) {
         result.error = recycleError;
@@ -500,7 +489,6 @@ HammerService::LaunchResult HammerService::launch(const LaunchParams& params) {
         "#75715e"
     );
 
-    // 保持 session_state 为已注入
     if (!BackupManager::SaveSessionState(params.workingDir, true)) {
         log(
             "[-] 会话状态写入失败 (session_state.json)，异常退出后的自动恢复可能失效",
@@ -527,18 +515,14 @@ bool HammerService::isIpcAvailable() const {
     return HammerIpc::FindIpcWindow() != nullptr;
 }
 
-HammerService::ReloadResult HammerService::reloadDictionaries(const std::wstring& /*cs2Root*/,
-                                                              const std::wstring& /*workingDir*/,
-                                                              bool /*useMachineTrans*/) {
+HammerService::ReloadResult HammerService::reloadDictionaries(const std::wstring& ,
+                                                              const std::wstring& ,
+                                                              bool ) {
     ReloadResult result;
 
-    // 纯内存模式：无需向 CS2 目录写入任何 JSON 词典或 FGD 文件
-    // 注入模块收到 IPC 消息后，会自动从启动器程序目录直读最新词典，
-    // 在内存中重载并预编译最新 FGD，最后触发 Hammer 原生 Reload .FGD Files 并重绘所有窗口
     result.fgdOk = true;
     result.fgdFileCount = 0;
 
-    // 发送 IPC 消息给 Hammer 注入模块
     result.ipcOk = HammerIpc::Send(HammerIpc::kMsgReloadDict);
 
     return result;
@@ -581,12 +565,9 @@ void HammerService::onProcessFinished(int exitCode, QProcess::ExitStatus exitSta
 
 void HammerService::onProcessError(QProcess::ProcessError error) {
     if (error != QProcess::FailedToStart) {
-        // 其他错误 (Crashed / TimedError 等)：交由 finished / 监控定时器路径统一处理，避免双重恢复
         return;
     }
 
-    // start() 前已置 m_isRunning = true，而 FailedToStart 只触发 errorOccurred、不触发 finished，
-    // 必须在此立即回滚，否则只能依赖 1 秒轮询兜底
     resetTerminatedState();
 
     log(
@@ -603,7 +584,6 @@ void HammerService::onMonitorTimeout() {
         return;
     }
 
-    // 三路探测来源按优先级由 ProcessMonitor 判定（QProcess → 原生句柄 → PID）
     ProcessMonitor::Source src;
     src.qProcessRunning = (m_process != nullptr) && (m_process->state() == QProcess::Running);
     src.nativeHandle    = m_processHandle;

@@ -8,8 +8,6 @@ if(MSVC)
     add_compile_options(/utf-8)
 endif()
 
-
-# 支持从环境变量或 CMake 参数动态检索 Qt6 路径
 if(NOT DEFINED CMAKE_PREFIX_PATH)
     if(DEFINED ENV{Qt6_DIR})
         set(CMAKE_PREFIX_PATH "$ENV{Qt6_DIR}")
@@ -26,15 +24,10 @@ if(NOT CMAKE_BUILD_TYPE)
     set(CMAKE_BUILD_TYPE Release CACHE STRING "Build type" FORCE)
 endif()
 
-# 版本号，默认 "dev"，CI 通过 -DAPP_VERSION=v1.0.0 传入
 set(APP_VERSION "dev" CACHE STRING "Application version string")
 
-# 源码按 ui / service / core 三层组织，src/ 作为项目内部 include 根：
-#   #include "core/xxx.h" / "service/xxx.h" / "ui/xxx.h"
-# 依赖方向只允许 UI -> Service -> Core，Core 不得反向依赖 UI。
 set(LAYERED_INCLUDE_ROOT ${CMAKE_CURRENT_SOURCE_DIR}/src)
 
-# 1. 编译注入 DLL qtcore_qm.dll
 add_library(qtcore_qm SHARED
     src/core/qtcore_qm.cpp
     src/core/qm/translation_engine.cpp
@@ -61,7 +54,6 @@ set_target_properties(qtcore_qm PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}"
 )
 
-# 2. 编译主启动器图形界面程序
 add_executable(CS2WorkshopToolsLocalizerCN WIN32
     src/main.cpp
 
@@ -116,7 +108,6 @@ target_link_libraries(CS2WorkshopToolsLocalizerCN PRIVATE
     rstrtmgr
 )
 
-# 复制字典文件目录和 DLL 到输出目录方便调试运行
 add_custom_command(TARGET CS2WorkshopToolsLocalizerCN POST_BUILD
     COMMAND ${CMAKE_COMMAND} -E make_directory
         "$<TARGET_FILE_DIR:CS2WorkshopToolsLocalizerCN>/translations"
@@ -128,7 +119,3 @@ add_custom_command(TARGET CS2WorkshopToolsLocalizerCN POST_BUILD
         "$<TARGET_FILE_DIR:CS2WorkshopToolsLocalizerCN>/qtcore_qm.dll"
 )
 
-# 说明：本项目不设单元测试目标。
-# 注入型改动的行为正确性只能靠实际 HOOK 到 Hammer 进程验证，
-# 脱离宿主进程的单测无法覆盖真实时序，反而会给出虚假的安全感。
-# 验证方式见 README「验证」章节。

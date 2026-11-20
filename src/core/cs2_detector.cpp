@@ -57,7 +57,6 @@ bool Cs2Detector::IsValidCs2Root(const std::wstring& rootPath) {
     if (rootPath.empty()) return false;
     std::error_code ec;
     const fs::path bin = paths::Win64Bin(rootPath);
-    // 必须同时存在 cs2.exe 与 Qt5Core.dll 常规文件，避免卸载/迁移后残留的空 win64 目录误判
     return fs::is_regular_file(bin / paths::kCs2Exe, ec)
         && fs::is_regular_file(bin / paths::kQt5CoreDll, ec);
 }
@@ -71,7 +70,6 @@ std::wstring Cs2Detector::NormalizeCs2RootCandidate(const std::wstring& selected
         p = p.parent_path();
     }
 
-    // 允许用户选择 CS2 根目录，或误选其下的 game / game/bin / game/bin/win64 子目录
     fs::path cur = p;
     for (int up = 0; up < 4; ++up) {
         if (IsValidCs2Root(cur.wstring())) {
@@ -102,7 +100,6 @@ bool Cs2Detector::CheckRunningProcess(std::wstring& outPath) {
         return false;
     }
 
-    // <cs2Root>\game\bin\win64\cs2.exe -> 向上三级目录回到 <cs2Root>
     fs::path root = fs::path(exePath).parent_path().parent_path().parent_path().parent_path();
     if (IsValidCs2Root(root.wstring())) {
         outPath = root.wstring();
@@ -182,7 +179,6 @@ bool Cs2Detector::ParseSteamLibraryFolders(const std::wstring& vdfPath, std::vec
     const QString content = QString::fromUtf8(file.readAll());
     file.close();
 
-    // 按大括号层级解析每个库块的 "path" 与 "apps" -> "730"
     int depth = 0;
     bool inLibBlock = false;
     bool inAppsBlock = false;
@@ -308,14 +304,12 @@ bool Cs2Detector::CheckRegistrySteam(std::wstring& outPath) {
         return false;
     };
 
-    // 优先检查 libraryfolders.vdf 中明确登记了 AppID 730 (CS2) 的库目录
     for (const auto& lib : libraries) {
         if (lib.hasCs2App && tryLibrary(lib.path)) {
             return true;
         }
     }
 
-    // 兜底：若 VDF 缺少 apps 映射或为旧格式，再检查其余库及 Steam 主目录
     for (const auto& lib : libraries) {
         if (!lib.hasCs2App && tryLibrary(lib.path)) {
             return true;
@@ -329,7 +323,6 @@ bool Cs2Detector::CheckRegistrySteam(std::wstring& outPath) {
 }
 
 bool Cs2Detector::CheckCommonDrivePaths(std::wstring& outPath) {
-    // 盘符根目录下的 Steam 常见安装位置，统一拼上 steamapps/common/<CS2 安装目录名>
     const wchar_t* steamRoots[] = {
         L"SteamLibrary",
         L"Program Files (x86)\\Steam",
@@ -338,7 +331,6 @@ bool Cs2Detector::CheckCommonDrivePaths(std::wstring& outPath) {
         L"Games\\SteamLibrary"
     };
 
-    // 枚举系统全部盘符，替代硬编码的 C:~H:
     const QFileInfoList drives = QDir::drives();
     for (const QFileInfo& drive : drives) {
         QString drivePath = drive.absoluteFilePath();

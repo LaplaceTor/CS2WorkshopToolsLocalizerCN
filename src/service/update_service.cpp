@@ -95,7 +95,7 @@ QNetworkRequest MakeRequest(const QString& urlStr) {
     return req;
 }
 
-}  // namespace
+}
 
 UpdateService::UpdateService(QObject* parent)
     : QObject(parent)
@@ -154,7 +154,6 @@ void UpdateService::checkAppUpdate(std::function<void(const AppUpdateResult&)> c
         callback(res);
     };
 
-    // 兜底 2：GitHub /releases/latest 重定向末段提取 tag
     auto tryGitHubRedirect = [this, finalize]() {
         QNetworkReply* reply = m_networkManager->get(MakeRequest(QString::fromLatin1(kGitHubReleasesLatestUrl)));
         connect(reply, &QNetworkReply::finished, this, [reply, finalize]() {
@@ -173,7 +172,6 @@ void UpdateService::checkAppUpdate(std::function<void(const AppUpdateResult&)> c
         });
     };
 
-    // 兜底 1：jsDelivr 仓库元数据接口（保障 GitHub 直连受限时的国内可达性）
     auto tryJsDelivr = [this, finalize, tryGitHubRedirect]() {
         QNetworkReply* reply = m_networkManager->get(MakeRequest(QString::fromLatin1(kJsDelivrPackageUrl)));
         connect(reply, &QNetworkReply::finished, this, [reply, finalize, tryGitHubRedirect]() {
@@ -202,7 +200,6 @@ void UpdateService::checkAppUpdate(std::function<void(const AppUpdateResult&)> c
         });
     };
 
-    // 首选：GitHub Releases API
     QNetworkRequest apiReq = MakeRequest(QString::fromLatin1(kGitHubApiLatestUrl));
     apiReq.setRawHeader("Accept", "application/vnd.github+json");
     QNetworkReply* reply = m_networkManager->get(apiReq);

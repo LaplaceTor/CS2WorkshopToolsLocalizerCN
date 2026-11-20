@@ -7,35 +7,25 @@ class QString;
 
 class Cs2Detector {
 public:
-    // 检测 CS2 根目录路径（返回 true 表示检测成功）
     static bool DetectCs2(std::wstring& outCs2Root);
 
-    // 验证给定路径是否是有效的 CS2 安装目录
     static bool IsValidCs2Root(const std::wstring& rootPath);
 
-    // 将用户手动选择的目录（可能是根目录、game 或 game/bin/win64）归一化为 CS2 根目录
     static std::wstring NormalizeCs2RootCandidate(const std::wstring& selectedPath);
 
-    // 获取 CS2 的 win64 二进制目录
     static std::wstring GetWin64BinDir(const std::wstring& cs2Root);
 
-    // 获取 CS2 的 content/csgo_addons 目录
     static std::wstring GetAddonsDir(const std::wstring& cs2Root);
 
-    // 检查给定的 Addon 名称是否为游戏内置只读/隐藏排除项（不区分大小写）
     static bool IsExcludedAddon(const std::wstring& addonName);
     static bool IsExcludedAddon(const QString& addonName);
 
-    // 扫描 content/csgo_addons 下的所有可用 Addon 列表（已自动排除内置只读项）
     static std::vector<std::wstring> GetAvailableAddons(const std::wstring& cs2Root);
 
-    // 检测指定 PID 的进程是否在运行
     static bool IsProcessRunning(unsigned long pid);
 
-    // 查找当前运行的 CS2 进程 (cs2.exe) 的 PID；未运行返回 0
     static unsigned long FindCs2ProcessId();
 
-    // 检测系统当前是否有 CS2 进程 (cs2.exe) 在运行
     static bool IsCs2ProcessRunning();
 
 private:
