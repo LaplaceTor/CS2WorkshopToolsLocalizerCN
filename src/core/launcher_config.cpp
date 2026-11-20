@@ -9,6 +9,7 @@ namespace fs = std::filesystem;
 namespace {
 
 // config.ini 键名的唯一定义处
+constexpr const char* kKeyCs2Root         = "Launcher/Cs2Root";
 constexpr const char* kKeySelectedAddon   = "Launcher/SelectedAddon";
 constexpr const char* kKeyLaunchArgs      = "Launcher/LaunchArgs";
 constexpr const char* kKeyUseMachineTrans = "Launcher/UseMachineTrans";
@@ -25,6 +26,7 @@ LauncherSettings LauncherConfig::Load(const std::wstring& workingDir) {
     QSettings settings(ConfigFilePath(workingDir), QSettings::IniFormat);
 
     LauncherSettings s;
+    s.cs2Root         = settings.value(kKeyCs2Root, QString()).toString().trimmed();
     s.selectedAddon   = settings.value(kKeySelectedAddon, QString()).toString().trimmed();
     QString args      = settings.value(kKeyLaunchArgs, "-gpuraytracing").toString().trimmed();
     if (args.isEmpty()) {
@@ -38,6 +40,7 @@ LauncherSettings LauncherConfig::Load(const std::wstring& workingDir) {
 void LauncherConfig::Save(const std::wstring& workingDir, const LauncherSettings& settings) {
     QSettings qs(ConfigFilePath(workingDir), QSettings::IniFormat);
 
+    qs.setValue(kKeyCs2Root, settings.cs2Root);
     qs.setValue(kKeySelectedAddon, settings.selectedAddon);
     qs.setValue(kKeyLaunchArgs, settings.launchArgs);
     qs.setValue(kKeyUseMachineTrans, settings.useMachineTrans);

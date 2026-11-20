@@ -4,6 +4,7 @@
 //   - path_constants.h：纯路径常量（文件监视列表等）
 //   - launcher_config.h：启动器自身设置的读写入口
 // 进程探测、备份状态、词典模板等一律经由 Service，不再直接触碰 core。
+#include "core/cs2_detector.h"
 #include "core/launcher_config.h"
 #include "core/path_constants.h"
 #include "service/dictionary_service.h"
@@ -27,6 +28,7 @@
 #include <QTextEdit>
 #include <QStatusBar>
 #include <QMessageBox>
+#include <QFileDialog>
 #include <QDateTime>
 #include <QCloseEvent>
 #include <QApplication>
@@ -80,6 +82,11 @@ MainWindow::MainWindow(const std::wstring& cs2Root, QWidget *parent)
     setupUi();
     populateAddons();
     loadSettings();
+
+    if (m_changePathBtn) {
+        connect(m_changePathBtn, &QPushButton::clicked,
+                this, &MainWindow::onChangeCs2PathClicked);
+    }
 
     connect(m_injectBtn, &QPushButton::clicked,
             this, &MainWindow::onInjectClicked);
@@ -286,7 +293,12 @@ void MainWindow::setupUi() {
         Qt::TextSelectableByMouse
     );
 
-    pathLayout->addWidget(m_cs2PathLabel);
+    m_changePathBtn = new QPushButton("更改...", pathGroup);
+    m_changePathBtn->setToolTip("手动指定并锁定 Counter-Strike 2 根目录");
+    m_changePathBtn->setFixedWidth(64);
+
+    pathLayout->addWidget(m_cs2PathLabel, 1);
+    pathLayout->addWidget(m_changePathBtn);
 
     mainLayout->addWidget(pathGroup);
 
@@ -640,11 +652,66 @@ void MainWindow::loadSettings() {
 
 void MainWindow::saveSettings() {
     LauncherSettings settings;
+    settings.cs2Root         = QString::fromStdWString(m_cs2Root);
     settings.selectedAddon   = hasValidSelectedAddon() ? LauncherConfig::NormalizeAddonName(m_addonCombo->currentText()) : QString();
     settings.launchArgs      = m_argsEdit->text();
     settings.useMachineTrans = machineTranslationEnabled();
 
     LauncherConfig::Save(m_workingDir, settings);
+}
+
+void MainWindow::onChangeCs2PathClicked() {
+    if (m_workerBusy || m_hammerService->isRunning()) {
+        return;
+    }
+
+    const QString initialDir = QString::fromStdWString(m_cs2Root);
+    const QString picked = QFileDialog::getExistingDirectory(
+        this,
+        "选择 Counter-Strike Global Offensive 安装目录",
+        initialDir
+    );
+    if (picked.isEmpty()) {
+        return;
+    }
+
+    const std::wstring normalized = Cs2Detector::NormalizeCs2RootCandidate(picked.toStdWString());
+    if (!Cs2Detector::IsValidCs2Root(normalized)) {
+        QMessageBox::warning(
+            this,
+            "目录无效",
+            "所选目录中未找到有效的 game/bin/win64/cs2.exe 与 Qt5Core.dll，请重新选择。"
+        );
+        return;
+    }
+
+    if (normalized == m_cs2Root) {
+        return;
+    }
+
+    m_cs2Root = normalized;
+    if (m_cs2PathLabel) {
+        m_cs2PathLabel->setText(QString::fromStdWString(m_cs2Root));
+    }
+
+    m_lastValidationMs = 0;
+    m_cachedValidationValid = false;
+
+    saveSettings();
+    populateAddons();
+    loadSettings();
+    checkAndRecoverAbnormalExit();
+    LocalizationService::WriteAppDirPointer(
+        m_cs2Root,
+        m_workingDir,
+        machineTranslationEnabled()
+    );
+    updateActionButtonState();
+
+    appendLog(
+        QString("[i] 已切换并锁定 CS2 安装目录: %1").arg(QString::fromStdWString(m_cs2Root)),
+        "#66d9ef"
+    );
 }
 
 bool MainWindow::hasValidSelectedAddon() const {
@@ -725,6 +792,9 @@ bool MainWindow::runHeavyInWorker(const std::function<bool()>& task) {
 void MainWindow::setUiBusy(bool busy) {
     m_updateBtn->setEnabled(!busy);
     m_addonCombo->setEnabled(!busy);
+    if (m_changePathBtn) {
+        m_changePathBtn->setEnabled(!busy && !m_hammerService->isRunning());
+    }
     if (m_newAddonBtn) {
         m_newAddonBtn->setEnabled(!busy && !m_hammerService->isRunning());
     }
@@ -792,6 +862,10 @@ bool MainWindow::isPatchDeployedAndValid() {
 
 void MainWindow::updateActionButtonState() {
     const bool hammerRunning = m_hammerService->isRunning();
+
+    if (m_changePathBtn) {
+        m_changePathBtn->setEnabled(!m_workerBusy && !hammerRunning);
+    }
 
     if (m_toggleLangBtn) {
         m_toggleLangBtn->setEnabled(hammerRunning);
@@ -1120,6 +1194,9 @@ void MainWindow::onLaunchClicked() {
     m_launchBtn->setEnabled(false);
     m_restoreBtn->setEnabled(false);
     m_updateBtn->setEnabled(false);
+    if (m_changePathBtn) {
+        m_changePathBtn->setEnabled(false);
+    }
 }
 
 void MainWindow::onHammerStarted(qint64 pid) {

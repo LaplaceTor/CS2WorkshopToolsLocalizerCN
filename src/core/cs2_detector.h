@@ -13,6 +13,9 @@ public:
     // 验证给定路径是否是有效的 CS2 安装目录
     static bool IsValidCs2Root(const std::wstring& rootPath);
 
+    // 将用户手动选择的目录（可能是根目录、game 或 game/bin/win64）归一化为 CS2 根目录
+    static std::wstring NormalizeCs2RootCandidate(const std::wstring& selectedPath);
+
     // 获取 CS2 的 win64 二进制目录
     static std::wstring GetWin64BinDir(const std::wstring& cs2Root);
 
@@ -36,8 +39,14 @@ public:
     static bool IsCs2ProcessRunning();
 
 private:
+    struct SteamLibraryFolder {
+        std::wstring path;
+        bool hasCs2App = false;
+    };
+
+    static bool CheckRunningProcess(std::wstring& outPath);
     static bool CheckRegistryUninstall(std::wstring& outPath);
     static bool CheckRegistrySteam(std::wstring& outPath);
     static bool CheckCommonDrivePaths(std::wstring& outPath);
-    static bool ParseSteamLibraryFolders(const std::wstring& vdfPath, std::vector<std::wstring>& outLibraries);
+    static bool ParseSteamLibraryFolders(const std::wstring& vdfPath, std::vector<SteamLibraryFolder>& outLibraries);
 };

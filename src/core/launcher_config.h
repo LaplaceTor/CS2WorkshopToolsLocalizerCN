@@ -9,6 +9,7 @@
 #include <QString>
 
 struct LauncherSettings {
+    QString cs2Root;                           // 上次锁定/选择的 CS2 根目录
     QString selectedAddon;                     // 上次选择的 Addon 名
     QString launchArgs = "-gpuraytracing";     // 附加启动参数，默认 -gpuraytracing
     bool    useMachineTrans = true;            // 是否启用机翻

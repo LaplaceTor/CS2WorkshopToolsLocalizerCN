@@ -30,6 +30,7 @@ protected:
     void closeEvent(QCloseEvent *event) override;
 
 private slots:
+    void onChangeCs2PathClicked();
     void onInjectClicked();
     void onLaunchClicked();
     void onRestoreClicked();
@@ -124,7 +125,8 @@ private:
 
     QTextEdit* m_logEdit{nullptr};
     QLabel*    m_statusLabel{nullptr};
-    QLabel*    m_cs2PathLabel{nullptr};
+    QLabel*      m_cs2PathLabel{nullptr};
+    QPushButton* m_changePathBtn{nullptr};
 
     // Service 层：业务流程编排，MainWindow 只负责传参与展示结果
     DictionaryService* m_dictionaryService;
