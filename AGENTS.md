@@ -30,7 +30,7 @@
 
 ## 按场景读取与检查
 
-- **修改注入、Hook、备份、IPC 或捕获协议前**：先阅读 [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) 了解双进程协同与不变量。
+- **修改注入、Hook、备份、IPC 或捕获协议前**：先阅读 [ARCHITECTURE.md](ARCHITECTURE.md) 了解双进程协同与不变量。
 - **构建与产物**：以 `CMakeLists.txt` 和 `.github/workflows/pr-ci.yml` 为准（需先初始化 `third_party/minhook` 子模块）；增删 `.cpp` 文件需同步更新 `CMakeLists.txt`。
 - **修改 `MainWindow` 成员**：保持 `src/ui/mainwindow.cpp` 构造函数初始化列表与 `src/ui/mainwindow.h` 声明顺序一致（MSVC `C5038`）。
 - **修改词典（`translations/`）**：仅编辑 `qt_translations.jsonc`、`fgd_translations.jsonc`、`fgd_override.jsonc`（`*_fallback.jsonc` 由脚本生成），提交前运行 `python scripts/check_duplicates.py`。
